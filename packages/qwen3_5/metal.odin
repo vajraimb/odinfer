@@ -2039,6 +2039,7 @@ kernel void chunked_delta(
         float sp = av + dtb;
         float softplus = sp > 20.0f ? sp : (sp < -20.0f ? 0.0f : log(1.0f+exp(sp)));
         cp[t] = (t==0) ? exp(a_dec*softplus) : cp[t-1]*exp(a_dec*softplus);
+        cp[t] = max(cp[t], 1e-20f); // cp floor: cp[t]/cp[i] must never be 0/0
     }
     float delta[16];
     for (uint t=0;t<C;t++) {
@@ -4617,6 +4618,7 @@ kernel void chunked_delta_c(
         float sp = av + dtb;
         float softplus = sp > 20.0f ? sp : (sp < -20.0f ? 0.0f : log(1.0f+exp(sp)));
         cp[t] = (t==0) ? exp(a_dec*softplus) : cp[t-1]*exp(a_dec*softplus);
+        cp[t] = max(cp[t], 1e-20f); // cp floor: cp[t]/cp[i] must never be 0/0
     }
     float delta[16];
     for (uint t=0;t<C;t++) {
@@ -5373,6 +5375,7 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	// much as the GEMVs themselves. QGEMVEXACT=1 restores that overwrite.
 	g_gemv_exact = os.get_env("QGEMVEXACT", context.temp_allocator) == "1"
 	g_battn = os.get_env("QATTNB", context.temp_allocator) != "0"
+	g_chunk_delta = os.get_env("QCHUNKD", context.temp_allocator) == "1"
 	g_gemv2r = os.get_env("QGEMV2R", context.temp_allocator) == "1"
 	g_normfuse = os.get_env("QGEMVNORM", context.temp_allocator) == "1"
 	// Tier 3.5 is ON by default (interleaved A/B on the 9B: +5.6% decode tps,
@@ -6866,6 +6869,7 @@ g_gate_needs_hd: bool
 // Batched full-attention block (prefill chunks): PSO pair selected at init
 // next to g_sag; QATTNB=0 falls back to the per-token loop.
 g_battn: bool
+g_chunk_delta: bool // prefill: chunked (C=8, cp-floored) delta instead of the per-token recurrence (numerics differ)
 g_store_b_pso, g_attn_b_pso: ^MTL.ComputePipelineState
 
 // attention output gate: o_h *= sigmoid(gate_h), gate = second half of each qproj head
@@ -7532,6 +7536,19 @@ switch lw.layer_type {
 			// the sequential delta recurrence per token (setBuffer offsets into the
 			// token's _t row; was 7 dispatches/token).
 			enc_l2norm_batch(enc, m_b_qkv2_t, m_b_qlin_t, m_b_klin_t, head_k_dim, key_dim, conv_dim, n_real, n_kh, l2_scale)
+			if g_chunk_delta {
+				// C=8 chunked forward-substitution (cp floored at 1e-20 inside the
+				// kernel — the documented 0/0 NaN root cause). Numerics differ from
+				// the per-token recurrence (QCHUNKD=1 opt-in).
+				cs0 := 0
+				for cs0 < n_real {
+					clen := min(8, n_real - cs0)
+					enc_chunked_delta(enc, m_b_qlin_t, m_b_klin_t, m_b_qkv2_t, m_b_bt, m_b_at,
+						raw_data(la.a_decay), raw_data(la.dt_bias), m_b_rec_states, m_b_loutt,
+						head_k_dim, head_v_dim, clen, key_dim, conv_dim, value_dim, n_vh, n_kh, cs0, slot)
+					cs0 += clen
+				}
+			} else {
 			qk_b := NS.UInteger(key_dim * 4)
 			for t in 0 ..< n_real {
 				oqkv := NS.UInteger(t) * qkv_b; oba := NS.UInteger(t) * ba_b; olout := NS.UInteger(t) * lout_b
@@ -7550,6 +7567,7 @@ switch lw.layer_type {
 					enc->setBytes(bytes_of(&dp, size_of(dp)), 9)
 				}
 				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_vh), 1, 1}, MTL.Size{NS.Integer(head_v_dim), 1, 1})
+			}
 			}
 			enc_rmsgated_batch(enc, m_b_loutt, m_b_loutt, raw_data(la.norm_w), m_b_zt, head_v_dim, n_vh, n_real, eps)
 			} // end QPROF_NOLIN guard
@@ -7842,6 +7860,19 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 			// recurrence left per token (running on the token's _t row via
 			// setBuffer offsets). Was 7 dispatches/token -> 2 + T per layer.
 			enc_l2norm_batch(enc, m_b_qkv2_t, m_b_qlin_t, m_b_klin_t, head_k_dim, key_dim, conv_dim, n_real, n_kh, l2_scale)
+			if g_chunk_delta {
+				// C=8 chunked forward-substitution (cp floored at 1e-20 inside the
+				// kernel — the documented 0/0 NaN root cause). Numerics differ from
+				// the per-token recurrence (QCHUNKD=1 opt-in).
+				cs0 := 0
+				for cs0 < n_real {
+					clen := min(8, n_real - cs0)
+					enc_chunked_delta(enc, m_b_qlin_t, m_b_klin_t, m_b_qkv2_t, m_b_bt, m_b_at,
+						raw_data(la.a_decay), raw_data(la.dt_bias), m_b_rec_states, m_b_loutt,
+						head_k_dim, head_v_dim, clen, key_dim, conv_dim, value_dim, n_vh, n_kh, cs0, slot)
+					cs0 += clen
+				}
+			} else {
 			qk_b := NS.UInteger(key_dim * 4)
 			for t in 0 ..< n_real {
 				oqkv := NS.UInteger(t) * qkv_b; oba := NS.UInteger(t) * ba_b; olout := NS.UInteger(t) * lout_b
@@ -7860,6 +7891,7 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 					enc->setBytes(bytes_of(&dp, size_of(dp)), 9)
 				}
 				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_vh), 1, 1}, MTL.Size{NS.Integer(head_v_dim), 1, 1})
+			}
 			}
 			enc_rmsgated_batch(enc, m_b_loutt, m_b_loutt, raw_data(la.norm_w), m_b_zt, head_v_dim, n_vh, n_real, eps)
 			} // end QPROF_NOLIN guard

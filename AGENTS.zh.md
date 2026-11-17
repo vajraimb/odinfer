@@ -204,6 +204,14 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
   （0.8B MoE GPU 输出与 QATTNB=0 逐位一致）；其 GEMV 覆写保持原样（数值决策）。
   线性循环 = 批量 l2norm/rmsgated（Stage 2 遗产内核）+ 逐 token delta；l2norm 批量版
   的乘法顺序已对齐逐 token 版（iq 不折叠 scale），改内核时保持。
+- **int8 MMQ 在 Apple/Metal 上不存在（2026-11-18 实证，别再评估）**：
+  `simdgroup_matrix<int8_t/int32_t>` 触发 static_assert——simdgroup mma 只有
+  f16/f32，MSL 也没有 dp4a（那是 CUDA）。llama.cpp 的 int8 MMQ 不走 Metal。
+  本机 f16 mma 微基准（寄存器内）≈ 2.25 TFLOPS（热态），我们的宽-N MMQ 已达
+  其 ~89%——内核侧在硬件墙。工具：`gemm_harness/mma_ratio_bench.odin`。
+- **chunked delta 已接线但默认关（QCHUNKD=1 开，2026-11-18）**：C=8，核内
+  cp≥1e-20 下限修 0/0 NaN 根因。交错实测 −0.4~−0.9 ms/tok（6-8% prefill）。
+  数值是逐 token 递归的重排（非逐位一致）——默认口径的决定留给维护者。
 - **MMQ 的 A 级 dequant 必须向量化（2026-11-17 已交付）**：宽-N MMQ
   （`gemm_q4k_f32_n32`/`gemm_q6k_f32_n64`）的 dequant 逐元素标量写法是 ALU
   瓶颈；uchar4 加载 + 向量 nibble 运算 + half4 写（B 级 half4）后 Q4 +22%、

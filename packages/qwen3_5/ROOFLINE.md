@@ -158,6 +158,25 @@ BK=128 变体全面更慢,弃。
 天花板 ~1.8 TFLOPS"已交付大半;残余 ~10% 在 mma/barrier 结构,dequant 不再是
 瓶颈。
 
+### int8 MMQ 判死 + mma 峰值重校准 + chunked delta 交付(2026-11-18 凌晨)
+
+**int8 判死(数据)**:`simdgroup_matrix<int8_t/int32_t,8,8>` 在本机 Metal 工具链
+直接 static_assert 拒绝(`is_simdgroup_matrix_element`)——Metal 的 simdgroup
+矩阵只有 f16/f32 路径,无 dp4a;8-bit 整数矩阵乘在这平台不存在(llama.cpp 的
+int8 MMQ 是 CUDA 的 dp4a 路径,Metal 后端同样只用 f16 mma)。工具:
+`gemm_harness/mma_ratio_bench.odin`。**不要再评估 int8 MMQ。**
+
+**f16 mma 峰值重校准**:寄存器内微基准(无访存)实测本机(热态)f16 simdgroup
+mma ≈ **2.25 TFLOPS**——不是标称 4.3。我们的宽-N MMQ 1994 GFLOPS = 峰值的
+**~89%**,内核侧已在硬件墙(llama.cpp ~2.2 有效 = 同一堵墙);此前"46% of
+4.3"的分母是错的。端到端对 ollama 的残差不在 MMQ 内核里。
+
+**chunked delta 交付(opt-in,QCHUNKD=1)**:Stage 2 内核接线,C=8,核内加
+`cp ≥ 1e-20` 下限(修文档记载的 cp 下溢 0/0 NaN 根因;cp 单调不增,钳位只
+影响 <1e-20 的可忽略项)。交错 A/B(每轮 on 先跑):**−0.4~−0.9 ms/tok(6-8%
+prefill)**,热漂移下每轮方向一致。数值与逐 token 递归是重排关系(非逐位);
+count 提示词输出逐字相同,俳句连贯。默认关——数值口径由维护者定夺。
+
 ### 线性循环批量 norm + MoE 移植(2026-11-18 深夜)
 
 重消融(批量注意力后,基线 9.84):full 批量块只剩 0.42(flash 融合贬值,弃),
