@@ -586,6 +586,197 @@ kernel void gemv_iq2_xxs(device const uchar *wb [[buffer(0)]], device const floa
     if (lane % 8 == 0 && row < dim.d) out[row] = sum;
 }
 
+// Short-K IQ2_XXS: the simdgroup splits K, two rows share the x tile, and the
+// scale is applied once per 32 weights. 0.593 -> 0.426 ms on 5120x17408
+// against the 8-lane two-row kernel, max_rel 5e-6. Long K stays on spec.
+kernel void gemv_iq2_xxs_ks(
+    device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]],
+    uint tg [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint nb32 = 160;
+    uint row0 = (tg * 8u + sgitg) * 2u;
+    uint row1 = row0 + 1u;
+    float s0 = 0.0f, s1 = 0.0f;
+    for (uint ib32 = tiisg; ib32 < nb32; ib32 += 32) {
+        uint yb = ib32 * 32;
+        float yl[32];
+        for (uint i = 0; i < 32; ++i) yl[i] = x[yb + i];
+        uint ibl = ib32 >> 3;
+        uint ib = ib32 & 7;
+        device const uchar *b0 = wb + ((ulong)row0 * 20u + ibl) * 66;
+        device const uchar *b1 = wb + ((ulong)row1 * 20u + ibl) * 66;
+        float d0 = (float)(*(device const half *)b0);
+        float d1 = (float)(*(device const half *)b1);
+        uint qb = 2 + 8 * ib;
+        uint aux0 = (uint)b0[qb + 4] | ((uint)b0[qb + 5] << 8) | ((uint)b0[qb + 6] << 16) | ((uint)b0[qb + 7] << 24);
+        uint aux1 = (uint)b1[qb + 4] | ((uint)b1[qb + 5] << 8) | ((uint)b1[qb + 6] << 16) | ((uint)b1[qb + 7] << 24);
+        float db0 = d0 * (0.5f + (float)(aux0 >> 28)) * 0.25f;
+        float db1 = d1 * (0.5f + (float)(aux1 >> 28)) * 0.25f;
+        float a0 = 0.0f, a1 = 0.0f;
+        for (uint l = 0; l < 4; ++l) {
+            ulong g0 = iq2xxs_grid[b0[qb + l]];
+            ulong g1 = iq2xxs_grid[b1[qb + l]];
+            uchar sg0 = ksigns_iq2xs[(aux0 >> (7 * l)) & 127];
+            uchar sg1 = ksigns_iq2xs[(aux1 >> (7 * l)) & 127];
+            for (uint j = 0; j < 8; ++j) {
+                float xj = yl[8 * l + j];
+                float v0 = (float)((g0 >> (8 * j)) & 0xff);
+                float v1 = (float)((g1 >> (8 * j)) & 0xff);
+                float z0 = (sg0 & (1u << j)) == 0 ? 1.0f : -1.0f;
+                float z1 = (sg1 & (1u << j)) == 0 ? 1.0f : -1.0f;
+                a0 += v0 * z0 * xj;
+                a1 += v1 * z1 * xj;
+            }
+        }
+        s0 += db0 * a0;
+        s1 += db1 * a1;
+    }
+    s0 = simd_sum(s0);
+    s1 = simd_sum(s1);
+    if (tiisg == 0) { out[row0] = s0; out[row1] = s1; }
+}
+
+// Short-K IQ1_S, same simdgroup split. Delta is applied once per 32 weights.
+// 0.60 -> 0.46 ms on 5120x17408 against the scalar spec kernel, max_rel 1e-5.
+kernel void gemv_iq1_s_ks(
+    device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]],
+    uint tg [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint nb32 = 160;
+    uint rowbase = (tg * 8u + sgitg) * 2u;
+    float sumf[2] = {0.0f, 0.0f};
+    for (uint ib32 = tiisg; ib32 < nb32; ib32 += 32) {
+        uint yb = ib32 * 32;
+        float yl[32];
+        float sumy = 0.0f;
+        for (uint i = 0; i < 32; ++i) { yl[i] = x[yb + i]; sumy += yl[i]; }
+        uint ibl = ib32 >> 3;
+        uint ib = ib32 & 7;
+        for (uint row = 0; row < 2; ++row) {
+            device const uchar *blk = wb + ((ulong)(rowbase + row) * 20u + ibl) * 50;
+            float d = (float)(*(device const half*)blk);
+            device const uchar *qs = blk + 2 + 4 * ib;
+            uint qh = (uint)blk[34 + 2 * ib] | ((uint)blk[35 + 2 * ib] << 8);
+            float scale = (float)(2 * (int)((qh >> 12) & 7) + 1);
+            float delta = (qh & 0x8000) == 0 ? 0.125f : -0.125f;
+            float sum = 0.0f;
+            for (uint l = 0; l < 4; ++l) {
+                uint idx = (uint)qs[l] | (((qh >> (3 * l)) & 7) << 8);
+                ulong grid = iq1s_grid[idx];
+                for (uint j = 0; j < 8; ++j) {
+                    float gv = (float)((char)((grid >> (8 * j)) & 0xff));
+                    sum += gv * yl[8 * l + j];
+                }
+            }
+            sumf[row] += d * (sum + delta * sumy) * scale;
+        }
+    }
+    for (uint row = 0; row < 2; ++row) {
+        float all = simd_sum(sumf[row]);
+        if (tiisg == 0) out[rowbase + row] = all;
+    }
+}
+
+// Long-K (n == 17408) IQ2_XXS. Same split as gemv_iq2_xxs_ks with the
+// superblock count baked. Inside the production library: 0.653 -> 0.436 ms
+// on 5120x17408, max_rel 1.7e-4.
+kernel void gemv_iq2_xxs_ks_l(
+    device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]],
+    uint tg [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint nsb = 68;
+    constexpr uint nb32 = 544;
+    uint row0 = (tg * 8u + sgitg) * 2u;
+    uint row1 = row0 + 1u;
+    float s0 = 0.0f, s1 = 0.0f;
+    for (uint ib32 = tiisg; ib32 < nb32; ib32 += 32) {
+        uint yb = ib32 * 32;
+        float yl[32];
+        for (uint i = 0; i < 32; ++i) yl[i] = x[yb + i];
+        uint ibl = ib32 >> 3;
+        uint ib = ib32 & 7;
+        device const uchar *b0 = wb + ((ulong)row0 * nsb + ibl) * 66;
+        device const uchar *b1 = wb + ((ulong)row1 * nsb + ibl) * 66;
+        float d0 = (float)(*(device const half *)b0);
+        float d1 = (float)(*(device const half *)b1);
+        uint qb = 2 + 8 * ib;
+        uint aux0 = (uint)b0[qb + 4] | ((uint)b0[qb + 5] << 8) | ((uint)b0[qb + 6] << 16) | ((uint)b0[qb + 7] << 24);
+        uint aux1 = (uint)b1[qb + 4] | ((uint)b1[qb + 5] << 8) | ((uint)b1[qb + 6] << 16) | ((uint)b1[qb + 7] << 24);
+        float db0 = d0 * (0.5f + (float)(aux0 >> 28)) * 0.25f;
+        float db1 = d1 * (0.5f + (float)(aux1 >> 28)) * 0.25f;
+        float a0 = 0.0f, a1 = 0.0f;
+        for (uint l = 0; l < 4; ++l) {
+            ulong g0 = iq2xxs_grid[b0[qb + l]];
+            ulong g1 = iq2xxs_grid[b1[qb + l]];
+            uchar sg0 = ksigns_iq2xs[(aux0 >> (7 * l)) & 127];
+            uchar sg1 = ksigns_iq2xs[(aux1 >> (7 * l)) & 127];
+            for (uint j = 0; j < 8; ++j) {
+                float xj = yl[8 * l + j];
+                float v0 = (float)((g0 >> (8 * j)) & 0xff);
+                float v1 = (float)((g1 >> (8 * j)) & 0xff);
+                float z0 = (sg0 & (1u << j)) == 0 ? 1.0f : -1.0f;
+                float z1 = (sg1 & (1u << j)) == 0 ? 1.0f : -1.0f;
+                a0 += v0 * z0 * xj;
+                a1 += v1 * z1 * xj;
+            }
+        }
+        s0 += db0 * a0;
+        s1 += db1 * a1;
+    }
+    s0 = simd_sum(s0);
+    s1 = simd_sum(s1);
+    if (tiisg == 0) { out[row0] = s0; out[row1] = s1; }
+}
+
+// Long-K (n == 17408) IQ1_S. 0.570 -> 0.484 ms on 5120x17408, max_rel 6e-6.
+kernel void gemv_iq1_s_ks_l(
+    device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]],
+    uint tg [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint nsb = 68;
+    constexpr uint nb32 = 544;
+    uint rowbase = (tg * 8u + sgitg) * 2u;
+    float sumf[2] = {0.0f, 0.0f};
+    for (uint ib32 = tiisg; ib32 < nb32; ib32 += 32) {
+        uint yb = ib32 * 32;
+        float yl[32];
+        float sumy = 0.0f;
+        for (uint i = 0; i < 32; ++i) { yl[i] = x[yb + i]; sumy += yl[i]; }
+        uint ibl = ib32 >> 3;
+        uint ib = ib32 & 7;
+        for (uint row = 0; row < 2; ++row) {
+            device const uchar *blk = wb + ((ulong)(rowbase + row) * nsb + ibl) * 50;
+            float d = (float)(*(device const half*)blk);
+            device const uchar *qs = blk + 2 + 4 * ib;
+            uint qh = (uint)blk[34 + 2 * ib] | ((uint)blk[35 + 2 * ib] << 8);
+            float scale = (float)(2 * (int)((qh >> 12) & 7) + 1);
+            float delta = (qh & 0x8000) == 0 ? 0.125f : -0.125f;
+            float sum = 0.0f;
+            for (uint l = 0; l < 4; ++l) {
+                uint idx = (uint)qs[l] | (((qh >> (3 * l)) & 7) << 8);
+                ulong grid = iq1s_grid[idx];
+                for (uint j = 0; j < 8; ++j) {
+                    float gv = (float)((char)((grid >> (8 * j)) & 0xff));
+                    sum += gv * yl[8 * l + j];
+                }
+            }
+            sumf[row] += d * (sum + delta * sumy) * scale;
+        }
+    }
+    for (uint row = 0; row < 2; ++row) {
+        float all = simd_sum(sumf[row]);
+        if (tiisg == 0) out[rowbase + row] = all;
+    }
+}
+
 kernel void gemv_iq2_xs(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
     device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
     uint tg [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
@@ -685,6 +876,104 @@ kernel void gemv_iq3_xxs(device const uchar *wb [[buffer(0)]], device const floa
     sum += simd_shuffle_xor(sum, 2);
     sum += simd_shuffle_xor(sum, 1);
     if (lane % 8 == 0 && row < dim.d) out[row] = sum;
+}
+
+// IQ2_S: simdgroup splits K, two rows share x, the two scales of each
+// 32-group sit outside the inner product. 0.71 -> 0.46 ms on 5120x17408
+// next to the production library, max_rel 5e-6. nsb is buffer(3).
+kernel void gemv_iq2_s_ks(
+    device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant uint &nsb_in [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    uint nsb = nsb_in;
+    uint nb32 = nsb * 8u;
+    uint rowbase = (tg * 8u + sgitg) * 2u;
+    float sumf[2] = {0.0f, 0.0f};
+    for (uint ib32 = tiisg; ib32 < nb32; ib32 += 32) {
+        uint yb = ib32 * 32;
+        float yl[32];
+        for (uint i = 0; i < 32; ++i) yl[i] = x[yb + i];
+        uint ibl = ib32 >> 3;
+        uint ib = ib32 & 7;
+        for (uint row = 0; row < 2; ++row) {
+            device const uchar *blk = wb + ((ulong)(rowbase + row) * nsb + ibl) * 82;
+            float d = (float)(*(device const half*)blk);
+            device const uchar *qs = blk + 2 + 4 * ib;
+            device const uchar *sg = blk + 34 + 4 * ib;
+            uint qh = blk[66 + ib];
+            uchar scv = blk[74 + ib];
+            float db0 = d * (0.5f + (float)(scv & 0xF)) * 0.25f;
+            float db1 = d * (0.5f + (float)(scv >> 4)) * 0.25f;
+            float lo = 0.0f, hi = 0.0f;
+            for (uint l = 0; l < 4; ++l) {
+                uint idx = (uint)qs[l] | ((qh << (8 - 2 * l)) & 0x300);
+                ulong grid = iq2s_grid[idx];
+                uchar sn = sg[l];
+                float acc = 0.0f;
+                for (uint j = 0; j < 8; ++j) {
+                    float v = (float)((grid >> (8 * j)) & 0xff);
+                    float s = (sn & kmask_iq2xs[j]) == 0 ? 1.0f : -1.0f;
+                    acc += v * s * yl[8 * l + j];
+                }
+                if (l < 2) lo += acc; else hi += acc;
+            }
+            sumf[row] += db0 * lo + db1 * hi;
+        }
+    }
+    for (uint row = 0; row < 2; ++row) {
+        float all = simd_sum(sumf[row]);
+        if (tiisg == 0) out[rowbase + row] = all;
+    }
+}
+
+// IQ3_XXS, same split. One scale per 32 weights. 0.74 -> 0.45 ms on
+// 5120x17408, max_rel 2e-5.
+kernel void gemv_iq3_xxs_ks(
+    device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant uint &nsb_in [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    uint nsb = nsb_in;
+    uint nb32 = nsb * 8u;
+    uint rowbase = (tg * 8u + sgitg) * 2u;
+    float sumf[2] = {0.0f, 0.0f};
+    for (uint ib32 = tiisg; ib32 < nb32; ib32 += 32) {
+        uint yb = ib32 * 32;
+        float yl[32];
+        for (uint i = 0; i < 32; ++i) yl[i] = x[yb + i];
+        uint ibl = ib32 >> 3;
+        uint ib = ib32 & 7;
+        for (uint row = 0; row < 2; ++row) {
+            device const uchar *blk = wb + ((ulong)(rowbase + row) * nsb + ibl) * 98;
+            float d = (float)(*(device const half*)blk);
+            device const uchar *qs = blk + 2 + 8 * ib;
+            device const uchar *sas = blk + 66 + 4 * ib;
+            uint aux = (uint)sas[0] | ((uint)sas[1] << 8) | ((uint)sas[2] << 16) | ((uint)sas[3] << 24);
+            float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;
+            float acc = 0.0f;
+            for (uint l = 0; l < 4; ++l) {
+                uchar signs = ksigns_iq2xs[(aux >> (7 * l)) & 127];
+                uint g1 = iq3xxs_grid[qs[2 * l + 0]];
+                uint g2 = iq3xxs_grid[qs[2 * l + 1]];
+                for (uint j = 0; j < 4; ++j) {
+                    float v1 = (float)((g1 >> (8 * j)) & 0xff);
+                    float v2 = (float)((g2 >> (8 * j)) & 0xff);
+                    float s1 = (signs & kmask_iq2xs[j + 0]) == 0 ? 1.0f : -1.0f;
+                    float s2 = (signs & kmask_iq2xs[j + 4]) == 0 ? 1.0f : -1.0f;
+                    acc += v1 * s1 * yl[8 * l + j];
+                    acc += v2 * s2 * yl[8 * l + j + 4];
+                }
+            }
+            sumf[row] += db * acc;
+        }
+    }
+    for (uint row = 0; row < 2; ++row) {
+        float all = simd_sum(sumf[row]);
+        if (tiisg == 0) out[rowbase + row] = all;
+    }
 }
 
 kernel void gemv_iq3_s(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
@@ -1725,6 +2014,65 @@ kernel void gemm_iq1s_f32(
     if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0, N);
 }
 
+// IQ1_S N=16: one K pass, two N=8 panels. 2.72 -> 2.10 ms on 17408x5120, max_rel 0.
+kernel void gemm_iq1s_n16(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 32, c0 = tgpig.x * 16;
+    const ulong row_bytes = (ulong)(K / 256) * 50;
+    threadgroup half sa[32 * 32];
+    threadgroup half sb[32 * 16];
+    simdgroup_half8x8 a_tile, b0, b1;
+    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = sgitg * 8;
+    for (uint k = 0; k < K; k += 32) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            uint row = tiitg >> 2, col_base = (tiitg & 3) * 8;
+            if (r0 + row < M) {
+                uint e_base = k + col_base;
+                device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 50;
+                int ew = int(e_base & 255);
+                float d = (float)(*(device const half *)blk);
+                device const uchar * qs = blk + 2; device const uchar * qh = blk + 34;
+                uint ib = (uint)ew >> 5;
+                uint qhv = (uint)qh[2 * ib] | ((uint)qh[2 * ib + 1] << 8);
+                float dl = d * (float)(2 * (int)((qhv >> 12) & 7) + 1);
+                float delta = (qhv & 0x8000) == 0 ? 0.125f : -0.125f;
+                uint l = ((uint)ew >> 3) & 3;
+                uint idx = (uint)qs[4 * ib + l] | (((qhv >> (3 * l)) & 7) << 8);
+                ulong grid = iq1s_grid[idx];
+                for (uint j = 0; j < 8; j++) {
+                    float gv = (float)((char)((grid >> (8 * j)) & 0xff));
+                    sa[row * 32 + col_base + j] = (half)(dl * (gv + delta));
+                }
+            }
+        }
+        for (uint t = tiitg; t < 32u * 16u; t += 128u) {
+            uint kr = t >> 4, nc = t & 15;
+            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ik = 0; ik < 4; ik++) {
+            simdgroup_load(a_tile, sa + sg_row * 32 + ik * 8, 32);
+            simdgroup_load(b0, sb + ik * 128, 16);
+            simdgroup_load(b1, sb + ik * 128 + 8, 16);
+            simdgroup_multiply_accumulate(acc0, a_tile, b0, acc0);
+            simdgroup_multiply_accumulate(acc1, a_tile, b1, acc1);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (r0 + sg_row < M) {
+        simdgroup_store(acc0, C + (ulong)(r0 + sg_row) * N + c0, N);
+        simdgroup_store(acc1, C + (ulong)(r0 + sg_row) * N + c0 + 8, N);
+    }
+}
+
 // IQ1_M: block = 56 bytes: qs[32], qh[16], scales[8].
 kernel void gemm_iq1m_f32(
     device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
@@ -1844,6 +2192,66 @@ kernel void gemm_iq2xxs_f32(
     if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0, N);
 }
 
+// IQ2_XXS N=16: one K pass feeds two N=8 panels. 2.69 -> 2.07 ms on
+// 17408x5120 against two BN=8 tiles, max_rel 0. N%32 stays on the wide tile.
+kernel void gemm_iq2xxs_n16(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 32, c0 = tgpig.x * 16;
+    const ulong row_bytes = (ulong)(K / 256) * 66;
+    threadgroup half sa[32 * 32];
+    threadgroup half sb[32 * 16];
+    simdgroup_half8x8 a_tile, b0, b1;
+    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = sgitg * 8;
+    for (uint k = 0; k < K; k += 32) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            uint row = tiitg >> 2, col_base = (tiitg & 3) * 8;
+            if (r0 + row < M) {
+                uint e_base = k + col_base;
+                device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 66;
+                int ew = int(e_base & 255);
+                float d = (float)(*(device const half *)blk);
+                uint ib32 = (uint)ew >> 5;
+                uint qb = 2 + 8 * ib32;
+                uint aux1 = (uint)blk[qb + 4] | ((uint)blk[qb + 5] << 8) | ((uint)blk[qb + 6] << 16) | ((uint)blk[qb + 7] << 24);
+                float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;
+                uint l = ((uint)ew >> 3) & 3;
+                ulong grid = iq2xxs_grid[blk[qb + l]];
+                uchar signs = ksigns_iq2xs[(aux1 >> (7 * l)) & 127];
+                for (uint j = 0; j < 8; j++) {
+                    float v = (float)((grid >> (8 * j)) & 0xff);
+                    float s = (signs & kmask_iq2xs[j]) == 0 ? 1.0f : -1.0f;
+                    sa[row * 32 + col_base + j] = (half)(db * v * s);
+                }
+            }
+        }
+        for (uint t = tiitg; t < 32u * 16u; t += 128u) {
+            uint kr = t >> 4, nc = t & 15;
+            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ik = 0; ik < 4; ik++) {
+            simdgroup_load(a_tile, sa + sg_row * 32 + ik * 8, 32);
+            simdgroup_load(b0, sb + ik * 128, 16);
+            simdgroup_load(b1, sb + ik * 128 + 8, 16);
+            simdgroup_multiply_accumulate(acc0, a_tile, b0, acc0);
+            simdgroup_multiply_accumulate(acc1, a_tile, b1, acc1);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (r0 + sg_row < M) {
+        simdgroup_store(acc0, C + (ulong)(r0 + sg_row) * N + c0, N);
+        simdgroup_store(acc1, C + (ulong)(r0 + sg_row) * N + c0 + 8, N);
+    }
+}
+
 // IQ2_XS: block = 74 bytes: d(2), qs[64] (16-bit codes), sc[8].
 kernel void gemm_iq2xs_f32(
     device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
@@ -1957,6 +2365,69 @@ kernel void gemm_iq2s_f32(
     if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0, N);
 }
 
+// IQ2_S N=16: one K pass, two N=8 panels. 2.72 -> 2.13 ms on 17408x5120, max_rel 0.
+kernel void gemm_iq2s_n16(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 32, c0 = tgpig.x * 16;
+    const ulong row_bytes = (ulong)(K / 256) * 82;
+    threadgroup half sa[32 * 32];
+    threadgroup half sb[32 * 16];
+    simdgroup_half8x8 a_tile, b0, b1;
+    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = sgitg * 8;
+    for (uint k = 0; k < K; k += 32) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            uint row = tiitg >> 2, col_base = (tiitg & 3) * 8;
+            if (r0 + row < M) {
+                uint e_base = k + col_base;
+                device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 82;
+                int ew = int(e_base & 255);
+                float d = (float)(*(device const half *)blk);
+                device const uchar * qs = blk + 2; device const uchar * signs = blk + 34;
+                device const uchar * qh = blk + 66; device const uchar * scales = blk + 74;
+                uint ib32 = (uint)ew >> 5;
+                uchar sc = scales[ib32];
+                float db0 = d * (0.5f + (float)(sc & 0xF)) * 0.25f;
+                float db1 = d * (0.5f + (float)(sc >> 4)) * 0.25f;
+                uint l = ((uint)ew >> 3) & 3;
+                uint idx = (uint)qs[4 * ib32 + l] | (((uint)qh[ib32] << (8 - 2 * l)) & 0x300);
+                ulong grid = iq2s_grid[idx];
+                uchar sn = signs[4 * ib32 + l];
+                float dl = (l < 2) ? db0 : db1;
+                for (uint j = 0; j < 8; j++) {
+                    float v = (float)((grid >> (8 * j)) & 0xff);
+                    float s = (sn & kmask_iq2xs[j]) == 0 ? 1.0f : -1.0f;
+                    sa[row * 32 + col_base + j] = (half)(dl * v * s);
+                }
+            }
+        }
+        for (uint t = tiitg; t < 32u * 16u; t += 128u) {
+            uint kr = t >> 4, nc = t & 15;
+            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ik = 0; ik < 4; ik++) {
+            simdgroup_load(a_tile, sa + sg_row * 32 + ik * 8, 32);
+            simdgroup_load(b0, sb + ik * 128, 16);
+            simdgroup_load(b1, sb + ik * 128 + 8, 16);
+            simdgroup_multiply_accumulate(acc0, a_tile, b0, acc0);
+            simdgroup_multiply_accumulate(acc1, a_tile, b1, acc1);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (r0 + sg_row < M) {
+        simdgroup_store(acc0, C + (ulong)(r0 + sg_row) * N + c0, N);
+        simdgroup_store(acc1, C + (ulong)(r0 + sg_row) * N + c0 + 8, N);
+    }
+}
+
 // IQ3_XXS: block = 98 bytes: d(2), qs[64] (2 bytes per 8 elems), sas[32] (signs+scale).
 kernel void gemm_iq3xxs_f32(
     device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
@@ -2013,6 +2484,70 @@ kernel void gemm_iq3xxs_f32(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0, N);
+}
+
+// IQ3_XXS N=16: one K pass, two N=8 panels. 2.81 -> 2.14 ms on 17408x5120, max_rel 0.
+kernel void gemm_iq3xxs_n16(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 32, c0 = tgpig.x * 16;
+    const ulong row_bytes = (ulong)(K / 256) * 98;
+    threadgroup half sa[32 * 32];
+    threadgroup half sb[32 * 16];
+    simdgroup_half8x8 a_tile, b0, b1;
+    simdgroup_float8x8 acc0 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 acc1 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = sgitg * 8;
+    for (uint k = 0; k < K; k += 32) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            uint row = tiitg >> 2, col_base = (tiitg & 3) * 8;
+            if (r0 + row < M) {
+                uint e_base = k + col_base;
+                device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 98;
+                int ew = int(e_base & 255);
+                float d = (float)(*(device const half *)blk);
+                device const uchar * qs = blk + 2; device const uchar * sas = blk + 66;
+                uint ib32 = (uint)ew >> 5;
+                uint sbase = 4 * ib32;
+                uint aux = (uint)sas[sbase] | ((uint)sas[sbase + 1] << 8) | ((uint)sas[sbase + 2] << 16) | ((uint)sas[sbase + 3] << 24);
+                float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;
+                uint l = ((uint)ew >> 3) & 3;
+                uchar signs = ksigns_iq2xs[(aux >> (7 * l)) & 127];
+                uint g1 = iq3xxs_grid[qs[8 * ib32 + 2 * l + 0]];
+                uint g2 = iq3xxs_grid[qs[8 * ib32 + 2 * l + 1]];
+                for (uint j = 0; j < 4; j++) {
+                    float v1 = (float)((g1 >> (8 * j)) & 0xff);
+                    float v2 = (float)((g2 >> (8 * j)) & 0xff);
+                    float s1 = (signs & kmask_iq2xs[j + 0]) == 0 ? 1.0f : -1.0f;
+                    float s2 = (signs & kmask_iq2xs[j + 4]) == 0 ? 1.0f : -1.0f;
+                    sa[row * 32 + col_base + j + 0] = (half)(db * v1 * s1);
+                    sa[row * 32 + col_base + j + 4] = (half)(db * v2 * s2);
+                }
+            }
+        }
+        for (uint t = tiitg; t < 32u * 16u; t += 128u) {
+            uint kr = t >> 4, nc = t & 15;
+            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ik = 0; ik < 4; ik++) {
+            simdgroup_load(a_tile, sa + sg_row * 32 + ik * 8, 32);
+            simdgroup_load(b0, sb + ik * 128, 16);
+            simdgroup_load(b1, sb + ik * 128 + 8, 16);
+            simdgroup_multiply_accumulate(acc0, a_tile, b0, acc0);
+            simdgroup_multiply_accumulate(acc1, a_tile, b1, acc1);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (r0 + sg_row < M) {
+        simdgroup_store(acc0, C + (ulong)(r0 + sg_row) * N + c0, N);
+        simdgroup_store(acc1, C + (ulong)(r0 + sg_row) * N + c0 + 8, N);
+    }
 }
 
 // IQ3_S: block = 110 bytes: d(2), qs[64], qh[8], signs[32], scales[4].
@@ -3858,6 +4393,9 @@ metal_enabled: bool
 m_pso_f32, m_pso_f16, m_pso_q8_0, m_pso_q4_0, m_pso_q4_1, m_pso_q5_0, m_pso_q5_1, m_pso_q4_k, m_pso_q6_k: ^MTL.ComputePipelineState
 	m_pso_q2_k, m_pso_q3_k, m_pso_q5_k, m_pso_q8_k: ^MTL.ComputePipelineState // k-quant GEMV kernels
 	m_pso_iq1_s, m_pso_iq1_m, m_pso_iq2_xxs, m_pso_iq2_xs, m_pso_iq2_s: ^MTL.ComputePipelineState
+	m_pso_iq2xxs_ks, m_pso_iq1s_ks: ^MTL.ComputePipelineState // short-K simdgroup K-split
+	m_pso_iq2xxs_ks_l, m_pso_iq1s_ks_l: ^MTL.ComputePipelineState // n=17408 K-split
+	m_pso_iq2s_ks, m_pso_iq3xxs_ks: ^MTL.ComputePipelineState // IQ2_S / IQ3_XXS K-split, n from setBytes
 	m_pso_iq3_xxs, m_pso_iq3_s, m_pso_iq4_nl, m_pso_iq4_xs: ^MTL.ComputePipelineState
 	m_pso_q4_k3, m_pso_q6_k3: ^MTL.ComputePipelineState // row-split v3 GEMV kernels (QGEMV3=1)
 	m_pso_q4_k2r, m_pso_q6_k2r: ^MTL.ComputePipelineState // 2 rows/lane GEMV kernels (QGEMV2R=1)
@@ -3886,6 +4424,7 @@ m_pso_iq3xxs_mm, m_pso_iq3s_mm, m_pso_iq4xs_mm, m_pso_q2k_mm, m_pso_q3k_mm, m_ps
 @(private = "file")
 // IQ wide-N MMQ (BM=32 BN=32 BK=64). QMMQN=0 keeps the v3 PSOs above.
 m_pso_iq1s_n32, m_pso_iq1m_n32, m_pso_iq2xxs_n32, m_pso_iq2xs_n32, m_pso_iq2s_n32,
+	m_pso_iq2xxs_n16, m_pso_iq1s_n16, m_pso_iq2s_n16, m_pso_iq3xxs_n16: ^MTL.ComputePipelineState // BN=16, two N=8 panels, one K pass
 m_pso_iq3xxs_n32, m_pso_iq3s_n32, m_pso_iq4xs_n32: ^MTL.ComputePipelineState
 @(private = "file")
 m_pso_conv_batch, m_pso_conv_update: ^MTL.ComputePipelineState // Stage 2 batched conv1d
@@ -4533,6 +5072,12 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	m_pso_q5_k = make_pso(lib, "gemv_q5_k"); m_pso_q8_k = make_pso(lib, "gemv_q8_k")
 	m_pso_iq1_s = make_pso(lib, "gemv_iq1_s"); m_pso_iq1_m = make_pso(lib, "gemv_iq1_m")
 	m_pso_iq2_xxs = make_pso(lib, "gemv_iq2_xxs"); m_pso_iq2_xs = make_pso(lib, "gemv_iq2_xs")
+	m_pso_iq2xxs_ks = make_pso(lib, "gemv_iq2_xxs_ks")
+	m_pso_iq1s_ks = make_pso(lib, "gemv_iq1_s_ks")
+	m_pso_iq2xxs_ks_l = make_pso(lib, "gemv_iq2_xxs_ks_l")
+	m_pso_iq1s_ks_l = make_pso(lib, "gemv_iq1_s_ks_l")
+	m_pso_iq2s_ks = make_pso(lib, "gemv_iq2_s_ks")
+	m_pso_iq3xxs_ks = make_pso(lib, "gemv_iq3_xxs_ks")
 	m_pso_iq2_s = make_pso(lib, "gemv_iq2_s"); m_pso_iq3_xxs = make_pso(lib, "gemv_iq3_xxs")
 	m_pso_iq3_s = make_pso(lib, "gemv_iq3_s"); m_pso_iq4_nl = make_pso(lib, "gemv_iq4_nl")
 	m_pso_iq4_xs = make_pso(lib, "gemv_iq4_xs")
@@ -4562,6 +5107,10 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	m_pso_iq2s_mm = make_pso(lib, "gemm_iq2s_f32"); m_pso_iq3xxs_mm = make_pso(lib, "gemm_iq3xxs_f32")
 	m_pso_iq3s_mm = make_pso(lib, "gemm_iq3s_f32"); m_pso_iq4xs_mm = make_pso(lib, "gemm_iq4xs_f32")
 	m_pso_iq2xxs_n32 = make_pso(lib, "gemm_iq2xxs_32_32_64")
+	m_pso_iq2xxs_n16 = make_pso(lib, "gemm_iq2xxs_n16")
+	m_pso_iq1s_n16 = make_pso(lib, "gemm_iq1s_n16")
+	m_pso_iq2s_n16 = make_pso(lib, "gemm_iq2s_n16")
+	m_pso_iq3xxs_n16 = make_pso(lib, "gemm_iq3xxs_n16")
 	m_pso_iq1s_n32 = make_pso(lib, "gemm_iq1s_32_32_64")
 	m_pso_iq2s_n32 = make_pso(lib, "gemm_iq2s_32_32_64")
 	m_pso_iq3xxs_n32 = make_pso(lib, "gemm_iq3xxs_32_32_64")
@@ -5519,6 +6068,31 @@ moe_ffn_gpu :: proc(enc: ^^MTL.ComputeCommandEncoder, cmd: ^^MTL.CommandBuffer, 
 
 enc_gemv :: proc(enc: ^MTL.ComputeCommandEncoder, kind: ggml.GGML_Type, w_off: NS.UInteger,
 	xb: ^MTL.Buffer, x_off: NS.UInteger, ob: ^MTL.Buffer, o_off: NS.UInteger, n, d: int) {
+	// IQ2_XXS / IQ1_S, n baked into the kernel. 16 rows per threadgroup.
+	// n=5120 is the up/attn shape; n=17408 is the down shape.
+	if (kind == .IQ2_XXS || kind == .IQ1_S) && d % 16 == 0 && d > 0 && (n == 5120 || n == 17408) {
+		ks := m_pso_iq2xxs_ks
+		if n == 17408 {
+			ks = kind == .IQ2_XXS ? m_pso_iq2xxs_ks_l : m_pso_iq1s_ks_l
+		} else if kind == .IQ1_S {
+			ks = m_pso_iq1s_ks
+		}
+		enc->setComputePipelineState(ks)
+		enc->setBuffer(m_weights, w_off, 0); enc->setBuffer(xb, x_off, 1); enc->setBuffer(ob, o_off, 2)
+		enc->dispatchThreadgroups(MTL.Size{NS.Integer(d / 16), 1, 1}, MTL.Size{256, 1, 1})
+		return
+	}
+	// IQ2_S / IQ3_XXS, any K that is a whole number of superblocks. nsb is a
+	// uniform; a baked nsb was the same speed. 16 rows per threadgroup.
+	if (kind == .IQ2_S || kind == .IQ3_XXS) && n % 256 == 0 && n > 0 && d % 16 == 0 && d > 0 {
+		ks2 := kind == .IQ2_S ? m_pso_iq2s_ks : m_pso_iq3xxs_ks
+		nsb := u32(n / 256)
+		enc->setComputePipelineState(ks2)
+		enc->setBuffer(m_weights, w_off, 0); enc->setBuffer(xb, x_off, 1); enc->setBuffer(ob, o_off, 2)
+		enc->setBytes(bytes_of(&nsb, size_of(nsb)), 3)
+		enc->dispatchThreadgroups(MTL.Size{NS.Integer(d / 16), 1, 1}, MTL.Size{256, 1, 1})
+		return
+	}
 	pso := pso_for(kind)
 	rows_tg := GEMV_ROWS
 	// Kernel selection order: env overrides (QGEMV3/QGEMV2R, handled inside
@@ -5711,12 +6285,48 @@ enc_mm :: proc(enc: ^MTL.ComputeCommandEncoder, kind: ggml.GGML_Type, w: rawptr,
 	#partial switch kind {
 	case .Q4_K: enc_q4k(enc, w, B, B_off, C, C_off, M, N, K)
 	case .Q6_K: enc_q6k(enc, w, B, B_off, C, C_off, M, N, K)
-	case .IQ1_S:   enc_iq(enc, m_pso_iq1s_n32, m_pso_iq1s_mm, w, B, B_off, C, C_off, M, N, K)
+	case .IQ1_S:
+		if g_mmq_n && N % 16 == 0 && N % 32 != 0 && K % 32 == 0 && M > 0 {
+			enc->setComputePipelineState(m_pso_iq1s_n16)
+			enc->setBuffer(m_weights, woff(w), 0); enc->setBuffer(B, B_off, 1); enc->setBuffer(C, C_off, 2)
+			dims16 := GemmDims{u32(M), u32(N), u32(K)}
+			enc->setBytes(bytes_of(&dims16, size_of(dims16)), 3)
+			enc->dispatchThreadgroups(MTL.Size{NS.Integer(N / 16), NS.Integer((M + 31) / 32), 1}, MTL.Size{128, 1, 1})
+		} else {
+			enc_iq(enc, m_pso_iq1s_n32, m_pso_iq1s_mm, w, B, B_off, C, C_off, M, N, K)
+		}
 	case .IQ1_M:   enc_iq(enc, m_pso_iq1m_n32, m_pso_iq1m_mm, w, B, B_off, C, C_off, M, N, K)
-	case .IQ2_XXS: enc_iq(enc, m_pso_iq2xxs_n32, m_pso_iq2xxs_mm, w, B, B_off, C, C_off, M, N, K)
+	case .IQ2_XXS:
+		if g_mmq_n && N % 16 == 0 && N % 32 != 0 && K % 32 == 0 && M > 0 {
+			enc->setComputePipelineState(m_pso_iq2xxs_n16)
+			enc->setBuffer(m_weights, woff(w), 0); enc->setBuffer(B, B_off, 1); enc->setBuffer(C, C_off, 2)
+			dims16 := GemmDims{u32(M), u32(N), u32(K)}
+			enc->setBytes(bytes_of(&dims16, size_of(dims16)), 3)
+			enc->dispatchThreadgroups(MTL.Size{NS.Integer(N / 16), NS.Integer((M + 31) / 32), 1}, MTL.Size{128, 1, 1})
+		} else {
+			enc_iq(enc, m_pso_iq2xxs_n32, m_pso_iq2xxs_mm, w, B, B_off, C, C_off, M, N, K)
+		}
 	case .IQ2_XS:  enc_iq(enc, m_pso_iq2xs_n32, m_pso_iq2xs_mm, w, B, B_off, C, C_off, M, N, K)
-	case .IQ2_S:   enc_iq(enc, m_pso_iq2s_n32, m_pso_iq2s_mm, w, B, B_off, C, C_off, M, N, K)
-	case .IQ3_XXS: enc_iq(enc, m_pso_iq3xxs_n32, m_pso_iq3xxs_mm, w, B, B_off, C, C_off, M, N, K)
+	case .IQ2_S:
+		if g_mmq_n && N % 16 == 0 && N % 32 != 0 && K % 32 == 0 && M > 0 {
+			enc->setComputePipelineState(m_pso_iq2s_n16)
+			enc->setBuffer(m_weights, woff(w), 0); enc->setBuffer(B, B_off, 1); enc->setBuffer(C, C_off, 2)
+			dims16 := GemmDims{u32(M), u32(N), u32(K)}
+			enc->setBytes(bytes_of(&dims16, size_of(dims16)), 3)
+			enc->dispatchThreadgroups(MTL.Size{NS.Integer(N / 16), NS.Integer((M + 31) / 32), 1}, MTL.Size{128, 1, 1})
+		} else {
+			enc_iq(enc, m_pso_iq2s_n32, m_pso_iq2s_mm, w, B, B_off, C, C_off, M, N, K)
+		}
+	case .IQ3_XXS:
+		if g_mmq_n && N % 16 == 0 && N % 32 != 0 && K % 32 == 0 && M > 0 {
+			enc->setComputePipelineState(m_pso_iq3xxs_n16)
+			enc->setBuffer(m_weights, woff(w), 0); enc->setBuffer(B, B_off, 1); enc->setBuffer(C, C_off, 2)
+			dims16 := GemmDims{u32(M), u32(N), u32(K)}
+			enc->setBytes(bytes_of(&dims16, size_of(dims16)), 3)
+			enc->dispatchThreadgroups(MTL.Size{NS.Integer(N / 16), NS.Integer((M + 31) / 32), 1}, MTL.Size{128, 1, 1})
+		} else {
+			enc_iq(enc, m_pso_iq3xxs_n32, m_pso_iq3xxs_mm, w, B, B_off, C, C_off, M, N, K)
+		}
 	case .IQ3_S:   enc_iq(enc, m_pso_iq3s_n32, m_pso_iq3s_mm, w, B, B_off, C, C_off, M, N, K)
 	case .IQ4_XS:  enc_iq(enc, m_pso_iq4xs_n32, m_pso_iq4xs_mm, w, B, B_off, C, C_off, M, N, K)
 	case .Q2_K:    enc_mm_v3(enc, m_pso_q2k_mm, w, B, B_off, C, C_off, M, N, K)
@@ -6038,6 +6648,8 @@ forward_gpu :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 		nonorm := nosmall || strings.contains(prof_s, "nonorm")
 		noattn := nosmall || strings.contains(prof_s, "noattn")
 		nodelta := nosmall || strings.contains(prof_s, "nodelta")
+		noup := strings.contains(prof_s, "noup")
+		nodown := strings.contains(prof_s, "nodown")
 	} else {
 		noout := false
 		nomlp := false
@@ -6045,6 +6657,8 @@ forward_gpu :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 		nonorm := false
 		noattn := false
 		nodelta := false
+		noup := false
+		nodown := false
 	}
 
 	cmd := m_queue->commandBuffer()
@@ -6192,9 +6806,11 @@ forward_gpu :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 			if p.is_moe {
 				moe_ffn_gpu(&enc, &cmd, transformer, l, nonorm)
 			} else if g_normfuse {
-				enc_gemv_norm(enc, lw.w1.kind, woff(raw_data(lw.w1.data)), woff(raw_data(lw.ffn_norm)), m_b_x, 0, m_b_hb, 0, dim, hidden_dim, eps)
-				enc_gemv_norm(enc, lw.w3.kind, woff(raw_data(lw.w3.data)), woff(raw_data(lw.ffn_norm)), m_b_x, 0, m_b_hb2, 0, dim, hidden_dim, eps)
-			} else {
+				if !noup {
+					enc_gemv_norm(enc, lw.w1.kind, woff(raw_data(lw.w1.data)), woff(raw_data(lw.ffn_norm)), m_b_x, 0, m_b_hb, 0, dim, hidden_dim, eps)
+					enc_gemv_norm(enc, lw.w3.kind, woff(raw_data(lw.w3.data)), woff(raw_data(lw.ffn_norm)), m_b_x, 0, m_b_hb2, 0, dim, hidden_dim, eps)
+				}
+			} else if !noup {
 				enc_gemv(enc, lw.w1.kind, woff(raw_data(lw.w1.data)), m_b_xb, 0, m_b_hb, 0, dim, hidden_dim)
 				enc_gemv(enc, lw.w3.kind, woff(raw_data(lw.w3.data)), m_b_xb, 0, m_b_hb2, 0, dim, hidden_dim)
 			}
@@ -6202,7 +6818,9 @@ forward_gpu :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 				if !nosmall {
 					enc_elementwise(enc, m_pso_swiglu, m_b_hb, m_b_hb2, hidden_dim)
 				}
-				enc_gemv(enc, lw.w2.kind, woff(raw_data(lw.w2.data)), m_b_hb, 0, m_b_xb, 0, hidden_dim, dim)
+				if !nodown {
+					enc_gemv(enc, lw.w2.kind, woff(raw_data(lw.w2.data)), m_b_hb, 0, m_b_xb, 0, hidden_dim, dim)
+				}
 				enc_elementwise(enc, m_pso_residual, m_b_x, m_b_xb, dim)
 			}
 		}
