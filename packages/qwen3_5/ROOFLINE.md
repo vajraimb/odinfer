@@ -110,6 +110,27 @@ q6k 假带宽 189 GB/s = shape 配错只算 1/3)。
 **最终判定:本机 decode 优化封顶(带宽墙 + 2.5% CPU 间隙),prefill MMQ 死磕仍是
 唯一 >10% 杠杆(roofline 原判断不变)。**
 
+## 同机 ollama 对照(2026-11-17 晚,同 GGUF blob,交替同窗,贪心)
+
+对照组:ollama 0.40.16(runner llamacpp,100% GPU,常驻),模型
+`hf.co/mradermacher/...heretic-GGUF:Q4_K_M`——与 odinfer 用的 GGUF 是**同一个
+blob**(sha256-a692de95),prompt/贪心/模板对齐(raw:true 复刻 odin 渲染),每轮
+交替执行防热漂移;ollama 的 KV prompt 缓存用唯一 prompt 后缀击败(否则会测到
+0.3-0.6 ms/tok 的假 prefill)。
+
+| 指标 | odinfer(当日 build) | ollama | 差距 |
+|---|---|---|---|
+| decode tok/s(内部速率) | 11.3(85 ms/tok GPU) | 14.2-14.9(67-71 ms/tok) | ollama 1.27× |
+| prefill ms/tok(T=448 块) | 11.0-12.6 | 6.0-6.4 | ollama 1.76× |
+| 454-tok TTFT(模型常驻) | ~5.0 s(纯 prefill) | 2.8-3.0 s | — |
+
+解读:ollama decode 全 token 折算 ~80 GB/s 有效带宽——等于我们隔离最优内核
+(Q8_0 探针 82-86)的水平,说明差距不在单个大 GEMV 的带宽,而在(a)小内核/调度
+开销(我们 ~85ms 里 ~14ms 非 GEMV),(b)混合 shape 上的逐形状 tile 选择
+(llama.cpp 的 mul_mv_ext 按形状选参,我们固定 8-lane;autotune 框架
+Tune_Cand 已有,可扩)。prefill 侧 llama.cpp MMQ 有效吞吐 ~2.2 TFLOPS vs 我们
+v4 的 ~1.66——MMQ 死磕的下一目标明确:双缓冲 sa/sb 消 barrier/更大 tile。
+
 ## MMQ dequant 向量化交付(2026-11-17 下半场,"死磕 MMQ"的第一刀)
 
 问题:宽-N MMQ 的 A 级(stage)dequant 是逐元素标量代码,Q6_K 每元素两次字节加载
