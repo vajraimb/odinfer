@@ -2885,6 +2885,12 @@ kernel void gemm_q4k_f32_b64(
 //   Q4_K  BM=32 BN=32 BK=64  ~1470 GFLOPS vs b64 ~1195 and vs BN=8 ~1020
 //   Q6_K  BM=16 BN=64 BK=64  ~800 GFLOPS vs BN=8 ~480
 //     (Q6 BM=64 BN=8 BK=64 stays the known ~0.66x regression; do not select it)
+// 2026-11-17 (tools/gemm_harness/mmq_v4_sweep.odin, thermal-interleaved): the
+// A-stage dequant was scalar per element and ALU-limiting; it now uses uchar4
+// loads + vector nibble math + half4 stores, and the B stage loads half4.
+// Same halves as the scalar path (gate max_rel identical to the digit).
+// Interleaved on the 9B shapes: Q4 1356->1659 GFLOPS (+22%), Q6 465-533
+// ->~1590 GFLOPS (~3x). BK=128 variants measured slower; do not widen K.
 // Requires M%BM==0, N%BN==0, K%BK==0. Rel err vs ggml.dequant_row+f16 was ~4e-7.
 kernel void gemm_q4k_f32_n32(
     device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
@@ -2915,16 +2921,20 @@ kernel void gemm_q4k_f32_n32(
             device const uchar * qs = blk + 16;
             uchar sc, m; k4_get_scale_min(is, scales, sc, m);
             float dl = d * (float)sc, ml = dmin * (float)m;
-            int qoff = sup * 32, shift = 4 * hf;
+            int qoff = sup * 32;
+            uint4 sh = uint4((uint)(4 * hf));
             int l32 = ew & 31;
-            for (uint j = 0; j < 8; j++) {
-                uchar nib = (qs[qoff + l32 + int(j)] >> shift) & 0xF;
-                sa[row * 64 + col_base + j] = (half)(dl * (float)nib - ml);
-            }
+            device const uchar4 * qv = (device const uchar4 *)(qs + qoff + l32);
+            threadgroup half4 * sav = (threadgroup half4 *)(sa + row * 64 + col_base);
+            uint4 v0 = uint4(qv[0]);
+            uint4 v1 = uint4(qv[1]);
+            sav[0] = (half4)(float4((v0 >> sh) & 15u) * dl - ml);
+            sav[1] = (half4)(float4((v1 >> sh) & 15u) * dl - ml);
         }
-        for (uint t = tiitg; t < 64 * 32; t += 512) {
-            uint kr = t / 32, nc = t % 32;
-            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        for (uint t4 = tiitg; t4 < 64 * 32 / 4; t4 += 512) {
+            uint e = t4 * 4;
+            uint kr = e / 32, nc = e % 32;
+            *(threadgroup half4 *)(sb + e) = *(device const half4 *)(B + (ulong)(k + kr) * N + c0 + nc);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint ik = 0; ik < 8; ik++) {
@@ -2966,21 +2976,34 @@ kernel void gemm_q6k_f32_n64(
             device const uchar * qh = blk + 128;
             device const char  * sc = (device const char *)(blk + 192);
             float dl = d * (float)sc[hf * 8 + is + 2 * sub];
-            int qloff = hf * 64, qhoff = hf * 32;
+            int qloff = hf * 64 + (sub & 1) * 32, qhoff = hf * 32;
             int l32 = ew & 31;
-            for (uint j = 0; j < 8; j++) {
-                int l = l32 + int(j);
-                int q;
-                if (sub == 0)      q = ((ql[qloff + l]      & 0xF) | (((qh[qhoff + l] >> 0) & 3) << 4)) - 32;
-                else if (sub == 1) q = ((ql[qloff + l + 32] & 0xF) | (((qh[qhoff + l] >> 2) & 3) << 4)) - 32;
-                else if (sub == 2) q = ((ql[qloff + l] >> 4)       | (((qh[qhoff + l] >> 4) & 3) << 4)) - 32;
-                else               q = ((ql[qloff + l + 32] >> 4)  | (((qh[qhoff + l] >> 6) & 3) << 4)) - 32;
-                sa[row * 64 + col_base + j] = (half)(dl * (float)q);
+            device const uchar4 * qlv = (device const uchar4 *)(ql + qloff + l32);
+            device const uchar4 * qhv = (device const uchar4 *)(qh + qhoff + l32);
+            threadgroup half4 * sav = (threadgroup half4 *)(sa + row * 64 + col_base);
+            uint4 qa = uint4(qlv[0]), qb = uint4(qlv[1]);
+            uint4 h0 = uint4(qhv[0]), h1 = uint4(qhv[1]);
+            uint4 q01, q23;
+            if (sub == 0) {
+                q01 = (qa & 15u) | ((h0 & 3u) << 4);
+                q23 = (qb & 15u) | ((h1 & 3u) << 4);
+            } else if (sub == 1) {
+                q01 = (qa & 15u) | (((h0 >> 2u) & 3u) << 4);
+                q23 = (qb & 15u) | (((h1 >> 2u) & 3u) << 4);
+            } else if (sub == 2) {
+                q01 = ((qa >> 4u) & 15u) | (((h0 >> 4u) & 3u) << 4);
+                q23 = ((qb >> 4u) & 15u) | (((h1 >> 4u) & 3u) << 4);
+            } else {
+                q01 = ((qa >> 4u) & 15u) | (((h0 >> 6u) & 3u) << 4);
+                q23 = ((qb >> 4u) & 15u) | (((h1 >> 6u) & 3u) << 4);
             }
+            sav[0] = (half4)(float4(int4(q01) - 32) * dl);
+            sav[1] = (half4)(float4(int4(q23) - 32) * dl);
         }
-        for (uint t = tiitg; t < 64 * 64; t += 512) {
-            uint kr = t / 64, nc = t % 64;
-            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        for (uint t4 = tiitg; t4 < 64 * 64 / 4; t4 += 512) {
+            uint e = t4 * 4;
+            uint kr = e / 64, nc = e % 64;
+            *(threadgroup half4 *)(sb + e) = *(device const half4 *)(B + (ulong)(k + kr) * N + c0 + nc);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint ik = 0; ik < 8; ik++) {

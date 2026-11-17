@@ -110,6 +110,34 @@ q6k 假带宽 189 GB/s = shape 配错只算 1/3)。
 **最终判定:本机 decode 优化封顶(带宽墙 + 2.5% CPU 间隙),prefill MMQ 死磕仍是
 唯一 >10% 杠杆(roofline 原判断不变)。**
 
+## MMQ dequant 向量化交付(2026-11-17 下半场,"死磕 MMQ"的第一刀)
+
+问题:宽-N MMQ 的 A 级(stage)dequant 是逐元素标量代码,Q6_K 每元素两次字节加载
++ or/shift,是 roofline 判定的 ALU 瓶颈本身。
+
+改动(`gemm_q4k_f32_n32` / `gemm_q6k_f32_n64`,kernel 名与分派不变):A 级改
+uchar4 加载 + 向量 nibble 运算 + half4 写 threadgroup,B 级改 half4 加载。
+数值与标量路径**逐位一致**(gate max_rel 与标量版到数字位都相同)。
+
+交错实测(`tools/gemm_harness/mmq_v4_sweep.odin`,10 轮,gate=f64 dot):
+
+| shape(9B) | 基线 | v4 | 比 |
+|---|---|---|---|
+| Q4 up/gate 12288×64×4096 | 1356 GFLOPS | **1659** | +22% |
+| Q6 down 4096×64×12288 | 465 | **1588** | 3.4× |
+| Q6 qkv 8192×64×4096 | 533 | **1586** | 3.0× |
+| Q6 output 248320×64×4096 | 512 | **1598** | 3.1×(254→81 ms/slab) |
+
+BK=128 变体全面更慢,弃。
+
+端到端(同机同会话,T=448 chunk):**15.50 → 12.59 ms/tok(+23% 吞吐)**,贪心输出
+与基线逐字一致,build.sh 单测/metal_smoke 120 kernel/test_mcp 全绿。
+
+新 roofline:prefill 已从收工时的 ~900 GFLOPS 推到 **~1600–1660**,原"硬工程
+天花板 ~1.8 TFLOPS"已交付大半;残余 ~10% 在 mma/barrier 结构,dequant 不再是
+瓶颈。
+
+
 ## v1.0 Release Status(收工基线)
 - **主线交付**:prefill 122→23 ms/tok(**4.9×**),贪心解码 **bit-identical**
   (`2+2=4`、`Paris`、1062-token 摘要逐字一致),三仓库(origin/main)同步。

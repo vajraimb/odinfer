@@ -197,6 +197,12 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
   generic 41 GB/s vs `gemv_iq2_xxs_ks_l` 52 GB/s（同窗 +27%，median 亦 +），
   IQ1_S 31→36 GB/s。这类内核离墙很远（IQ 解量化 ALU 重），结构改动有效——
   与 Q4_K/Q6_K 的"无增益"结论不矛盾。
+- **MMQ 的 A 级 dequant 必须向量化（2026-11-17 已交付）**：宽-N MMQ
+  （`gemm_q4k_f32_n32`/`gemm_q6k_f32_n64`）的 dequant 逐元素标量写法是 ALU
+  瓶颈；uchar4 加载 + 向量 nibble 运算 + half4 写（B 级 half4）后 Q4 +22%、
+  Q6 ~3×（交错实测，`gemm_harness/mmq_v4_sweep.odin`），数值逐位一致，端到端
+  prefill 15.50→12.59 ms/tok。重写这些 kernel 时不要退回标量 dequant；
+  BK=128 已实测更慢，别加宽 K。
 - 内核计时必须**墙钟 + 正确性验证**：GPU 计时器（GPUEndTime）对短 dispatch
   会给出假数据（曾误判 22.5ms 输出层，实际 6.4ms）。
 - Odin 语法小坑：for 循环里不能直接放数组字面量（先命名变量）；proc 参数取
