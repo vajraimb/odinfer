@@ -86,6 +86,30 @@ continuation 修复后实测 pie 真实会话仍 100% miss。服务端 QDUMP_DIV
 **契约**:任何客户端只要改变 system 块/历史消息的**字节**(哪怕语义等价的 JSON 键序),
 前缀缓存即失效。稳定序列化是客户端责任;服务端 `QDUMP_DIVERGE=1` 可打点定位漂移段。
 
+## Decode GEMV 带宽墙终验 + 交错计时方法学（2026-11-17）
+
+问题:README 记录的"MLP GEMV 76 GB/s / attention 90 GB/s"与本次复测对不上,且
+同一内核两次 sweep 差 2×。归因:**M3 Air 被动散热,会话内 GPU 时钟漂移**——顺序
+逐变体计时的 A/B 会被热状态系统性带偏(实测 ks8r2 顺序"赢 44%",交错实为慢 20%;
+q6k 假带宽 189 GB/s = shape 配错只算 1/3)。
+
+方法学修正(`gemm_harness/gemv_9b_ks.odin`,CHECK=1 对拍 + 12 轮交错,每轮每变体
+一个 command buffer×5 dispatch,取 min/median):
+
+- **Q4_K/Q6_K GEMV 在墙上**:9B 四大流量 shape(up/gate 12288×4096 Q4_K ×66、
+  down 4096×12288 Q6_K ×33、qkv 8192×4096 Q6_K ×33、output 248320×4096 Q6_K)
+  上,generic ≈ Tier3.5 spec ≈ ks16/ks8r2/ks8r4/ks32 ≈ uchar4 向量化 v4(逐位
+  一致),全部 55–75 GB/s;Q8_0 同 shape 探针 66–86 GB/s。差距 < 变体间噪声。
+  结论:结构(8 种)与 ALU 微优化(手写 nibble 向量化)都已到头,编译器等价。
+- **decode 端到端**:墙钟 87.6ms/tok vs GPU 85.4ms/tok(11.4 tok/s,热态),
+  CPU 间隙 ~2.5%——双 buffer 预编码最多 +2.6%,低 ROI 不做。
+- **IQ ks(K-split 双行)复验为真**:IQ2_XXS down generic 41→ks_l 52 GB/s(+27%,
+  median 同向),IQ1_S 31→36。IQ 内核离墙远(重解量化 ALU),结构改动有效;
+  与 Q4_K/Q6_K 无增益不矛盾。未提交的 ks/n16 系列可以放心提交。
+
+**最终判定:本机 decode 优化封顶(带宽墙 + 2.5% CPU 间隙),prefill MMQ 死磕仍是
+唯一 >10% 杠杆(roofline 原判断不变)。**
+
 ## v1.0 Release Status(收工基线)
 - **主线交付**:prefill 122→23 ms/tok(**4.9×**),贪心解码 **bit-identical**
   (`2+2=4`、`Paris`、1062-token 摘要逐字一致),三仓库(origin/main)同步。

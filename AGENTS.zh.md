@@ -44,6 +44,12 @@ odin-serve "$HOME/.odinfer/models/Qwen3.5-0.8B-MoE-A0.6B-Q4_K_M.gguf" --mcp --me
 ./build.sh        # 全量：bin/odin-serve + bin/odin-cli + 全部单测（约 1-2 分钟）
 ```
 
+> ⚠️ 本机（vajra 的 M3 Air）Homebrew 默认 `odin` 是 `2026-11a`：其
+> `vendor:darwin/Metal` 的 `MTL.Size` 字段从 `Integer` 改成了 `UInteger`，
+> 本仓库源码（锁定 `dev-2026-07`）用它编译直接报错。本机构建/测试请用
+> `PATH=/opt/homebrew/Cellar/odin/2026-07a/bin:$PATH ./build.sh`（该 keg
+> 已装好）；test_mcp.py 等会自行重建二进制的脚本同样要带这个 PATH。
+
 单测单独跑：
 
 ```sh
@@ -172,6 +178,25 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
 
 - GEMV 内核形状：本机（M3）最优 = 256 线程/32 行/8 lanes；其余多行/多线程/
   融合变体实测回归（数据在 packages/qwen3_5/README.md 与 gemm_harness）。
+- **内核 A/B 必须同窗交错计时（2026-11-17 实证）**：M3 Air 被动散热，GPU 时钟
+  随热状态在会话内漂移 ~2×。同一 harness 内**顺序**逐变体计时会得出完全相反的
+  结论——实测 q4k ks8r2 变体顺序计时"赢 44%"（0.755→0.524ms），交错计时（每轮
+  各变体各一个 command buffer 轮转 12 轮取 min/median）实为**慢 20%**；q6k
+  顺序计时还出过 189 GB/s 的假带宽（>DRAM 物理上限，实为只算了 1/3 的 shape
+  配错）。正确做法见 `gemm_harness/gemv_9b_ks.odin`（CHECK=1 先对拍，默认
+  交错计时；含 Q8_0 同 shape 带宽天花板探针）。凡"新内核更快"的结论，先过
+  这道闸。
+- **9B decode 的 Q4_K/Q6_K GEMV 已在带宽墙上（2026-11-17 交错实测）**：同窗下
+  generic/spec(特化)/ks16/ks8r2/ks8r4/ks32/uchar4 手写向量化（v4，逐位一致）
+  在 up/gate 12288×4096、down 4096×12288、qkv 8192×4096、output 248320×4096
+  上全部落在 55–75 GB/s（热态 median ~50-55，凉态 best ~72）；Q8_0 探针（解量化
+  最便宜）同 shape 也只有 66–86 GB/s。结构与 ALU 微优化均无增益，编译器已生成
+  等价代码。decode 剩余空间不在 GEMV 内核里；engine 端墙钟 87.6ms vs GPU
+  85.4ms/token，CPU 间隙仅 ~2.5%，也不是杠杆。**decode 已封顶，别再投。**
+- **IQ ks 内核（K-split 双行）经交错复验为真**：IQ2_XXS down 5120×17408
+  generic 41 GB/s vs `gemv_iq2_xxs_ks_l` 52 GB/s（同窗 +27%，median 亦 +），
+  IQ1_S 31→36 GB/s。这类内核离墙很远（IQ 解量化 ALU 重），结构改动有效——
+  与 Q4_K/Q6_K 的"无增益"结论不矛盾。
 - 内核计时必须**墙钟 + 正确性验证**：GPU 计时器（GPUEndTime）对短 dispatch
   会给出假数据（曾误判 22.5ms 输出层，实际 6.4ms）。
 - Odin 语法小坑：for 循环里不能直接放数组字面量（先命名变量）；proc 参数取

@@ -33,6 +33,8 @@ def read_meta(path):
                         val.append(f.read(vlen).decode())
                 elif at == 0:
                     val = list(struct.unpack(f"<{alen}B", f.read(alen)))
+                elif at == 7:
+                    val = [b != 0 for b in struct.unpack(f"<{alen}B", f.read(alen))]
                 elif at == 4:
                     val = list(struct.unpack(f"<{alen}I", f.read(4 * alen)))
                 elif at == 5:
