@@ -42,10 +42,11 @@ Variant :: struct {
 VARIANTS := []Variant{
 	{"q4k_n32",     false, 32, 32, 64, 512},
 	{"q4k_n32v",    false, 32, 32, 64, 512},
-	{"q4k_n32v128", false, 32, 32, 128, 512},
+	{"q4k_n32v2",   false, 32, 32, 64, 512},
+	{"q4k_n64v2",   false, 32, 64, 64, 1024},
 	{"q6k_n64",     true,  16, 64, 64, 512},
 	{"q6k_n64v",    true,  16, 64, 64, 512},
-	{"q6k_n64v128", true,  16, 64, 128, 512},
+	{"q6k_n64v2",   true,  16, 64, 64, 512},
 }
 
 Shape :: struct {
@@ -443,6 +444,221 @@ MSL_Q6_V128 :: `kernel void q6k_n64v128(
 }
 `
 
+// ---- Double-buffered pipelines: load tile k+1 into the other buffer while
+// the simdgroup mma consumes tile k; one barrier per K step instead of two.
+// q4k_n32v2 / q6k_n64v2 keep the production geometry; q4k_n64v2 widens BN to
+// 64 with 1024-thread threadgroups. ----
+MSL_V2 :: `
+
+inline void q4v2_stage(device const uchar * A, device const half * B,
+    uint M, uint N, ulong row_bytes, uint k, uint r0, uint c0, uint tiitg, uint sbase,
+    threadgroup half * sa, threadgroup half * sb) {
+    for (uint row = tiitg / 8; row < 32; row += 64) {
+        const uint col_base = (tiitg % 8) * 8;
+        uint e_base = k + col_base;
+        if (r0 + row >= M) { continue; }
+        device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 144;
+        int ew = int(e_base & 255), sup = ew >> 6, hf = (ew >> 5) & 1, is = sup * 2 + hf;
+        float d = (float)(*(device const half *)(blk));
+        float dmin = (float)(*(device const half *)(blk + 2));
+        device const uchar * scales = blk + 4;
+        device const uchar * qs = blk + 16;
+        uchar sc, m; k4_get_scale_min(is, scales, sc, m);
+        float dl = d * (float)sc, ml = dmin * (float)m;
+        int qoff = sup * 32;
+        uint4 sh = uint4((uint)(4 * hf));
+        int l32 = ew & 31;
+        device const uchar4 * qv = (device const uchar4 *)(qs + qoff + l32);
+        threadgroup half4 * sav = (threadgroup half4 *)(sa + sbase + row * 64 + col_base);
+        uint4 v0 = uint4(qv[0]);
+        uint4 v1 = uint4(qv[1]);
+        sav[0] = (half4)(float4((v0 >> sh) & 15u) * dl - ml);
+        sav[1] = (half4)(float4((v1 >> sh) & 15u) * dl - ml);
+    }
+    for (uint t4 = tiitg; t4 < 64 * 32 / 4; t4 += 512) {
+        uint e = t4 * 4;
+        uint kr = e / 32, nc = e % 32;
+        *(threadgroup half4 *)(sb + sbase + e) = *(device const half4 *)(B + (ulong)(k + kr) * N + c0 + nc);
+    }
+}
+
+kernel void q4k_n32v2(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 32, c0 = tgpig.x * 32;
+    const ulong row_bytes = (ulong)(K / 256) * 144;
+    threadgroup half sa[2 * 32 * 64];
+    threadgroup half sb[2 * 64 * 32];
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = (sgitg / 4) * 8;
+    const uint sg_col = (sgitg % 4) * 8;
+    const uint KB = K / 64;
+    q4v2_stage(A, B, M, N, row_bytes, 0, r0, c0, tiitg, 0, sa, sb);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint kb = 0; kb < KB; kb++) {
+        const uint buf = kb & 1u, nbuf = buf ^ 1u;
+        if (kb + 1 < KB) {
+            q4v2_stage(A, B, M, N, row_bytes, (kb + 1) * 64, r0, c0, tiitg, nbuf * 32 * 64, sa, sb);
+        }
+        const threadgroup half * sab = sa + buf * 32 * 64;
+        const threadgroup half * sbb = sb + buf * 64 * 32;
+        for (uint ik = 0; ik < 8; ik++) {
+            simdgroup_load(a_tile, sab + sg_row * 64 + ik * 8, 64);
+            simdgroup_load(b_tile, sbb + ik * 8 * 32 + sg_col, 32);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0 + sg_col, N);
+}
+
+inline void q6v2_stage(device const uchar * A, device const half * B,
+    uint M, uint N, ulong row_bytes, uint k, uint r0, uint c0, uint tiitg, uint sbase,
+    threadgroup half * sa, threadgroup half * sb) {
+    for (uint row = tiitg / 8; row < 16; row += 64) {
+        const uint col_base = (tiitg % 8) * 8;
+        uint e_base = k + col_base;
+        if (r0 + row >= M) { continue; }
+        device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 210;
+        int ew = int(e_base & 255);
+        int hf = ew >> 7, sub = (ew >> 5) & 3, is = (ew >> 4) & 1;
+        float d = (float)(*(device const half *)(blk + 208));
+        device const uchar * ql = blk;
+        device const uchar * qh = blk + 128;
+        device const char  * sc = (device const char *)(blk + 192);
+        float dl = d * (float)sc[hf * 8 + is + 2 * sub];
+        int qloff = hf * 64 + (sub & 1) * 32, qhoff = hf * 32;
+        int l32 = ew & 31;
+        device const uchar4 * qlv = (device const uchar4 *)(ql + qloff + l32);
+        device const uchar4 * qhv = (device const uchar4 *)(qh + qhoff + l32);
+        threadgroup half4 * sav = (threadgroup half4 *)(sa + sbase + row * 64 + col_base);
+        uint4 qa = uint4(qlv[0]), qb = uint4(qlv[1]);
+        uint4 h0 = uint4(qhv[0]), h1 = uint4(qhv[1]);
+        uint4 q01, q23;
+        if (sub == 0)      { q01 = (qa & 15u) | ((h0 & 3u) << 4); q23 = (qb & 15u) | ((h1 & 3u) << 4); }
+        else if (sub == 1) { q01 = (qa & 15u) | (((h0 >> 2u) & 3u) << 4); q23 = (qb & 15u) | (((h1 >> 2u) & 3u) << 4); }
+        else if (sub == 2) { q01 = ((qa >> 4u) & 15u) | (((h0 >> 4u) & 3u) << 4); q23 = ((qb >> 4u) & 15u) | (((h1 >> 4u) & 3u) << 4); }
+        else               { q01 = ((qa >> 4u) & 15u) | (((h0 >> 6u) & 3u) << 4); q23 = ((qb >> 4u) & 15u) | (((h1 >> 6u) & 3u) << 4); }
+        sav[0] = (half4)(float4(int4(q01) - 32) * dl);
+        sav[1] = (half4)(float4(int4(q23) - 32) * dl);
+    }
+    for (uint t4 = tiitg; t4 < 64 * 64 / 4; t4 += 512) {
+        uint e = t4 * 4;
+        uint kr = e / 64, nc = e % 64;
+        *(threadgroup half4 *)(sb + sbase * 4 + e) = *(device const half4 *)(B + (ulong)(k + kr) * N + c0 + nc);
+    }
+}
+
+kernel void q6k_n64v2(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 16, c0 = tgpig.x * 64;
+    const ulong row_bytes = (ulong)(K / 256) * 210;
+    threadgroup half sa[2 * 16 * 64];
+    threadgroup half sb[2 * 64 * 64];
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = (sgitg / 8) * 8;
+    const uint sg_col = (sgitg % 8) * 8;
+    const uint KB = K / 64;
+    q6v2_stage(A, B, M, N, row_bytes, 0, r0, c0, tiitg, 0, sa, sb);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint kb = 0; kb < KB; kb++) {
+        const uint buf = kb & 1u, nbuf = buf ^ 1u;
+        if (kb + 1 < KB) {
+            q6v2_stage(A, B, M, N, row_bytes, (kb + 1) * 64, r0, c0, tiitg, nbuf * 16 * 64, sa, sb);
+        }
+        const threadgroup half * sab = sa + buf * 16 * 64;
+        const threadgroup half * sbb = sb + buf * 64 * 64;
+        for (uint ik = 0; ik < 8; ik++) {
+            simdgroup_load(a_tile, sab + sg_row * 64 + ik * 8, 64);
+            simdgroup_load(b_tile, sbb + ik * 8 * 64 + sg_col, 64);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0 + sg_col, N);
+}
+
+// Q4 with BN=64: 32 simdgroups = 1024 threads; A stage uses threads 0..255
+// (32 rows x 8 chunks), B stage uses all 1024 (64x64 tile = 1024 half4).
+inline void q4v2w_stage(device const uchar * A, device const half * B,
+    uint M, uint N, ulong row_bytes, uint k, uint r0, uint c0, uint tiitg, uint sbase,
+    threadgroup half * sa, threadgroup half * sb) {
+    for (uint row = tiitg / 8; row < 32; row += 128) {
+        const uint col_base = (tiitg % 8) * 8;
+        uint e_base = k + col_base;
+        if (r0 + row >= M) { continue; }
+        device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 144;
+        int ew = int(e_base & 255), sup = ew >> 6, hf = (ew >> 5) & 1, is = sup * 2 + hf;
+        float d = (float)(*(device const half *)(blk));
+        float dmin = (float)(*(device const half *)(blk + 2));
+        device const uchar * scales = blk + 4;
+        device const uchar * qs = blk + 16;
+        uchar sc, m; k4_get_scale_min(is, scales, sc, m);
+        float dl = d * (float)sc, ml = dmin * (float)m;
+        int qoff = sup * 32;
+        uint4 sh = uint4((uint)(4 * hf));
+        int l32 = ew & 31;
+        device const uchar4 * qv = (device const uchar4 *)(qs + qoff + l32);
+        threadgroup half4 * sav = (threadgroup half4 *)(sa + sbase + row * 64 + col_base);
+        uint4 v0 = uint4(qv[0]);
+        uint4 v1 = uint4(qv[1]);
+        sav[0] = (half4)(float4((v0 >> sh) & 15u) * dl - ml);
+        sav[1] = (half4)(float4((v1 >> sh) & 15u) * dl - ml);
+    }
+    for (uint t4 = tiitg; t4 < 64 * 64 / 4; t4 += 1024) {
+        uint e = t4 * 4;
+        uint kr = e / 64, nc = e % 64;
+        *(threadgroup half4 *)(sb + sbase * 2 + e) = *(device const half4 *)(B + (ulong)(k + kr) * N + c0 + nc);
+    }
+}
+
+kernel void q4k_n64v2(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 32, c0 = tgpig.x * 64;
+    const ulong row_bytes = (ulong)(K / 256) * 144;
+    threadgroup half sa[2 * 32 * 64];
+    threadgroup half sb[2 * 64 * 64];
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = (sgitg / 8) * 8;
+    const uint sg_col = (sgitg % 8) * 8;
+    const uint KB = K / 64;
+    q4v2w_stage(A, B, M, N, row_bytes, 0, r0, c0, tiitg, 0, sa, sb);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint kb = 0; kb < KB; kb++) {
+        const uint buf = kb & 1u, nbuf = buf ^ 1u;
+        if (kb + 1 < KB) {
+            q4v2w_stage(A, B, M, N, row_bytes, (kb + 1) * 64, r0, c0, tiitg, nbuf * 32 * 64, sa, sb);
+        }
+        const threadgroup half * sab = sa + buf * 32 * 64;
+        const threadgroup half * sbb = sb + buf * 64 * 64;
+        for (uint ik = 0; ik < 8; ik++) {
+            simdgroup_load(a_tile, sab + sg_row * 64 + ik * 8, 64);
+            simdgroup_load(b_tile, sbb + ik * 8 * 64 + sg_col, 64);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0 + sg_col, N);
+}
+`
+
 rng_f :: proc(seed: ^u32) -> f32 {
 	x := seed^
 	x = x ~ (x << 13)
@@ -598,7 +814,7 @@ main :: proc() {
 	g_queue = g_dev->newCommandQueue()
 	defer g_queue->release()
 
-	src, _ := strings.concatenate({MSL_HEAD, MSL_Q4_BASE, MSL_Q6_BASE, MSL_Q4_V4, MSL_Q6_V4, MSL_Q4_V128, MSL_Q6_V128})
+	src, _ := strings.concatenate({MSL_HEAD, MSL_Q4_BASE, MSL_Q6_BASE, MSL_Q4_V4, MSL_Q6_V4, MSL_Q4_V128, MSL_Q6_V128, MSL_V2})
 	src_ns := NS.String.alloc()->initWithOdinString(src)
 	defer src_ns->release()
 	opts := MTL.CompileOptions.alloc()->init()

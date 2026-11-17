@@ -158,6 +158,19 @@ BK=128 变体全面更慢,弃。
 天花板 ~1.8 TFLOPS"已交付大半;残余 ~10% 在 mma/barrier 结构,dequant 不再是
 瓶颈。
 
+### 双缓冲交付(2026-11-18,同 harness)
+
+sa/sb 双缓冲:tile k+1 装入另一块 buffer、与 tile k 的 simdgroup mma 并行,
+每 K 步 barrier 从 2 个降到 1 个。三个生产内核换体(名字/分派门槛不变):
+`gemm_q4k_f32_n32`(1348→**1874** GFLOPS)、`gemm_q6k_f32_n64`(498→**1707**),
+新增 `gemm_q4k_f32_n64`(BM=32 BN=64,1024 线程,enc_q4k 在 N%64==0 时优先,
+**1994** GFLOPS)。gate 全过,数值与单缓冲逐位一致。
+
+端到端:T=448 chunk **12.59 → 11.23 ms/tok**(今日累计 15.50→11.23,+38%),
+贪心输出逐字一致,单测/metal_smoke 121 kernel/test_mcp 全绿。对 llama.cpp
+(~2.2 TFLOPS 有效)的内核级差距缩到 **~1.10×**(Q4 侧);端到端 prefill 差距
+从 1.76× 预计缩到 ~1.6×(未重跑 ollama 对照,模型已按用户要求卸载)。
+
 
 ## v1.0 Release Status(收工基线)
 - **主线交付**:prefill 122→23 ms/tok(**4.9×**),贪心解码 **bit-identical**

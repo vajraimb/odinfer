@@ -2889,9 +2889,43 @@ kernel void gemm_q4k_f32_b64(
 // A-stage dequant was scalar per element and ALU-limiting; it now uses uchar4
 // loads + vector nibble math + half4 stores, and the B stage loads half4.
 // Same halves as the scalar path (gate max_rel identical to the digit).
-// Interleaved on the 9B shapes: Q4 1356->1659 GFLOPS (+22%), Q6 465-533
-// ->~1590 GFLOPS (~3x). BK=128 variants measured slower; do not widen K.
-// Requires M%BM==0, N%BN==0, K%BK==0. Rel err vs ggml.dequant_row+f16 was ~4e-7.
+// 2026-11-18 (same harness): DOUBLE-BUFFERED sa/sb — tile k+1 loads into the
+// other buffer while the simdgroup mma consumes tile k; one barrier per K
+// step instead of two. Interleaved on the 9B shapes: Q4 1348->1874 GFLOPS,
+// Q6 498->1707 GFLOPS; gemm_q4k_f32_n64 (BM=32 BN=64, 1024 threads) reaches
+// 1994 GFLOPS and is preferred when N%64==0. BK=128 measured slower; do not
+// widen K. Requires M%BM==0, N%BN==0, K%BK==0. Rel err vs ggml.dequant+f16 ~4e-7.
+inline void q4v2_stage(device const uchar * A, device const half * B,
+    uint M, uint N, ulong row_bytes, uint k, uint r0, uint c0, uint tiitg, uint sbase,
+    threadgroup half * sa, threadgroup half * sb) {
+    for (uint row = tiitg / 8; row < 32; row += 64) {
+        const uint col_base = (tiitg % 8) * 8;
+        uint e_base = k + col_base;
+        if (r0 + row >= M) { continue; }
+        device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 144;
+        int ew = int(e_base & 255), sup = ew >> 6, hf = (ew >> 5) & 1, is = sup * 2 + hf;
+        float d = (float)(*(device const half *)(blk));
+        float dmin = (float)(*(device const half *)(blk + 2));
+        device const uchar * scales = blk + 4;
+        device const uchar * qs = blk + 16;
+        uchar sc, m; k4_get_scale_min(is, scales, sc, m);
+        float dl = d * (float)sc, ml = dmin * (float)m;
+        int qoff = sup * 32;
+        uint4 sh = uint4((uint)(4 * hf));
+        int l32 = ew & 31;
+        device const uchar4 * qv = (device const uchar4 *)(qs + qoff + l32);
+        threadgroup half4 * sav = (threadgroup half4 *)(sa + sbase + row * 64 + col_base);
+        uint4 v0 = uint4(qv[0]);
+        uint4 v1 = uint4(qv[1]);
+        sav[0] = (half4)(float4((v0 >> sh) & 15u) * dl - ml);
+        sav[1] = (half4)(float4((v1 >> sh) & 15u) * dl - ml);
+    }
+    for (uint t4 = tiitg; t4 < 64 * 32 / 4; t4 += 512) {
+        uint e = t4 * 4;
+        uint kr = e / 32, nc = e % 32;
+        *(threadgroup half4 *)(sb + sbase + e) = *(device const half4 *)(B + (ulong)(k + kr) * N + c0 + nc);
+    }
+}
 kernel void gemm_q4k_f32_n32(
     device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
     device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
@@ -2901,45 +2935,25 @@ kernel void gemm_q4k_f32_n32(
     const uint M = dims.M, N = dims.N, K = dims.K;
     const uint r0 = tgpig.y * 32, c0 = tgpig.x * 32;
     const ulong row_bytes = (ulong)(K / 256) * 144;
-    threadgroup half sa[32 * 64];
-    threadgroup half sb[64 * 32];
+    threadgroup half sa[2 * 32 * 64];
+    threadgroup half sb[2 * 64 * 32];
     simdgroup_half8x8 a_tile, b_tile;
     simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
     const uint sg_row = (sgitg / 4) * 8;
     const uint sg_col = (sgitg % 4) * 8;
-    for (uint k = 0; k < K; k += 64) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint row = tiitg / 8; row < 32; row += 64) {
-            const uint col_base = (tiitg % 8) * 8;
-            uint e_base = k + col_base;
-            if (r0 + row >= M) { continue; }
-            device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 144;
-            int ew = int(e_base & 255), sup = ew >> 6, hf = (ew >> 5) & 1, is = sup * 2 + hf;
-            float d = (float)(*(device const half *)(blk));
-            float dmin = (float)(*(device const half *)(blk + 2));
-            device const uchar * scales = blk + 4;
-            device const uchar * qs = blk + 16;
-            uchar sc, m; k4_get_scale_min(is, scales, sc, m);
-            float dl = d * (float)sc, ml = dmin * (float)m;
-            int qoff = sup * 32;
-            uint4 sh = uint4((uint)(4 * hf));
-            int l32 = ew & 31;
-            device const uchar4 * qv = (device const uchar4 *)(qs + qoff + l32);
-            threadgroup half4 * sav = (threadgroup half4 *)(sa + row * 64 + col_base);
-            uint4 v0 = uint4(qv[0]);
-            uint4 v1 = uint4(qv[1]);
-            sav[0] = (half4)(float4((v0 >> sh) & 15u) * dl - ml);
-            sav[1] = (half4)(float4((v1 >> sh) & 15u) * dl - ml);
+    const uint KB = K / 64;
+    q4v2_stage(A, B, M, N, row_bytes, 0, r0, c0, tiitg, 0, sa, sb);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint kb = 0; kb < KB; kb++) {
+        const uint buf = kb & 1u, nbuf = buf ^ 1u;
+        if (kb + 1 < KB) {
+            q4v2_stage(A, B, M, N, row_bytes, (kb + 1) * 64, r0, c0, tiitg, nbuf * 32 * 64, sa, sb);
         }
-        for (uint t4 = tiitg; t4 < 64 * 32 / 4; t4 += 512) {
-            uint e = t4 * 4;
-            uint kr = e / 32, nc = e % 32;
-            *(threadgroup half4 *)(sb + e) = *(device const half4 *)(B + (ulong)(k + kr) * N + c0 + nc);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const threadgroup half * sab = sa + buf * 32 * 64;
+        const threadgroup half * sbb = sb + buf * 64 * 32;
         for (uint ik = 0; ik < 8; ik++) {
-            simdgroup_load(a_tile, sa + sg_row * 64 + ik * 8, 64);
-            simdgroup_load(b_tile, sb + ik * 8 * 32 + sg_col, 32);
+            simdgroup_load(a_tile, sab + sg_row * 64 + ik * 8, 64);
+            simdgroup_load(b_tile, sbb + ik * 8 * 32 + sg_col, 32);
             simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2947,6 +2961,111 @@ kernel void gemm_q4k_f32_n32(
     if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0 + sg_col, N);
 }
 
+// Q4 wide-N: BM=32 BN=64 BK=64, 32 simdgroups = 1024 threads. sa and sb are
+// double buffered (24 KB threadgroup). A stage uses threads 0..255
+// (32 rows x 8 chunks of 8); the B stage (64x64 tile = 1024 half4) uses all.
+inline void q4v2w_stage(device const uchar * A, device const half * B,
+    uint M, uint N, ulong row_bytes, uint k, uint r0, uint c0, uint tiitg, uint sbase,
+    threadgroup half * sa, threadgroup half * sb) {
+    for (uint row = tiitg / 8; row < 32; row += 128) {
+        const uint col_base = (tiitg % 8) * 8;
+        uint e_base = k + col_base;
+        if (r0 + row >= M) { continue; }
+        device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 144;
+        int ew = int(e_base & 255), sup = ew >> 6, hf = (ew >> 5) & 1, is = sup * 2 + hf;
+        float d = (float)(*(device const half *)(blk));
+        float dmin = (float)(*(device const half *)(blk + 2));
+        device const uchar * scales = blk + 4;
+        device const uchar * qs = blk + 16;
+        uchar sc, m; k4_get_scale_min(is, scales, sc, m);
+        float dl = d * (float)sc, ml = dmin * (float)m;
+        int qoff = sup * 32;
+        uint4 sh = uint4((uint)(4 * hf));
+        int l32 = ew & 31;
+        device const uchar4 * qv = (device const uchar4 *)(qs + qoff + l32);
+        threadgroup half4 * sav = (threadgroup half4 *)(sa + sbase + row * 64 + col_base);
+        uint4 v0 = uint4(qv[0]);
+        uint4 v1 = uint4(qv[1]);
+        sav[0] = (half4)(float4((v0 >> sh) & 15u) * dl - ml);
+        sav[1] = (half4)(float4((v1 >> sh) & 15u) * dl - ml);
+    }
+    for (uint t4 = tiitg; t4 < 64 * 64 / 4; t4 += 1024) {
+        uint e = t4 * 4;
+        uint kr = e / 64, nc = e % 64;
+        *(threadgroup half4 *)(sb + sbase * 2 + e) = *(device const half4 *)(B + (ulong)(k + kr) * N + c0 + nc);
+    }
+}
+kernel void gemm_q4k_f32_n64(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 32, c0 = tgpig.x * 64;
+    const ulong row_bytes = (ulong)(K / 256) * 144;
+    threadgroup half sa[2 * 32 * 64];
+    threadgroup half sb[2 * 64 * 64];
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = (sgitg / 8) * 8;
+    const uint sg_col = (sgitg % 8) * 8;
+    const uint KB = K / 64;
+    q4v2w_stage(A, B, M, N, row_bytes, 0, r0, c0, tiitg, 0, sa, sb);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint kb = 0; kb < KB; kb++) {
+        const uint buf = kb & 1u, nbuf = buf ^ 1u;
+        if (kb + 1 < KB) {
+            q4v2w_stage(A, B, M, N, row_bytes, (kb + 1) * 64, r0, c0, tiitg, nbuf * 32 * 64, sa, sb);
+        }
+        const threadgroup half * sab = sa + buf * 32 * 64;
+        const threadgroup half * sbb = sb + buf * 64 * 64;
+        for (uint ik = 0; ik < 8; ik++) {
+            simdgroup_load(a_tile, sab + sg_row * 64 + ik * 8, 64);
+            simdgroup_load(b_tile, sbb + ik * 8 * 64 + sg_col, 64);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0 + sg_col, N);
+}
+
+inline void q6v2_stage(device const uchar * A, device const half * B,
+    uint M, uint N, ulong row_bytes, uint k, uint r0, uint c0, uint tiitg, uint sbase,
+    threadgroup half * sa, threadgroup half * sb) {
+    for (uint row = tiitg / 8; row < 16; row += 64) {
+        const uint col_base = (tiitg % 8) * 8;
+        uint e_base = k + col_base;
+        if (r0 + row >= M) { continue; }
+        device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 210;
+        int ew = int(e_base & 255);
+        int hf = ew >> 7, sub = (ew >> 5) & 3, is = (ew >> 4) & 1;
+        float d = (float)(*(device const half *)(blk + 208));
+        device const uchar * ql = blk;
+        device const uchar * qh = blk + 128;
+        device const char  * sc = (device const char *)(blk + 192);
+        float dl = d * (float)sc[hf * 8 + is + 2 * sub];
+        int qloff = hf * 64 + (sub & 1) * 32, qhoff = hf * 32;
+        int l32 = ew & 31;
+        device const uchar4 * qlv = (device const uchar4 *)(ql + qloff + l32);
+        device const uchar4 * qhv = (device const uchar4 *)(qh + qhoff + l32);
+        threadgroup half4 * sav = (threadgroup half4 *)(sa + sbase + row * 64 + col_base);
+        uint4 qa = uint4(qlv[0]), qb = uint4(qlv[1]);
+        uint4 h0 = uint4(qhv[0]), h1 = uint4(qhv[1]);
+        uint4 q01, q23;
+        if (sub == 0)      { q01 = (qa & 15u) | ((h0 & 3u) << 4); q23 = (qb & 15u) | ((h1 & 3u) << 4); }
+        else if (sub == 1) { q01 = (qa & 15u) | (((h0 >> 2u) & 3u) << 4); q23 = (qb & 15u) | (((h1 >> 2u) & 3u) << 4); }
+        else if (sub == 2) { q01 = ((qa >> 4u) & 15u) | (((h0 >> 4u) & 3u) << 4); q23 = ((qb >> 4u) & 15u) | (((h1 >> 4u) & 3u) << 4); }
+        else               { q01 = ((qa >> 4u) & 15u) | (((h0 >> 6u) & 3u) << 4); q23 = ((qb >> 4u) & 15u) | (((h1 >> 6u) & 3u) << 4); }
+        sav[0] = (half4)(float4(int4(q01) - 32) * dl);
+        sav[1] = (half4)(float4(int4(q23) - 32) * dl);
+    }
+    for (uint t4 = tiitg; t4 < 64 * 64 / 4; t4 += 512) {
+        uint e = t4 * 4;
+        uint kr = e / 64, nc = e % 64;
+        *(threadgroup half4 *)(sb + sbase * 4 + e) = *(device const half4 *)(B + (ulong)(k + kr) * N + c0 + nc);
+    }
+}
 kernel void gemm_q6k_f32_n64(
     device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
     device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
@@ -2956,59 +3075,25 @@ kernel void gemm_q6k_f32_n64(
     const uint M = dims.M, N = dims.N, K = dims.K;
     const uint r0 = tgpig.y * 16, c0 = tgpig.x * 64;
     const ulong row_bytes = (ulong)(K / 256) * 210;
-    threadgroup half sa[16 * 64];
-    threadgroup half sb[64 * 64];
+    threadgroup half sa[2 * 16 * 64];
+    threadgroup half sb[2 * 64 * 64];
     simdgroup_half8x8 a_tile, b_tile;
     simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
     const uint sg_row = (sgitg / 8) * 8;
     const uint sg_col = (sgitg % 8) * 8;
-    for (uint k = 0; k < K; k += 64) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint row = tiitg / 8; row < 16; row += 64) {
-            const uint col_base = (tiitg % 8) * 8;
-            uint e_base = k + col_base;
-            if (r0 + row >= M) { continue; }
-            device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 210;
-            int ew = int(e_base & 255);
-            int hf = ew >> 7, sub = (ew >> 5) & 3, is = (ew >> 4) & 1;
-            float d = (float)(*(device const half *)(blk + 208));
-            device const uchar * ql = blk;
-            device const uchar * qh = blk + 128;
-            device const char  * sc = (device const char *)(blk + 192);
-            float dl = d * (float)sc[hf * 8 + is + 2 * sub];
-            int qloff = hf * 64 + (sub & 1) * 32, qhoff = hf * 32;
-            int l32 = ew & 31;
-            device const uchar4 * qlv = (device const uchar4 *)(ql + qloff + l32);
-            device const uchar4 * qhv = (device const uchar4 *)(qh + qhoff + l32);
-            threadgroup half4 * sav = (threadgroup half4 *)(sa + row * 64 + col_base);
-            uint4 qa = uint4(qlv[0]), qb = uint4(qlv[1]);
-            uint4 h0 = uint4(qhv[0]), h1 = uint4(qhv[1]);
-            uint4 q01, q23;
-            if (sub == 0) {
-                q01 = (qa & 15u) | ((h0 & 3u) << 4);
-                q23 = (qb & 15u) | ((h1 & 3u) << 4);
-            } else if (sub == 1) {
-                q01 = (qa & 15u) | (((h0 >> 2u) & 3u) << 4);
-                q23 = (qb & 15u) | (((h1 >> 2u) & 3u) << 4);
-            } else if (sub == 2) {
-                q01 = ((qa >> 4u) & 15u) | (((h0 >> 4u) & 3u) << 4);
-                q23 = ((qb >> 4u) & 15u) | (((h1 >> 4u) & 3u) << 4);
-            } else {
-                q01 = ((qa >> 4u) & 15u) | (((h0 >> 6u) & 3u) << 4);
-                q23 = ((qb >> 4u) & 15u) | (((h1 >> 6u) & 3u) << 4);
-            }
-            sav[0] = (half4)(float4(int4(q01) - 32) * dl);
-            sav[1] = (half4)(float4(int4(q23) - 32) * dl);
+    const uint KB = K / 64;
+    q6v2_stage(A, B, M, N, row_bytes, 0, r0, c0, tiitg, 0, sa, sb);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint kb = 0; kb < KB; kb++) {
+        const uint buf = kb & 1u, nbuf = buf ^ 1u;
+        if (kb + 1 < KB) {
+            q6v2_stage(A, B, M, N, row_bytes, (kb + 1) * 64, r0, c0, tiitg, nbuf * 16 * 64, sa, sb);
         }
-        for (uint t4 = tiitg; t4 < 64 * 64 / 4; t4 += 512) {
-            uint e = t4 * 4;
-            uint kr = e / 64, nc = e % 64;
-            *(threadgroup half4 *)(sb + e) = *(device const half4 *)(B + (ulong)(k + kr) * N + c0 + nc);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const threadgroup half * sab = sa + buf * 16 * 64;
+        const threadgroup half * sbb = sb + buf * 64 * 64;
         for (uint ik = 0; ik < 8; ik++) {
-            simdgroup_load(a_tile, sa + sg_row * 64 + ik * 8, 64);
-            simdgroup_load(b_tile, sb + ik * 8 * 64 + sg_col, 64);
+            simdgroup_load(a_tile, sab + sg_row * 64 + ik * 8, 64);
+            simdgroup_load(b_tile, sbb + ik * 8 * 64 + sg_col, 64);
             simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -4437,7 +4522,8 @@ m_pso_conv, m_pso_l2norm, m_pso_delta, m_pso_rmsgated: ^MTL.ComputePipelineState
 m_pso_q4k, m_pso_q6k, m_pso_cast, m_pso_copy, m_pso_tr_h16, m_pso_tr_f32: ^MTL.ComputePipelineState // Stage 1a
 @(private = "file")
 m_pso_q4k_b64: ^MTL.ComputePipelineState // Stage 1a autotuned bm=64 bk=64 (M%64==0; Q4K only, Q6K regresses)
-m_pso_q4k_n32, m_pso_q6k_n64: ^MTL.ComputePipelineState // wide-N tiles: Q4 32x32x64, Q6 16x64x64
+m_pso_q4k_n32, m_pso_q6k_n64: ^MTL.ComputePipelineState // wide-N tiles: Q4 32x32x64, Q6 16x64x64 (double-buffered sa/sb)
+m_pso_q4k_n64: ^MTL.ComputePipelineState // Q4 32x64x64 @1024 threads, preferred when N%64==0
 @(private = "file")
 g_b64_seen: bool // one-shot dispatch confirmation (debug)
 @(private = "file")
@@ -5124,6 +5210,7 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	m_pso_q4k = make_pso(lib, "gemm_q4k_f32"); m_pso_q6k = make_pso(lib, "gemm_q6k_f32")
 	m_pso_q4k_b64 = make_pso(lib, "gemm_q4k_f32_b64")
 	m_pso_q4k_n32 = make_pso(lib, "gemm_q4k_f32_n32")
+	m_pso_q4k_n64 = make_pso(lib, "gemm_q4k_f32_n64")
 	m_pso_q6k_n64 = make_pso(lib, "gemm_q6k_f32_n64")
 	m_pso_iq1s_mm = make_pso(lib, "gemm_iq1s_f32"); m_pso_iq1m_mm = make_pso(lib, "gemm_iq1m_f32")
 	m_pso_iq2xxs_mm = make_pso(lib, "gemm_iq2xxs_f32"); m_pso_iq2xs_mm = make_pso(lib, "gemm_iq2xs_f32")
@@ -6232,7 +6319,13 @@ enc_copy :: proc(enc: ^MTL.ComputeCommandEncoder, src: ^MTL.Buffer, src_off: NS.
 @(private = "file")
 enc_q4k :: proc(enc: ^MTL.ComputeCommandEncoder, w: rawptr, B: ^MTL.Buffer, B_off: NS.UInteger, C: ^MTL.Buffer, C_off: NS.UInteger, M, N, K: int) {
 	dims := GemmDims{u32(M), u32(N), u32(K)}
-	if g_mmq_n && M % 32 == 0 && N % 32 == 0 && K % 64 == 0 {
+	if g_mmq_n && M % 32 == 0 && N % 64 == 0 && K % 64 == 0 {
+		// 1024-thread BN=64 tile (mmq_v4_sweep: 1994 vs 1874 GFLOPS at BN=32)
+		enc->setComputePipelineState(m_pso_q4k_n64)
+		enc->setBuffer(m_weights, woff(w), 0); enc->setBuffer(B, B_off, 1); enc->setBuffer(C, C_off, 2)
+		enc->setBytes(bytes_of(&dims, size_of(dims)), 3)
+		enc->dispatchThreadgroups(MTL.Size{NS.Integer(N / 64), NS.Integer(M / 32), 1}, MTL.Size{1024, 1, 1})
+	} else if g_mmq_n && M % 32 == 0 && N % 32 == 0 && K % 64 == 0 {
 		enc->setComputePipelineState(m_pso_q4k_n32)
 		enc->setBuffer(m_weights, woff(w), 0); enc->setBuffer(B, B_off, 1); enc->setBuffer(C, C_off, 2)
 		enc->setBytes(bytes_of(&dims, size_of(dims)), 3)
