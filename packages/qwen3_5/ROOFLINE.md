@@ -158,6 +158,29 @@ BK=128 变体全面更慢,弃。
 天花板 ~1.8 TFLOPS"已交付大半;残余 ~10% 在 mma/barrier 结构,dequant 不再是
 瓶颈。
 
+### 逐 token 状态循环批量化(2026-11-18 下半场)
+
+消融定位(QPROF_NOLIN/NOFULL,T=448,基线 10.12 ms/tok):MMQ ~8.3,全注意力
+逐 token 块 1.80,线性层状态循环 1.76。两个循环的 launch 数才是成本
+(~250 dispatch/token)。
+
+交付两刀(均逐位一致,贪心输出与逐 token 路径逐字相同):
+
+1. **批量 full-attention**(dense prefill 路径,`QATTNB=0` 回退):新增 9 个
+   batch 内核(qnorm/rope/store×{f16,q8,q8v}/attn×3/gate,运行时参数版),
+   `enc_full_attn_batch` 每层每阶段一次 launch 处理整 chunk;attention 每
+   (token,head) 一个线程组,threadgroup scratch 按 max(pos) 分配。三条 KV
+   路径(f16 / 对称Q8 / Q8+混合V)均 A/B 逐位一致。filler token 写入的未来
+   KV 槽位由下一 chunk 的 store 先写后读覆盖,安全(与 MMQ filler 列同理)。
+   MoE 路径(forward_gpu_batch_moe)仍是逐 token,本轮未动。
+2. **线性层循环去拷贝**:l2norm/delta/rmsgated 通过 setBuffer 偏移直接在
+   _t 张量行上运行,删掉每 token 5 个 enc_copy,7 dispatch/token -> 3。
+
+端到端(T=448,同机,冷却窗口):**11.28 -> 9.80-9.82 ms/tok**(批量注意力
+-1.3,去拷贝 -0.1)。当日累计 **15.50 -> 9.8(+58% 吞吐)**;对 ollama
+(6.0-6.4)差距 1.76× -> **~1.55×**。单测/metal_smoke 130 kernel/test_mcp
+全绿。
+
 ### 双缓冲交付(2026-11-18,同 harness)
 
 sa/sb 双缓冲:tile k+1 装入另一块 buffer、与 tile k 的 simdgroup mma 并行,

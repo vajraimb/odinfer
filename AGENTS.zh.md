@@ -197,6 +197,11 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
   generic 41 GB/s vs `gemv_iq2_xxs_ks_l` 52 GB/s（同窗 +27%，median 亦 +），
   IQ1_S 31→36 GB/s。这类内核离墙很远（IQ 解量化 ALU 重），结构改动有效——
   与 Q4_K/Q6_K 的"无增益"结论不矛盾。
+- **prefill 的逐 token 状态循环已批量化（2026-11-18，dense 路径）**：全注意力块
+  走 9 个 batch 内核一次 launch 处理整 chunk（`QATTNB=0` 回退逐 token）；线性层
+  l2norm/delta/rmsgated 用 setBuffer 偏移直读 _t 行（无拷贝）。两者与逐 token
+  路径逐位一致（三条 KV 路径都 A/B 验证过）。MoE prefill 路径仍是逐 token，
+  别假设它享受同样的优化。写回 per-token 形态时保持逐元素数学不变。
 - **MMQ 的 A 级 dequant 必须向量化（2026-11-17 已交付）**：宽-N MMQ
   （`gemm_q4k_f32_n32`/`gemm_q6k_f32_n64`）的 dequant 逐元素标量写法是 ALU
   瓶颈；uchar4 加载 + 向量 nibble 运算 + half4 写（B 级 half4）后 Q4 +22%、

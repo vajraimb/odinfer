@@ -1583,6 +1583,259 @@ kernel void attn_gate(device float *xb3 [[buffer(0)]], device const float *qproj
     xb3[(ulong)h * n + i] *= g;
 }
 
+// ---------- batched full-attention block (prefill chunks, 2026-11-18) ----------
+// One launch per stage per layer covers all T tokens of the chunk. The
+// per-element math and summation order are IDENTICAL to the per-token kernels
+// above (only a t row index is added), so batch prefill stays bit-identical to
+// decode. Fillers (n_real..T-1) write KV slots beyond this chunk's real range;
+// the next chunk overwrites those slots before any read (store runs before
+// attention), so processing them is harmless — same argument as the MMQ filler
+// columns. Runtime params only: prefill is batch-dominated, the QCONST win was
+// measured at ~0 for these shapes.
+
+struct QNormBP { uint head_dim; float eps; uint n_heads; uint T; };
+kernel void qnorm_extract_b(device const float *qproj_t [[buffer(0)]], device float *q_t [[buffer(1)]],
+    device const float *qn [[buffer(2)]], constant QNormBP &P [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+    uint n = P.head_dim;
+    uint t = tg / P.n_heads, h = tg % P.n_heads;
+    device const float *src = qproj_t + ((ulong)t * P.n_heads) * (2 * n) + (ulong)h * (2 * n);
+    device float *dst = q_t + ((ulong)t * P.n_heads) * n + (ulong)h * n;
+    float ss = 0.0; for (uint j = tid; j < n; j += 32) ss += src[j] * src[j];
+    ss = simd_sum(ss); ss = ss / (float)n + P.eps; ss = rsqrt(ss);
+    for (uint j = tid; j < n; j += 32) dst[j] = qn[j] * (ss * src[j]);
+}
+
+struct RopeBP { uint head_dim; uint rotary_dim; float rope_freq; uint n_heads; uint pos_start; uint row_stride; };
+kernel void rope_b(device float *rows [[buffer(0)]], constant RopeBP &P [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint half_r = P.rotary_dim / 2;
+    uint per = P.n_heads * half_r;
+    uint t = gid / per, r = gid % per, h = r / half_r, i = r % half_r;
+    uint pos = P.pos_start + t;
+    device float *q = rows + (ulong)t * P.row_stride + (ulong)h * P.head_dim;
+    float freq = 1.0 / pow(P.rope_freq, (float)i / (float)half_r);
+    float c = cos((float)pos * freq), s = sin((float)pos * freq);
+    float x0 = q[i], y0 = q[i + half_r];
+    q[i] = x0 * c - y0 * s; q[i + half_r] = x0 * s + y0 * c;
+}
+
+struct StoreBP { uint head_dim; uint seq_len; uint pos_start; uint kv_dim; };
+kernel void store_kv_b(device const float *kt [[buffer(0)]], device const float *vt [[buffer(1)]],
+    device half *kc [[buffer(2)]], device half *vc [[buffer(3)]], constant StoreBP &P [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint t = gid / P.kv_dim, i = gid % P.kv_dim;
+    uint kvh = i / P.head_dim, j = i % P.head_dim;
+    uint pos = P.pos_start + t;
+    ulong dst = ((ulong)kvh * P.seq_len + pos) * P.head_dim + j;
+    kc[dst] = (half)kt[gid]; vc[dst] = (half)vt[gid];
+}
+
+struct Q8StoreBP { uint kv_pos_bytes; uint pos_start; uint nblocks; };
+kernel void store_kv_q8_b(device const float *kt [[buffer(0)]], device const float *vt [[buffer(1)]],
+    device uchar *kc [[buffer(2)]], device uchar *vc [[buffer(3)]], constant Q8StoreBP &P [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint t = gid / P.nblocks;
+    uint pos = P.pos_start + t;
+    device const float *k32 = kt + (ulong)gid * 32; // kv_dim = nblocks*32, so rows are contiguous
+    device const float *v32 = vt + (ulong)gid * 32;
+    float kamax = 0.0, vamax = 0.0;
+    for (uint j = 0; j < 32; ++j) {
+        kamax = max(kamax, fabs(k32[j]));
+        vamax = max(vamax, fabs(v32[j]));
+    }
+    float kd = kamax / 127.0, vd = vamax / 127.0;
+    float kid = kd != 0.0 ? 1.0/kd : 0.0, vid = vd != 0.0 ? 1.0/vd : 0.0;
+    device uchar *kb = kc + (ulong)pos * P.kv_pos_bytes + (ulong)(gid % P.nblocks) * 34;
+    device uchar *vb = vc + (ulong)pos * P.kv_pos_bytes + (ulong)(gid % P.nblocks) * 34;
+    *(device half*)(kb) = (half)kd;
+    *(device half*)(vb) = (half)vd;
+    device char *kq = (device char*)(kb + 2);
+    device char *vq = (device char*)(vb + 2);
+    for (uint j = 0; j < 32; ++j) {
+        kq[j] = (char)round(k32[j] * kid);
+        vq[j] = (char)round(v32[j] * vid);
+    }
+}
+
+struct Q8VStoreBP { uint k_pos_bytes; uint v_pos_bytes; uint pos_start; uint nblocks; };
+kernel void store_kv_q8v_b(device const float *kt [[buffer(0)]], device const float *vt [[buffer(1)]],
+    device uchar *kc [[buffer(2)]], device uchar *vc [[buffer(3)]], constant Q8VStoreBP &P [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint t = gid / P.nblocks;
+    uint pos = P.pos_start + t;
+    device const float *k32 = kt + (ulong)gid * 32;
+    device const float *v32 = vt + (ulong)gid * 32;
+    float kamax = 0.0;
+    for (uint j = 0; j < 32; ++j) kamax = max(kamax, fabs(k32[j]));
+    float kd = kamax / 127.0;
+    float kid = kd != 0.0 ? 1.0/kd : 0.0;
+    device uchar *kb = kc + (ulong)pos * P.k_pos_bytes + (ulong)(gid % P.nblocks) * 34;
+    *(device half*)(kb) = (half)kd;
+    device char *kq = (device char*)(kb + 2);
+    for (uint j = 0; j < 32; ++j) kq[j] = (char)round(k32[j] * kid);
+
+    float vamax = fabs(v32[0]); uint jmax = 0;
+    for (uint j = 1; j < 32; ++j) {
+        float a = fabs(v32[j]);
+        if (a > vamax) { vamax = a; jmax = j; }
+    }
+    float amax2 = 0.0;
+    for (uint j = 0; j < 32; ++j) { if (j != jmax) amax2 = max(amax2, fabs(v32[j])); }
+    float vd = amax2 / 127.0;
+    float vid = vd != 0.0 ? 1.0/vd : 0.0;
+    device uchar *vb = vc + (ulong)pos * P.v_pos_bytes + (ulong)(gid % P.nblocks) * 40;
+    for (uint j = 0; j < 40; ++j) vb[j] = 0;
+    *(device half*)(vb) = (half)vd;
+    vb[2] = (uchar)jmax;
+    *(device half*)(vb + 4) = (half)v32[jmax];
+    device char *vq = (device char*)(vb + 6);
+    for (uint j = 0; j < 32; ++j) {
+        if (j != jmax) vq[j] = (char)round(v32[j] * vid);
+    }
+}
+
+struct AttnBP { uint head_dim; uint seq_len; uint kv_mul; uint pos_start; uint n_heads; uint q_stride; uint o_stride; };
+kernel void attention_b(device const float *q_t [[buffer(0)]], device const half *kc [[buffer(1)]],
+    device const half *vc [[buffer(2)]], device float *xb3_t [[buffer(3)]], constant AttnBP &P [[buffer(4)]],
+    threadgroup float *scores [[threadgroup(0)]], uint tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]) {
+    const uint NT = 128; threadgroup float red[NT];
+    uint t = tg / P.n_heads, h = tg % P.n_heads;
+    uint pos = P.pos_start + t; uint n = pos + 1;
+    device const float *qh = q_t + (ulong)t * P.q_stride + (ulong)h * P.head_dim;
+    uint kvh = h / P.kv_mul;
+    device const half *kbase = kc + (ulong)kvh * P.seq_len * P.head_dim;
+    device const half *vbase = vc + (ulong)kvh * P.seq_len * P.head_dim;
+    device float *out = xb3_t + (ulong)t * P.o_stride;
+    float scale = rsqrt((float)P.head_dim);
+    for (uint tt = tid; tt < n; tt += NT) { device const half *k = kbase + (ulong)tt * P.head_dim;
+        float s = 0.0; for (uint i = 0; i < P.head_dim; ++i) s += qh[i] * (float)k[i]; scores[tt] = s * scale; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float lm = -INFINITY; for (uint tt = tid; tt < n; tt += NT) lm = max(lm, scores[tt]); red[tid] = lm;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = NT / 2; s > 0; s >>= 1) { if (tid < s) red[tid] = max(red[tid], red[tid + s]); threadgroup_barrier(mem_flags::mem_threadgroup); }
+    float m = red[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
+    float ls = 0.0; for (uint tt = tid; tt < n; tt += NT) { float e = exp(scores[tt] - m); scores[tt] = e; ls += e; }
+    red[tid] = ls; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = NT / 2; s > 0; s >>= 1) { if (tid < s) red[tid] = red[tid] + red[tid + s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+    float inv = 1.0 / red[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < P.head_dim; i += NT) { float acc = 0.0;
+        for (uint tt = 0; tt < n; ++tt) acc += scores[tt] * (float)vbase[(ulong)tt * P.head_dim + i];
+        out[(ulong)h * P.head_dim + i] = acc * inv; }
+}
+
+struct Q8AttnBP { uint head_dim; uint k_pos_bytes; uint v_pos_bytes; uint kv_mul; uint pos_start; uint n_heads; uint q_stride; uint o_stride; };
+kernel void attention_q8_b(device const float *q_t [[buffer(0)]], device const uchar *kc [[buffer(1)]],
+    device const uchar *vc [[buffer(2)]], device float *xb3_t [[buffer(3)]], constant Q8AttnBP &P [[buffer(4)]],
+    threadgroup float *scores [[threadgroup(0)]], uint tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]) {
+    const uint NT = 128; threadgroup float red[NT];
+    uint t = tg / P.n_heads, h = tg % P.n_heads;
+    uint pos = P.pos_start + t; uint n = pos + 1;
+    uint nb = P.head_dim / 32;
+    uint kvh = h / P.kv_mul;
+    uint hb = kvh * nb;
+    device const float *qh = q_t + (ulong)t * P.q_stride + (ulong)h * P.head_dim;
+    device float *out = xb3_t + (ulong)t * P.o_stride;
+    float scale = rsqrt((float)P.head_dim);
+    for (uint tt = tid; tt < n; tt += NT) {
+        device const uchar *kb = kc + (ulong)tt * P.k_pos_bytes + (ulong)hb * 34;
+        float s = 0.0;
+        for (uint b = 0; b < nb; ++b) {
+            device const uchar *bb = kb + (ulong)b * 34;
+            float d = (float)(*(device const half*)bb);
+            device const char *qs = (device const char*)(bb + 2);
+            for (uint j = 0; j < 32; ++j) s += qh[b*32+j] * (d * (float)qs[j]);
+        }
+        scores[tt] = s * scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float lm = -INFINITY; for (uint tt = tid; tt < n; tt += NT) lm = max(lm, scores[tt]); red[tid] = lm;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = NT / 2; s > 0; s >>= 1) { if (tid < s) red[tid] = max(red[tid], red[tid + s]); threadgroup_barrier(mem_flags::mem_threadgroup); }
+    float m = red[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
+    float ls = 0.0; for (uint tt = tid; tt < n; tt += NT) { float e = exp(scores[tt] - m); scores[tt] = e; ls += e; }
+    red[tid] = ls; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = NT / 2; s > 0; s >>= 1) { if (tid < s) red[tid] = red[tid] + red[tid + s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+    float inv = 1.0 / red[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < P.head_dim; i += NT) {
+        uint bb = (kvh * P.head_dim + i) / 32;
+        uint jj = (kvh * P.head_dim + i) - bb * 32;
+        float acc = 0.0;
+        for (uint tt = 0; tt < n; ++tt) {
+            device const uchar *vb = vc + (ulong)tt * P.v_pos_bytes + (ulong)bb * 34;
+            float d = (float)(*(device const half*)vb);
+            device const char *qs = (device const char*)(vb + 2);
+            acc += scores[tt] * (d * (float)qs[jj]);
+        }
+        out[(ulong)h * P.head_dim + i] = acc * inv;
+    }
+}
+
+struct Q8VAttnBP { uint head_dim; uint k_pos_bytes; uint v_pos_bytes; uint kv_mul; uint pos_start; uint n_heads; uint q_stride; uint o_stride; };
+kernel void attention_q8v_b(device const float *q_t [[buffer(0)]], device const uchar *kc [[buffer(1)]],
+    device const uchar *vc [[buffer(2)]], device float *xb3_t [[buffer(3)]], constant Q8VAttnBP &P [[buffer(4)]],
+    threadgroup float *scores [[threadgroup(0)]], uint tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]) {
+    const uint NT = 128; threadgroup float red[NT];
+    uint t = tg / P.n_heads, h = tg % P.n_heads;
+    uint pos = P.pos_start + t; uint n = pos + 1;
+    uint nb = P.head_dim / 32;
+    uint kvh = h / P.kv_mul;
+    uint hb = kvh * nb;
+    device const float *qh = q_t + (ulong)t * P.q_stride + (ulong)h * P.head_dim;
+    device float *out = xb3_t + (ulong)t * P.o_stride;
+    float scale = rsqrt((float)P.head_dim);
+    for (uint tt = tid; tt < n; tt += NT) {
+        device const uchar *kb = kc + (ulong)tt * P.k_pos_bytes + (ulong)hb * 34;
+        float s = 0.0;
+        for (uint b = 0; b < nb; ++b) {
+            device const uchar *bb = kb + (ulong)b * 34;
+            float d = (float)(*(device const half*)bb);
+            device const char *qs = (device const char*)(bb + 2);
+            for (uint j = 0; j < 32; ++j) s += qh[b*32+j] * (d * (float)qs[j]);
+        }
+        scores[tt] = s * scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float lm = -INFINITY; for (uint tt = tid; tt < n; tt += NT) lm = max(lm, scores[tt]); red[tid] = lm;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = NT / 2; s > 0; s >>= 1) { if (tid < s) red[tid] = max(red[tid], red[tid + s]); threadgroup_barrier(mem_flags::mem_threadgroup); }
+    float m = red[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
+    float ls = 0.0; for (uint tt = tid; tt < n; tt += NT) { float e = exp(scores[tt] - m); scores[tt] = e; ls += e; }
+    red[tid] = ls; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = NT / 2; s > 0; s >>= 1) { if (tid < s) red[tid] = red[tid] + red[tid + s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+    float inv = 1.0 / red[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < P.head_dim; i += NT) {
+        uint bb = (kvh * P.head_dim + i) / 32;
+        uint jj = (kvh * P.head_dim + i) - bb * 32;
+        float acc = 0.0;
+        for (uint tt = 0; tt < n; ++tt) {
+            device const uchar *vb = vc + (ulong)tt * P.v_pos_bytes + (ulong)bb * 40;
+            float d = (float)(*(device const half*)vb);
+            uint idx = vb[2];
+            float ov = (float)(*(device const half*)(vb + 4));
+            device const char *qs = (device const char*)(vb + 6);
+            float vv = (jj == idx) ? ov : d * (float)qs[jj];
+            acc += scores[tt] * vv;
+        }
+        out[(ulong)h * P.head_dim + i] = acc * inv;
+    }
+}
+
+struct GateBP { uint head_dim; uint n_heads; uint T; };
+kernel void attn_gate_b(device float *xb3_t [[buffer(0)]], device const float *qproj_t [[buffer(1)]],
+    constant GateBP &P [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+    uint n = P.head_dim; uint att = P.n_heads * n;
+    uint t = gid / att, r = gid % att, h = r / n, i = r % n;
+    device float *dst = xb3_t + (ulong)t * att + (ulong)h * n;
+    float g = qproj_t[(ulong)t * (2 * att) + (ulong)h * (2 * n) + n + i];
+    g = 1.0 / (1.0 + exp(-g));
+    dst[i] *= g;
+}
+
+
 kernel void swiglu(device float *hb [[buffer(0)]], device const float *hb2 [[buffer(1)]],
     uint gid [[thread_position_in_grid]]) {
     float v = hb[gid]; v *= 1.0 / (1.0 + exp(-v)); hb[gid] = v * hb2[gid];
@@ -4513,6 +4766,10 @@ m_pso_f32, m_pso_f16, m_pso_q8_0, m_pso_q4_0, m_pso_q4_1, m_pso_q5_0, m_pso_q5_1
 m_pso_rmsnorm, m_pso_rope, m_pso_qnorm, m_pso_store_kv, m_pso_attn, m_pso_attn_gate, m_pso_swiglu, m_pso_residual: ^MTL.ComputePipelineState
 	m_pso_store_kv_q8, m_pso_attn_q8: ^MTL.ComputePipelineState // Q8_0 KV cache (KV_Q8=1 default)
 	m_pso_store_kv_q8v, m_pso_attn_q8v: ^MTL.ComputePipelineState // K=Q8_0, V=mixed outlier block (KV_V default)
+	m_pso_qnorm_b, m_pso_rope_b, m_pso_gate_b: ^MTL.ComputePipelineState // batched full-attn block (prefill)
+	m_pso_store_b, m_pso_attn_b: ^MTL.ComputePipelineState // batched f16 KV
+	m_pso_store_q8_b, m_pso_attn_q8_b: ^MTL.ComputePipelineState // batched Q8 KV
+	m_pso_store_q8v_b, m_pso_attn_q8v_b: ^MTL.ComputePipelineState // batched mixed-V KV
 	m_pso_gemv_f32, m_pso_gemv_q80, m_pso_gemv_q50, m_pso_moe_topk, m_pso_moe_combine: ^MTL.ComputePipelineState
 	m_pso_gemv_f32_b, m_pso_moe_topk_b: ^MTL.ComputePipelineState
 	m_pso_moe_up_id_q4, m_pso_moe_down_id_q80, m_pso_moe_down_id_q50: ^MTL.ComputePipelineState
@@ -4611,6 +4868,7 @@ m_b_zt, m_b_loutt: ^MTL.Buffer                     // [T x value_dim] in_z / lin
 @(private = "file")
 m_b_bt, m_b_at: ^MTL.Buffer                        // [T x n_vh] in_b / in_a
 @(private = "file")
+m_b_qt: ^MTL.Buffer                                // [T x att_head_dim] batched full-attn q
 m_b_xb3t: ^MTL.Buffer                              // [T x att_head_dim] wo input
 @(private = "file")
 m_b_xb2t: ^MTL.Buffer                              // [T x dim] post-proj output (residual add)
@@ -5114,6 +5372,7 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	// token with a GEMV made prefill bit-identical to decode and cost about as
 	// much as the GEMVs themselves. QGEMVEXACT=1 restores that overwrite.
 	g_gemv_exact = os.get_env("QGEMVEXACT", context.temp_allocator) == "1"
+	g_battn = os.get_env("QATTNB", context.temp_allocator) != "0"
 	g_gemv2r = os.get_env("QGEMV2R", context.temp_allocator) == "1"
 	g_normfuse = os.get_env("QGEMVNORM", context.temp_allocator) == "1"
 	// Tier 3.5 is ON by default (interleaved A/B on the 9B: +5.6% decode tps,
@@ -5200,6 +5459,11 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	m_pso_swiglu = make_pso(lib, "swiglu"); m_pso_residual = make_pso(lib, "residual")
 	m_pso_store_kv_q8 = make_pso(lib, "store_kv_q8"); m_pso_attn_q8 = make_pso(lib, "attention_q8")
 	m_pso_store_kv_q8v = make_pso(lib, "store_kv_q8v"); m_pso_attn_q8v = make_pso(lib, "attention_q8v")
+	m_pso_qnorm_b = make_pso(lib, "qnorm_extract_b"); m_pso_rope_b = make_pso(lib, "rope_b")
+	m_pso_gate_b = make_pso(lib, "attn_gate_b")
+	m_pso_store_b = make_pso(lib, "store_kv_b"); m_pso_attn_b = make_pso(lib, "attention_b")
+	m_pso_store_q8_b = make_pso(lib, "store_kv_q8_b"); m_pso_attn_q8_b = make_pso(lib, "attention_q8_b")
+	m_pso_store_q8v_b = make_pso(lib, "store_kv_q8v_b"); m_pso_attn_q8v_b = make_pso(lib, "attention_q8v_b")
 	m_pso_gemv_f32 = make_pso(lib, "moe_gemv_f32"); m_pso_gemv_q80 = make_pso(lib, "moe_gemv_q80"); m_pso_gemv_q50 = make_pso(lib, "moe_gemv_q50")
 	m_pso_moe_topk = make_pso(lib, "moe_softmax_topk"); m_pso_moe_combine = make_pso(lib, "moe_combine")
 	m_pso_gemv_f32_b = make_pso(lib, "gemv_f32_b"); m_pso_moe_topk_b = make_pso(lib, "moe_softmax_topk_b")
@@ -5330,6 +5594,17 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 			g_sag = sag_f16
 		}
 	}
+	// batched full-attn PSO pair mirrors the g_sag KV mode (runtime params)
+	if g_kv_q8 && g_kv_v_mix {
+		g_store_b_pso = m_pso_store_q8v_b
+		g_attn_b_pso = m_pso_attn_q8v_b
+	} else if g_kv_q8 {
+		g_store_b_pso = m_pso_store_q8_b
+		g_attn_b_pso = m_pso_attn_q8_b
+	} else {
+		g_store_b_pso = m_pso_store_b
+		g_attn_b_pso = m_pso_attn_b
+	}
 	if g_kv_q8 {
 		kv_bytes_q8 := kv_total_bytes_q8(c.n_full, c.seq_len, kv_dim)
 		v_bytes := kv_bytes_q8
@@ -5386,6 +5661,7 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	m_b_loutt = new_shared_bytes(value_dim * mt * 4)
 	m_b_bt = new_shared_bytes(c.lin_n_v_heads * mt * 4)
 	m_b_at = new_shared_bytes(c.lin_n_v_heads * mt * 4)
+	m_b_qt = new_shared_bytes(att_head_dim * mt * 4) // batched full-attn q rows
 	m_b_xb3t = new_shared_bytes(att_head_dim * mt * 4)
 	m_b_xb2t = new_shared_bytes(c.dim * mt * 4)
 
@@ -5440,7 +5716,7 @@ metal_destroy :: proc() {
 		m_b_conv_states, m_b_rec_states,
 		m_b_bx, m_b_bxb, m_b_bxbh, m_b_bxout, m_b_bhb, m_b_bhb2, m_b_bhb2h,
 		m_b_proj_half, m_b_proj_outf, m_b_qproj_t, m_b_qkv_t, m_b_qkv2_t, m_b_qlin_t, m_b_klin_t, m_b_kt, m_b_vt,
-		m_b_zt, m_b_loutt, m_b_bt, m_b_at, m_b_xb3t, m_b_xb2t,
+		m_b_zt, m_b_loutt, m_b_bt, m_b_at, m_b_qt, m_b_xb3t, m_b_xb2t,
 	}) {
 		b->release()
 	}
@@ -6587,6 +6863,11 @@ g_sag: SAG_Proc
 g_gate_pso: ^MTL.ComputePipelineState
 g_gate_needs_hd: bool
 
+// Batched full-attention block (prefill chunks): PSO pair selected at init
+// next to g_sag; QATTNB=0 falls back to the per-token loop.
+g_battn: bool
+g_store_b_pso, g_attn_b_pso: ^MTL.ComputePipelineState
+
 // attention output gate: o_h *= sigmoid(gate_h), gate = second half of each qproj head
 @(private = "file")
 enc_attn_gate :: proc(enc: ^MTL.ComputeCommandEncoder, head_dim, att_head_dim: int) {
@@ -6723,6 +7004,113 @@ sag_q8vc :: proc(enc: ^MTL.ComputeCommandEncoder, slot: int, pos, head_dim, seq_
 	enc_attn_gate(enc, head_dim, att_head_dim)
 }
 
+
+// Batched full-attention block for prefill chunks: qnorm/knorm/rope/store/
+// attention/gate each run ONCE per layer for all T tokens (per-element math
+// identical to the per-token path -> bit-identical results). The KV-mode PSO
+// pair was selected at init (g_store_b_pso / g_attn_b_pso).
+@(private = "file")
+enc_full_attn_batch :: proc(enc: ^MTL.ComputeCommandEncoder, slot: int, T, pos_start, head_dim, seq_len, kv_dim, kv_mul, n_heads, n_kv_heads,
+	att_head_dim, rotary_dim: int, rope_freq, eps: f32, q_norm_ptr, k_norm_ptr: rawptr) {
+	// qnorm: qproj_t [T][qproj_dim] -> q_t
+	enc->setComputePipelineState(m_pso_qnorm_b)
+	enc->setBuffer(m_b_qproj_t, 0, 0); enc->setBuffer(m_b_qt, 0, 1)
+	enc->setBuffer(m_weights, woff(q_norm_ptr), 2)
+	qbp := struct { head_dim: u32, eps: f32, n_heads: u32, T: u32 }{u32(head_dim), eps, u32(n_heads), u32(T)}
+	enc->setBytes(bytes_of(&qbp, size_of(qbp)), 3)
+	enc->dispatchThreadgroups(MTL.Size{NS.Integer(T * n_heads), 1, 1}, MTL.Size{32, 1, 1})
+	// knorm: in-place rmsnorm over T*n_kv blocks of head_dim (same kernel the
+	// per-token path uses per token, just with count=T*n_kv_heads).
+	enc_rmsnorm(enc, m_b_kt, m_b_kt, k_norm_ptr, head_dim, n_kv_heads * T, eps)
+	// rope on q_t then kt; pos = pos_start + t inside the kernel
+	half_r := rotary_dim / 2
+	enc->setComputePipelineState(m_pso_rope_b)
+	rbp := struct { head_dim: u32, rotary_dim: u32, rope_freq: f32, n_heads: u32, pos_start: u32, row_stride: u32 }{
+		u32(head_dim), u32(rotary_dim), rope_freq, u32(n_heads), u32(pos_start), u32(att_head_dim),
+	}
+	rbp_local := rbp
+	enc->setBuffer(m_b_qt, 0, 0)
+	enc->setBytes(bytes_of(&rbp_local, size_of(rbp_local)), 1)
+	enc->dispatchThreads(MTL.Size{NS.Integer(T * n_heads * half_r), 1, 1}, MTL.Size{NS.Integer(min(half_r, 64)), 1, 1})
+	rbp_k := struct { head_dim: u32, rotary_dim: u32, rope_freq: f32, n_heads: u32, pos_start: u32, row_stride: u32 }{
+		u32(head_dim), u32(rotary_dim), rope_freq, u32(n_kv_heads), u32(pos_start), u32(kv_dim),
+	}
+	enc->setBuffer(m_b_kt, 0, 0)
+	enc->setBytes(bytes_of(&rbp_k, size_of(rbp_k)), 1)
+	enc->dispatchThreads(MTL.Size{NS.Integer(T * n_kv_heads * half_r), 1, 1}, MTL.Size{NS.Integer(min(half_r, 64)), 1, 1})
+	// store_kv: mode-selected PSO; offsets mirror the sag_* procs
+	kv_mode_q8 := g_store_b_pso != m_pso_store_b
+	nblocks := kv_dim / 32
+	if kv_mode_q8 {
+		k_off := NS.UInteger(slot) * NS.UInteger(kv_layer_bytes_q8(seq_len, kv_dim))
+		kb_pos := u32(kv_pos_bytes(kv_dim))
+		enc->setBuffer(m_b_kt, 0, 0); enc->setBuffer(m_b_vt, 0, 1)
+		enc->setBuffer(m_b_kc, k_off, 2)
+		if g_store_b_pso == m_pso_store_q8v_b {
+			v_off := NS.UInteger(slot) * NS.UInteger(kv_v_mix_layer_bytes(seq_len, kv_dim))
+			enc->setBuffer(m_b_vc, v_off, 3)
+			sbp := struct { k_pos_bytes: u32, v_pos_bytes: u32, pos_start: u32, nblocks: u32 }{kb_pos, u32(kv_v_mix_pos_bytes(kv_dim)), u32(pos_start), u32(nblocks)}
+			enc->setComputePipelineState(g_store_b_pso)
+			enc->setBytes(bytes_of(&sbp, size_of(sbp)), 4)
+		} else {
+			enc->setBuffer(m_b_vc, k_off, 3)
+			sbp := struct { kv_pos_bytes: u32, pos_start: u32, nblocks: u32 }{kb_pos, u32(pos_start), u32(nblocks)}
+			enc->setComputePipelineState(g_store_b_pso)
+			enc->setBytes(bytes_of(&sbp, size_of(sbp)), 4)
+		}
+		enc->dispatchThreads(MTL.Size{NS.Integer(T * nblocks), 1, 1}, MTL.Size{NS.Integer(min(nblocks, 256)), 1, 1})
+	} else {
+		kv_loff := NS.UInteger(slot) * NS.UInteger(seq_len * kv_dim * 2)
+		enc->setBuffer(m_b_kt, 0, 0); enc->setBuffer(m_b_vt, 0, 1)
+		enc->setBuffer(m_b_kc, kv_loff, 2); enc->setBuffer(m_b_vc, kv_loff, 3)
+		sbp := struct { head_dim: u32, seq_len: u32, pos_start: u32, kv_dim: u32 }{u32(head_dim), u32(seq_len), u32(pos_start), u32(kv_dim)}
+		enc->setComputePipelineState(g_store_b_pso)
+		enc->setBytes(bytes_of(&sbp, size_of(sbp)), 4)
+		enc->dispatchThreads(MTL.Size{NS.Integer(T * kv_dim), 1, 1}, MTL.Size{NS.Integer(min(kv_dim, 256)), 1, 1})
+	}
+	// attention: one threadgroup per (token, head); scratch sized for the max pos
+	enc->setBuffer(m_b_qt, 0, 0)
+	if kv_mode_q8 {
+		k_off2 := NS.UInteger(slot) * NS.UInteger(kv_layer_bytes_q8(seq_len, kv_dim))
+		enc->setBuffer(m_b_kc, k_off2, 1)
+		if g_attn_b_pso == m_pso_attn_q8v_b {
+			v_off2 := NS.UInteger(slot) * NS.UInteger(kv_v_mix_layer_bytes(seq_len, kv_dim))
+			enc->setBuffer(m_b_vc, v_off2, 2)
+			abp := struct { head_dim: u32, k_pos_bytes: u32, v_pos_bytes: u32, kv_mul: u32, pos_start: u32, n_heads: u32, q_stride: u32, o_stride: u32 }{
+				u32(head_dim), u32(kv_pos_bytes(kv_dim)), u32(kv_v_mix_pos_bytes(kv_dim)), u32(kv_mul), u32(pos_start), u32(n_heads), u32(att_head_dim), u32(att_head_dim),
+			}
+			abp_local := abp
+			enc->setComputePipelineState(g_attn_b_pso)
+			enc->setBytes(bytes_of(&abp_local, size_of(abp_local)), 4)
+		} else {
+			enc->setBuffer(m_b_vc, k_off2, 2)
+			abp := struct { head_dim: u32, k_pos_bytes: u32, v_pos_bytes: u32, kv_mul: u32, pos_start: u32, n_heads: u32, q_stride: u32, o_stride: u32 }{
+				u32(head_dim), u32(kv_pos_bytes(kv_dim)), u32(kv_pos_bytes(kv_dim)), u32(kv_mul), u32(pos_start), u32(n_heads), u32(att_head_dim), u32(att_head_dim),
+			}
+			abp_local := abp
+			enc->setComputePipelineState(g_attn_b_pso)
+			enc->setBytes(bytes_of(&abp_local, size_of(abp_local)), 4)
+		}
+	} else {
+		kv_loff2 := NS.UInteger(slot) * NS.UInteger(seq_len * kv_dim * 2)
+		enc->setBuffer(m_b_kc, kv_loff2, 1); enc->setBuffer(m_b_vc, kv_loff2, 2)
+		abp := struct { head_dim: u32, seq_len: u32, kv_mul: u32, pos_start: u32, n_heads: u32, q_stride: u32, o_stride: u32 }{
+			u32(head_dim), u32(seq_len), u32(kv_mul), u32(pos_start), u32(n_heads), u32(att_head_dim), u32(att_head_dim),
+		}
+		abp_local := abp
+		enc->setComputePipelineState(g_attn_b_pso)
+		enc->setBytes(bytes_of(&abp_local, size_of(abp_local)), 4)
+	}
+	enc->setBuffer(m_b_xb3t, 0, 3)
+	enc->setThreadgroupMemoryLength(NS.UInteger((pos_start + T) * size_of(f32)), 0)
+	enc->dispatchThreadgroups(MTL.Size{NS.Integer(T * n_heads), 1, 1}, MTL.Size{128, 1, 1})
+	// gate: xb3_t *= sigmoid(qproj_t gate half)
+	enc->setComputePipelineState(m_pso_gate_b)
+	enc->setBuffer(m_b_xb3t, 0, 0); enc->setBuffer(m_b_qproj_t, 0, 1)
+	gbp := struct { head_dim: u32, n_heads: u32, T: u32 }{u32(head_dim), u32(n_heads), u32(T)}
+	enc->setBytes(bytes_of(&gbp, size_of(gbp)), 2)
+	enc->dispatchThreads(MTL.Size{NS.Integer(T * att_head_dim), 1, 1}, MTL.Size{NS.Integer(min(att_head_dim, 256)), 1, 1})
+}
 
 forward_gpu :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 	NS.scoped_autoreleasepool()
@@ -7134,14 +7522,16 @@ switch lw.layer_type {
 			// per-token delta loop below until the fused (S-in-threadgroup) version lands.
 			qkv_b := NS.UInteger(conv_dim * 4); z_b := NS.UInteger(value_dim * 4); ba_b := NS.UInteger(n_vh * 4); lout_b := NS.UInteger(value_dim * 4)
 			if !g_prof_nolin { // QPROF_NOLIN ablation: skip to measure linear per-token stateful share
+			// 2026-11-18: the row copies are gone — l2norm / delta / rmsgated run
+			// directly on the token's row of the _t tensors via setBuffer offsets.
+			// Same kernels, same per-element math -> bit-identical; 7 dispatches
+			// per token become 3.
+			qk_b := NS.UInteger(key_dim * 4)
 			for t in 0 ..< n_real {
 				oqkv := NS.UInteger(t) * qkv_b; oz := NS.UInteger(t) * z_b; oba := NS.UInteger(t) * ba_b; olout := NS.UInteger(t) * lout_b
-				enc_copy(enc, m_b_qkv2_t, oqkv, m_b_qkv2, 0, conv_dim)
-				enc_copy(enc, m_b_zt, oz, m_b_z, 0, value_dim)
-				enc_copy(enc, m_b_bt, oba, m_b_b, 0, n_vh)
-				enc_copy(enc, m_b_at, oba, m_b_a, 0, n_vh)
-				enc->setBuffer(m_b_qlin, 0, 0); enc->setBuffer(m_b_klin, 0, 1)
-				enc->setBuffer(m_b_qkv2, 0, 2); enc->setBuffer(m_b_qkv2, NS.UInteger(key_dim * 4), 3)
+				oqk := NS.UInteger(t) * qk_b
+				enc->setBuffer(m_b_qlin_t, oqk, 0); enc->setBuffer(m_b_klin_t, oqk, 1)
+				enc->setBuffer(m_b_qkv2_t, oqkv, 2); enc->setBuffer(m_b_qkv2_t, oqkv + NS.UInteger(key_dim * 4), 3)
 				if g_qc_c {
 					enc->setComputePipelineState(m_pso_l2norm_c)
 				} else {
@@ -7150,10 +7540,10 @@ switch lw.layer_type {
 					enc->setBytes(bytes_of(&l2p, size_of(l2p)), 4)
 				}
 				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_kh), 1, 1}, MTL.Size{32, 1, 1})
-				enc->setBuffer(m_b_lout, 0, 0); enc->setBuffer(m_b_rec_states, rec_off, 1)
-				enc->setBuffer(m_b_qlin, 0, 2); enc->setBuffer(m_b_klin, 0, 3)
-				enc->setBuffer(m_b_qkv2, NS.UInteger(2 * key_dim * 4), 4)
-				enc->setBuffer(m_b_b, 0, 5); enc->setBuffer(m_b_a, 0, 6)
+				enc->setBuffer(m_b_loutt, olout, 0); enc->setBuffer(m_b_rec_states, rec_off, 1)
+				enc->setBuffer(m_b_qlin_t, oqk, 2); enc->setBuffer(m_b_klin_t, oqk, 3)
+				enc->setBuffer(m_b_qkv2_t, oqkv + NS.UInteger(2 * key_dim * 4), 4)
+				enc->setBuffer(m_b_bt, oba, 5); enc->setBuffer(m_b_at, oba, 6)
 				enc->setBuffer(m_weights, woff(raw_data(la.a_decay)), 7)
 				enc->setBuffer(m_weights, woff(raw_data(la.dt_bias)), 8)
 				if g_qc_c {
@@ -7164,8 +7554,8 @@ switch lw.layer_type {
 					enc->setBytes(bytes_of(&dp, size_of(dp)), 9)
 				}
 				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_vh), 1, 1}, MTL.Size{NS.Integer(head_v_dim), 1, 1})
-				enc->setBuffer(m_b_lout, 0, 0); enc->setBuffer(m_b_lout, 0, 1)
-				enc->setBuffer(m_weights, woff(raw_data(la.norm_w)), 2); enc->setBuffer(m_b_z, 0, 3)
+				enc->setBuffer(m_b_loutt, olout, 0); enc->setBuffer(m_b_loutt, olout, 1)
+				enc->setBuffer(m_weights, woff(raw_data(la.norm_w)), 2); enc->setBuffer(m_b_zt, oz, 3)
 				if g_qc_c {
 					enc->setComputePipelineState(m_pso_rmsgated_c)
 				} else {
@@ -7174,7 +7564,6 @@ switch lw.layer_type {
 					enc->setBytes(bytes_of(&ngp, size_of(ngp)), 4)
 				}
 				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_vh), 1, 1}, MTL.Size{32, 1, 1})
-				enc_copy(enc, m_b_lout, 0, m_b_loutt, olout, value_dim)
 			}
 			} // end QPROF_NOLIN guard
 			enc_conv1d_update(enc, m_b_qkv_t, m_b_conv_states, conv_off, conv_dim, n_real, kernel)
@@ -7374,47 +7763,54 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 			slot := transformer.full_slot[l]
 			qproj_b := NS.UInteger(qproj_dim * 4); kv_b := NS.UInteger(kv_dim * 4); xb3_b := NS.UInteger(att_head_dim * 4)
 			if !g_prof_nofull { // QPROF_NOFULL ablation
-			for t in 0 ..< n_real {
-				pos := pos_start + t
-				oq := NS.UInteger(t) * qproj_b; okv := NS.UInteger(t) * kv_b; oxb3 := NS.UInteger(t) * xb3_b
-				enc_copy(enc, m_b_qproj_t, oq, m_b_qproj, 0, qproj_dim)
-				enc_copy(enc, m_b_kt, okv, m_b_ktmp, 0, kv_dim)
-				enc_copy(enc, m_b_vt, okv, m_b_vtmp, 0, kv_dim)
-				enc->setBuffer(m_b_qproj, 0, 0); enc->setBuffer(m_b_q, 0, 1); enc->setBuffer(m_weights, woff(raw_data(fa.q_norm)), 2)
-				if g_qc_a {
-					enc->setComputePipelineState(m_pso_qnorm_c)
-				} else {
-					enc->setComputePipelineState(m_pso_qnorm)
-					qnp := struct { size: u32, eps: f32 }{u32(head_dim), eps}
-					enc->setBytes(bytes_of(&qnp, size_of(qnp)), 3)
+			if g_battn {
+				// One launch per stage for the whole chunk (QATTNB=0 -> per-token loop)
+				enc_full_attn_batch(enc, slot, T, pos_start, head_dim, seq_len, kv_dim, kv_mul, n_heads, n_kv_heads,
+					att_head_dim, rotary_dim, p.rope_theta, eps, raw_data(fa.q_norm), raw_data(fa.k_norm))
+			} else {
+				qproj_b := NS.UInteger(qproj_dim * 4); kv_b := NS.UInteger(kv_dim * 4); xb3_b := NS.UInteger(att_head_dim * 4)
+				for t in 0 ..< n_real {
+					pos := pos_start + t
+					oq := NS.UInteger(t) * qproj_b; okv := NS.UInteger(t) * kv_b; oxb3 := NS.UInteger(t) * xb3_b
+					enc_copy(enc, m_b_qproj_t, oq, m_b_qproj, 0, qproj_dim)
+					enc_copy(enc, m_b_kt, okv, m_b_ktmp, 0, kv_dim)
+					enc_copy(enc, m_b_vt, okv, m_b_vtmp, 0, kv_dim)
+					enc->setBuffer(m_b_qproj, 0, 0); enc->setBuffer(m_b_q, 0, 1); enc->setBuffer(m_weights, woff(raw_data(fa.q_norm)), 2)
+					if g_qc_a {
+						enc->setComputePipelineState(m_pso_qnorm_c)
+					} else {
+						enc->setComputePipelineState(m_pso_qnorm)
+						qnp := struct { size: u32, eps: f32 }{u32(head_dim), eps}
+						enc->setBytes(bytes_of(&qnp, size_of(qnp)), 3)
+					}
+					enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_heads), 1, 1}, MTL.Size{32, 1, 1})
+					enc_rmsnorm(enc, m_b_ktmp, m_b_ktmp, raw_data(fa.k_norm), head_dim, n_kv_heads, eps)
+					half_r := rotary_dim / 2
+					enc->setBuffer(m_b_q, 0, 0)
+					if g_qc_a {
+						enc->setComputePipelineState(m_pso_rope_c)
+						pos_u := u32(pos)
+						enc->setBytes(bytes_of(&pos_u, size_of(pos_u)), 1)
+					} else {
+						enc->setComputePipelineState(m_pso_rope)
+						rope_p := struct { head_dim: u32, pos: u32, rope_freq: f32, rotary_dim: u32 }{u32(head_dim), u32(pos), p.rope_theta, u32(rotary_dim)}
+						enc->setBytes(bytes_of(&rope_p, size_of(rope_p)), 1)
+					}
+					enc->dispatchThreads(MTL.Size{NS.Integer(n_heads * half_r), 1, 1}, MTL.Size{NS.Integer(min(half_r, 64)), 1, 1})
+					enc->setBuffer(m_b_ktmp, 0, 0)
+					if g_qc_a {
+						enc->setComputePipelineState(m_pso_rope_c)
+						pos_u := u32(pos)
+						enc->setBytes(bytes_of(&pos_u, size_of(pos_u)), 1)
+					} else {
+						enc->setComputePipelineState(m_pso_rope)
+						rope_p := struct { head_dim: u32, pos: u32, rope_freq: f32, rotary_dim: u32 }{u32(head_dim), u32(pos), p.rope_theta, u32(rotary_dim)}
+						enc->setBytes(bytes_of(&rope_p, size_of(rope_p)), 1)
+					}
+					enc->dispatchThreads(MTL.Size{NS.Integer(n_kv_heads * half_r), 1, 1}, MTL.Size{NS.Integer(min(half_r, 64)), 1, 1})
+					g_sag(enc, slot, pos, head_dim, seq_len, kv_dim, kv_mul, n_heads, att_head_dim)
+					enc_copy(enc, m_b_xb3, 0, m_b_xb3t, oxb3, att_head_dim)
 				}
-				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_heads), 1, 1}, MTL.Size{32, 1, 1})
-				enc_rmsnorm(enc, m_b_ktmp, m_b_ktmp, raw_data(fa.k_norm), head_dim, n_kv_heads, eps)
-				half_r := rotary_dim / 2
-				enc->setBuffer(m_b_q, 0, 0)
-				if g_qc_a {
-					enc->setComputePipelineState(m_pso_rope_c)
-					pos_u := u32(pos)
-					enc->setBytes(bytes_of(&pos_u, size_of(pos_u)), 1)
-				} else {
-					enc->setComputePipelineState(m_pso_rope)
-					rope_p := struct { head_dim: u32, pos: u32, rope_freq: f32, rotary_dim: u32 }{u32(head_dim), u32(pos), p.rope_theta, u32(rotary_dim)}
-					enc->setBytes(bytes_of(&rope_p, size_of(rope_p)), 1)
-				}
-				enc->dispatchThreads(MTL.Size{NS.Integer(n_heads * half_r), 1, 1}, MTL.Size{NS.Integer(min(half_r, 64)), 1, 1})
-				enc->setBuffer(m_b_ktmp, 0, 0)
-				if g_qc_a {
-					enc->setComputePipelineState(m_pso_rope_c)
-					pos_u := u32(pos)
-					enc->setBytes(bytes_of(&pos_u, size_of(pos_u)), 1)
-				} else {
-					enc->setComputePipelineState(m_pso_rope)
-					rope_p := struct { head_dim: u32, pos: u32, rope_freq: f32, rotary_dim: u32 }{u32(head_dim), u32(pos), p.rope_theta, u32(rotary_dim)}
-					enc->setBytes(bytes_of(&rope_p, size_of(rope_p)), 1)
-				}
-				enc->dispatchThreads(MTL.Size{NS.Integer(n_kv_heads * half_r), 1, 1}, MTL.Size{NS.Integer(min(half_r, 64)), 1, 1})
-				g_sag(enc, slot, pos, head_dim, seq_len, kv_dim, kv_mul, n_heads, att_head_dim)
-				enc_copy(enc, m_b_xb3, 0, m_b_xb3t, oxb3, att_head_dim)
 			}
 			} // end QPROF_NOFULL guard
 			// batched wo -> residual
@@ -7454,14 +7850,16 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 			// per-token delta loop below until the fused (S-in-threadgroup) version lands.
 			qkv_b := NS.UInteger(conv_dim * 4); z_b := NS.UInteger(value_dim * 4); ba_b := NS.UInteger(n_vh * 4); lout_b := NS.UInteger(value_dim * 4)
 			if !g_prof_nolin { // QPROF_NOLIN ablation: skip to measure linear per-token stateful share
+			// 2026-11-18: the row copies are gone — l2norm / delta / rmsgated run
+			// directly on the token's row of the _t tensors via setBuffer offsets.
+			// Same kernels, same per-element math -> bit-identical; 7 dispatches
+			// per token become 3.
+			qk_b := NS.UInteger(key_dim * 4)
 			for t in 0 ..< n_real {
 				oqkv := NS.UInteger(t) * qkv_b; oz := NS.UInteger(t) * z_b; oba := NS.UInteger(t) * ba_b; olout := NS.UInteger(t) * lout_b
-				enc_copy(enc, m_b_qkv2_t, oqkv, m_b_qkv2, 0, conv_dim)
-				enc_copy(enc, m_b_zt, oz, m_b_z, 0, value_dim)
-				enc_copy(enc, m_b_bt, oba, m_b_b, 0, n_vh)
-				enc_copy(enc, m_b_at, oba, m_b_a, 0, n_vh)
-				enc->setBuffer(m_b_qlin, 0, 0); enc->setBuffer(m_b_klin, 0, 1)
-				enc->setBuffer(m_b_qkv2, 0, 2); enc->setBuffer(m_b_qkv2, NS.UInteger(key_dim * 4), 3)
+				oqk := NS.UInteger(t) * qk_b
+				enc->setBuffer(m_b_qlin_t, oqk, 0); enc->setBuffer(m_b_klin_t, oqk, 1)
+				enc->setBuffer(m_b_qkv2_t, oqkv, 2); enc->setBuffer(m_b_qkv2_t, oqkv + NS.UInteger(key_dim * 4), 3)
 				if g_qc_c {
 					enc->setComputePipelineState(m_pso_l2norm_c)
 				} else {
@@ -7470,10 +7868,10 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 					enc->setBytes(bytes_of(&l2p, size_of(l2p)), 4)
 				}
 				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_kh), 1, 1}, MTL.Size{32, 1, 1})
-				enc->setBuffer(m_b_lout, 0, 0); enc->setBuffer(m_b_rec_states, rec_off, 1)
-				enc->setBuffer(m_b_qlin, 0, 2); enc->setBuffer(m_b_klin, 0, 3)
-				enc->setBuffer(m_b_qkv2, NS.UInteger(2 * key_dim * 4), 4)
-				enc->setBuffer(m_b_b, 0, 5); enc->setBuffer(m_b_a, 0, 6)
+				enc->setBuffer(m_b_loutt, olout, 0); enc->setBuffer(m_b_rec_states, rec_off, 1)
+				enc->setBuffer(m_b_qlin_t, oqk, 2); enc->setBuffer(m_b_klin_t, oqk, 3)
+				enc->setBuffer(m_b_qkv2_t, oqkv + NS.UInteger(2 * key_dim * 4), 4)
+				enc->setBuffer(m_b_bt, oba, 5); enc->setBuffer(m_b_at, oba, 6)
 				enc->setBuffer(m_weights, woff(raw_data(la.a_decay)), 7)
 				enc->setBuffer(m_weights, woff(raw_data(la.dt_bias)), 8)
 				if g_qc_c {
@@ -7484,8 +7882,8 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 					enc->setBytes(bytes_of(&dp, size_of(dp)), 9)
 				}
 				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_vh), 1, 1}, MTL.Size{NS.Integer(head_v_dim), 1, 1})
-				enc->setBuffer(m_b_lout, 0, 0); enc->setBuffer(m_b_lout, 0, 1)
-				enc->setBuffer(m_weights, woff(raw_data(la.norm_w)), 2); enc->setBuffer(m_b_z, 0, 3)
+				enc->setBuffer(m_b_loutt, olout, 0); enc->setBuffer(m_b_loutt, olout, 1)
+				enc->setBuffer(m_weights, woff(raw_data(la.norm_w)), 2); enc->setBuffer(m_b_zt, oz, 3)
 				if g_qc_c {
 					enc->setComputePipelineState(m_pso_rmsgated_c)
 				} else {
@@ -7494,7 +7892,6 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 					enc->setBytes(bytes_of(&ngp, size_of(ngp)), 4)
 				}
 				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_vh), 1, 1}, MTL.Size{32, 1, 1})
-				enc_copy(enc, m_b_lout, 0, m_b_loutt, olout, value_dim)
 			}
 			} // end QPROF_NOLIN guard
 			enc_conv1d_update(enc, m_b_qkv_t, m_b_conv_states, conv_off, conv_dim, n_real, kernel)
