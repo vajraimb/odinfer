@@ -158,6 +158,22 @@ BK=128 变体全面更慢,弃。
 天花板 ~1.8 TFLOPS"已交付大半;残余 ~10% 在 mma/barrier 结构,dequant 不再是
 瓶颈。
 
+### 线性循环批量 norm + MoE 移植(2026-11-18 深夜)
+
+重消融(批量注意力后,基线 9.84):full 批量块只剩 0.42(flash 融合贬值,弃),
+linear 循环仍有 1.60。发现 Stage 2 遗产内核(`l2norm_scale_batch` /
+`rmsnorm_gated_batch`,当年 chunked-delta 回退时一并闲置)可直接接线:
+l2norm 与 gated-rmsnorm 各一次 launch 处理整 chunk,逐 token 只剩 delta 递归
+(setBuffer 偏移直读 _t 行)。l2norm 批量版原把 `iq*scale` 折叠(与逐 token 版
+差 1 ulp 风险),已改为完全相同的乘法顺序——构造性逐位一致。
+
+端到端:**9.80 -> 8.33 ms/tok**(T=448;贪心逐字一致,f16/Q8/混合V 三条 KV
+路径均过)。MoE prefill 路径(forward_gpu_batch_moe)移植同样的批量化,
+0.8B MoE GPU 端到端输出与 QATTNB=0 逐位一致(GEMV 覆写保持原样——数值
+决策,不属于本轮)。当日累计 **15.50 -> 8.33(+86% 吞吐)**;对 ollama
+(6.0-6.4)差距 1.76× -> **~1.33×**。剩余:MMQ ~7 ms/tok(kernel 级已到
+llama.cpp 的 1.10×,端到端差距需 int8 dot 才能再收——见下)。
+
 ### 逐 token 状态循环批量化(2026-11-18 下半场)
 
 消融定位(QPROF_NOLIN/NOFULL,T=448,基线 10.12 ms/tok):MMQ ~8.3,全注意力

@@ -1978,8 +1978,8 @@ kernel void l2norm_scale_batch(
     float sq = 0.0, sk = 0.0;
     for (uint j = tid; j < hkd; j += 32) { sq += qi[j]*qi[j]; sk += ki[j]*ki[j]; }
     sq = simd_sum(sq); sk = simd_sum(sk);
-    float iq = 1.0/max(sqrt(sq), P.eps)*P.scale, ik = 1.0/max(sqrt(sk), P.eps);
-    for (uint j = tid; j < hkd; j += 32) { qo[j] = qi[j]*iq; ko[j] = ki[j]*ik; }
+    float iq = 1.0/max(sqrt(sq), P.eps), ik = 1.0/max(sqrt(sk), P.eps);
+    for (uint j = tid; j < hkd; j += 32) { qo[j] = qi[j]*iq*P.scale; ko[j] = ki[j]*ik; }
 }
 
 // Batched RMSNormGated over [T tokens x n_vh value-heads]. in/gate are [T x value_dim].
@@ -4562,8 +4562,8 @@ kernel void l2norm_scale_batch_c(
     float sq = 0.0, sk = 0.0;
     for (uint j = tid; j < hkd; j += 32) { sq += qi[j]*qi[j]; sk += ki[j]*ki[j]; }
     sq = simd_sum(sq); sk = simd_sum(sk);
-    float iq = 1.0/max(sqrt(sq), 1e-6f)*L2_SCALE, ik = 1.0/max(sqrt(sk), 1e-6f);
-    for (uint j = tid; j < hkd; j += 32) { qo[j] = qi[j]*iq; ko[j] = ki[j]*ik; }
+    float iq = 1.0/max(sqrt(sq), 1e-6f), ik = 1.0/max(sqrt(sk), 1e-6f);
+    for (uint j = tid; j < hkd; j += 32) { qo[j] = qi[j]*iq*L2_SCALE; ko[j] = ki[j]*ik; }
 }
 
 // Batched RMSNormGated over [T tokens x N_VH value-heads] with baked dims.
@@ -7435,47 +7435,53 @@ switch lw.layer_type {
 			slot := transformer.full_slot[l]
 			qproj_b := NS.UInteger(qproj_dim * 4); kv_b := NS.UInteger(kv_dim * 4); xb3_b := NS.UInteger(att_head_dim * 4)
 			if !g_prof_nofull { // QPROF_NOFULL ablation
-			for t in 0 ..< n_real {
-				pos := pos_start + t
-				oq := NS.UInteger(t) * qproj_b; okv := NS.UInteger(t) * kv_b; oxb3 := NS.UInteger(t) * xb3_b
-				enc_copy(enc, m_b_qproj_t, oq, m_b_qproj, 0, qproj_dim)
-				enc_copy(enc, m_b_kt, okv, m_b_ktmp, 0, kv_dim)
-				enc_copy(enc, m_b_vt, okv, m_b_vtmp, 0, kv_dim)
-				enc->setBuffer(m_b_qproj, 0, 0); enc->setBuffer(m_b_q, 0, 1); enc->setBuffer(m_weights, woff(raw_data(fa.q_norm)), 2)
-				if g_qc_a {
-					enc->setComputePipelineState(m_pso_qnorm_c)
-				} else {
-					enc->setComputePipelineState(m_pso_qnorm)
-					qnp := struct { size: u32, eps: f32 }{u32(head_dim), eps}
-					enc->setBytes(bytes_of(&qnp, size_of(qnp)), 3)
+			if g_battn {
+				enc_full_attn_batch(enc, slot, T, pos_start, head_dim, seq_len, kv_dim, kv_mul, n_heads, n_kv_heads,
+					att_head_dim, rotary_dim, p.rope_theta, eps, raw_data(fa.q_norm), raw_data(fa.k_norm))
+			} else {
+				qproj_b := NS.UInteger(qproj_dim * 4); kv_b := NS.UInteger(kv_dim * 4); xb3_b := NS.UInteger(att_head_dim * 4)
+				for t in 0 ..< n_real {
+					pos := pos_start + t
+					oq := NS.UInteger(t) * qproj_b; okv := NS.UInteger(t) * kv_b; oxb3 := NS.UInteger(t) * xb3_b
+					enc_copy(enc, m_b_qproj_t, oq, m_b_qproj, 0, qproj_dim)
+					enc_copy(enc, m_b_kt, okv, m_b_ktmp, 0, kv_dim)
+					enc_copy(enc, m_b_vt, okv, m_b_vtmp, 0, kv_dim)
+					enc->setBuffer(m_b_qproj, 0, 0); enc->setBuffer(m_b_q, 0, 1); enc->setBuffer(m_weights, woff(raw_data(fa.q_norm)), 2)
+					if g_qc_a {
+						enc->setComputePipelineState(m_pso_qnorm_c)
+					} else {
+						enc->setComputePipelineState(m_pso_qnorm)
+						qnp := struct { size: u32, eps: f32 }{u32(head_dim), eps}
+						enc->setBytes(bytes_of(&qnp, size_of(qnp)), 3)
+					}
+					enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_heads), 1, 1}, MTL.Size{32, 1, 1})
+					enc_rmsnorm(enc, m_b_ktmp, m_b_ktmp, raw_data(fa.k_norm), head_dim, n_kv_heads, eps)
+					half_r := rotary_dim / 2
+					enc->setBuffer(m_b_q, 0, 0)
+					if g_qc_a {
+						enc->setComputePipelineState(m_pso_rope_c)
+						pos_u := u32(pos)
+						enc->setBytes(bytes_of(&pos_u, size_of(pos_u)), 1)
+					} else {
+						enc->setComputePipelineState(m_pso_rope)
+						rope_p := struct { head_dim: u32, pos: u32, rope_freq: f32, rotary_dim: u32 }{u32(head_dim), u32(pos), p.rope_theta, u32(rotary_dim)}
+						enc->setBytes(bytes_of(&rope_p, size_of(rope_p)), 1)
+					}
+					enc->dispatchThreads(MTL.Size{NS.Integer(n_heads * half_r), 1, 1}, MTL.Size{NS.Integer(min(half_r, 64)), 1, 1})
+					enc->setBuffer(m_b_ktmp, 0, 0)
+					if g_qc_a {
+						enc->setComputePipelineState(m_pso_rope_c)
+						pos_u := u32(pos)
+						enc->setBytes(bytes_of(&pos_u, size_of(pos_u)), 1)
+					} else {
+						enc->setComputePipelineState(m_pso_rope)
+						rope_p := struct { head_dim: u32, pos: u32, rope_freq: f32, rotary_dim: u32 }{u32(head_dim), u32(pos), p.rope_theta, u32(rotary_dim)}
+						enc->setBytes(bytes_of(&rope_p, size_of(rope_p)), 1)
+					}
+					enc->dispatchThreads(MTL.Size{NS.Integer(n_kv_heads * half_r), 1, 1}, MTL.Size{NS.Integer(min(half_r, 64)), 1, 1})
+					g_sag(enc, slot, pos, head_dim, seq_len, kv_dim, kv_mul, n_heads, att_head_dim)
+					enc_copy(enc, m_b_xb3, 0, m_b_xb3t, oxb3, att_head_dim)
 				}
-				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_heads), 1, 1}, MTL.Size{32, 1, 1})
-				enc_rmsnorm(enc, m_b_ktmp, m_b_ktmp, raw_data(fa.k_norm), head_dim, n_kv_heads, eps)
-				half_r := rotary_dim / 2
-				enc->setBuffer(m_b_q, 0, 0)
-				if g_qc_a {
-					enc->setComputePipelineState(m_pso_rope_c)
-					pos_u := u32(pos)
-					enc->setBytes(bytes_of(&pos_u, size_of(pos_u)), 1)
-				} else {
-					enc->setComputePipelineState(m_pso_rope)
-					rope_p := struct { head_dim: u32, pos: u32, rope_freq: f32, rotary_dim: u32 }{u32(head_dim), u32(pos), p.rope_theta, u32(rotary_dim)}
-					enc->setBytes(bytes_of(&rope_p, size_of(rope_p)), 1)
-				}
-				enc->dispatchThreads(MTL.Size{NS.Integer(n_heads * half_r), 1, 1}, MTL.Size{NS.Integer(min(half_r, 64)), 1, 1})
-				enc->setBuffer(m_b_ktmp, 0, 0)
-				if g_qc_a {
-					enc->setComputePipelineState(m_pso_rope_c)
-					pos_u := u32(pos)
-					enc->setBytes(bytes_of(&pos_u, size_of(pos_u)), 1)
-				} else {
-					enc->setComputePipelineState(m_pso_rope)
-					rope_p := struct { head_dim: u32, pos: u32, rope_freq: f32, rotary_dim: u32 }{u32(head_dim), u32(pos), p.rope_theta, u32(rotary_dim)}
-					enc->setBytes(bytes_of(&rope_p, size_of(rope_p)), 1)
-				}
-				enc->dispatchThreads(MTL.Size{NS.Integer(n_kv_heads * half_r), 1, 1}, MTL.Size{NS.Integer(min(half_r, 64)), 1, 1})
-				g_sag(enc, slot, pos, head_dim, seq_len, kv_dim, kv_mul, n_heads, att_head_dim)
-				enc_copy(enc, m_b_xb3, 0, m_b_xb3t, oxb3, att_head_dim)
 			}
 			} // end QPROF_NOFULL guard
 			// batched wo -> residual
@@ -7522,24 +7528,14 @@ switch lw.layer_type {
 			// per-token delta loop below until the fused (S-in-threadgroup) version lands.
 			qkv_b := NS.UInteger(conv_dim * 4); z_b := NS.UInteger(value_dim * 4); ba_b := NS.UInteger(n_vh * 4); lout_b := NS.UInteger(value_dim * 4)
 			if !g_prof_nolin { // QPROF_NOLIN ablation: skip to measure linear per-token stateful share
-			// 2026-11-18: the row copies are gone — l2norm / delta / rmsgated run
-			// directly on the token's row of the _t tensors via setBuffer offsets.
-			// Same kernels, same per-element math -> bit-identical; 7 dispatches
-			// per token become 3.
+			// 2026-11-18: batched l2norm + gated-rmsnorm for the whole chunk with only
+			// the sequential delta recurrence per token (setBuffer offsets into the
+			// token's _t row; was 7 dispatches/token).
+			enc_l2norm_batch(enc, m_b_qkv2_t, m_b_qlin_t, m_b_klin_t, head_k_dim, key_dim, conv_dim, n_real, n_kh, l2_scale)
 			qk_b := NS.UInteger(key_dim * 4)
 			for t in 0 ..< n_real {
-				oqkv := NS.UInteger(t) * qkv_b; oz := NS.UInteger(t) * z_b; oba := NS.UInteger(t) * ba_b; olout := NS.UInteger(t) * lout_b
+				oqkv := NS.UInteger(t) * qkv_b; oba := NS.UInteger(t) * ba_b; olout := NS.UInteger(t) * lout_b
 				oqk := NS.UInteger(t) * qk_b
-				enc->setBuffer(m_b_qlin_t, oqk, 0); enc->setBuffer(m_b_klin_t, oqk, 1)
-				enc->setBuffer(m_b_qkv2_t, oqkv, 2); enc->setBuffer(m_b_qkv2_t, oqkv + NS.UInteger(key_dim * 4), 3)
-				if g_qc_c {
-					enc->setComputePipelineState(m_pso_l2norm_c)
-				} else {
-					enc->setComputePipelineState(m_pso_l2norm)
-					l2p := struct { head_k_dim: u32, eps: f32, scale: f32 }{u32(head_k_dim), 1e-6, l2_scale}
-					enc->setBytes(bytes_of(&l2p, size_of(l2p)), 4)
-				}
-				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_kh), 1, 1}, MTL.Size{32, 1, 1})
 				enc->setBuffer(m_b_loutt, olout, 0); enc->setBuffer(m_b_rec_states, rec_off, 1)
 				enc->setBuffer(m_b_qlin_t, oqk, 2); enc->setBuffer(m_b_klin_t, oqk, 3)
 				enc->setBuffer(m_b_qkv2_t, oqkv + NS.UInteger(2 * key_dim * 4), 4)
@@ -7554,17 +7550,8 @@ switch lw.layer_type {
 					enc->setBytes(bytes_of(&dp, size_of(dp)), 9)
 				}
 				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_vh), 1, 1}, MTL.Size{NS.Integer(head_v_dim), 1, 1})
-				enc->setBuffer(m_b_loutt, olout, 0); enc->setBuffer(m_b_loutt, olout, 1)
-				enc->setBuffer(m_weights, woff(raw_data(la.norm_w)), 2); enc->setBuffer(m_b_zt, oz, 3)
-				if g_qc_c {
-					enc->setComputePipelineState(m_pso_rmsgated_c)
-				} else {
-					enc->setComputePipelineState(m_pso_rmsgated)
-					ngp := struct { size: u32, eps: f32 }{u32(head_v_dim), eps}
-					enc->setBytes(bytes_of(&ngp, size_of(ngp)), 4)
-				}
-				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_vh), 1, 1}, MTL.Size{32, 1, 1})
 			}
+			enc_rmsgated_batch(enc, m_b_loutt, m_b_loutt, raw_data(la.norm_w), m_b_zt, head_v_dim, n_vh, n_real, eps)
 			} // end QPROF_NOLIN guard
 			enc_conv1d_update(enc, m_b_qkv_t, m_b_conv_states, conv_off, conv_dim, n_real, kernel)
 			enc_proj_fwd(enc, la.out.kind, raw_data(la.out.data), m_b_loutt, dim, T, value_dim, m_b_xb2t)
@@ -7850,24 +7837,15 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 			// per-token delta loop below until the fused (S-in-threadgroup) version lands.
 			qkv_b := NS.UInteger(conv_dim * 4); z_b := NS.UInteger(value_dim * 4); ba_b := NS.UInteger(n_vh * 4); lout_b := NS.UInteger(value_dim * 4)
 			if !g_prof_nolin { // QPROF_NOLIN ablation: skip to measure linear per-token stateful share
-			// 2026-11-18: the row copies are gone — l2norm / delta / rmsgated run
-			// directly on the token's row of the _t tensors via setBuffer offsets.
-			// Same kernels, same per-element math -> bit-identical; 7 dispatches
-			// per token become 3.
+			// 2026-11-18: batched l2norm + gated-rmsnorm for the whole chunk
+			// (Stage 2 kernels, one launch each) with only the sequential delta
+			// recurrence left per token (running on the token's _t row via
+			// setBuffer offsets). Was 7 dispatches/token -> 2 + T per layer.
+			enc_l2norm_batch(enc, m_b_qkv2_t, m_b_qlin_t, m_b_klin_t, head_k_dim, key_dim, conv_dim, n_real, n_kh, l2_scale)
 			qk_b := NS.UInteger(key_dim * 4)
 			for t in 0 ..< n_real {
-				oqkv := NS.UInteger(t) * qkv_b; oz := NS.UInteger(t) * z_b; oba := NS.UInteger(t) * ba_b; olout := NS.UInteger(t) * lout_b
+				oqkv := NS.UInteger(t) * qkv_b; oba := NS.UInteger(t) * ba_b; olout := NS.UInteger(t) * lout_b
 				oqk := NS.UInteger(t) * qk_b
-				enc->setBuffer(m_b_qlin_t, oqk, 0); enc->setBuffer(m_b_klin_t, oqk, 1)
-				enc->setBuffer(m_b_qkv2_t, oqkv, 2); enc->setBuffer(m_b_qkv2_t, oqkv + NS.UInteger(key_dim * 4), 3)
-				if g_qc_c {
-					enc->setComputePipelineState(m_pso_l2norm_c)
-				} else {
-					enc->setComputePipelineState(m_pso_l2norm)
-					l2p := struct { head_k_dim: u32, eps: f32, scale: f32 }{u32(head_k_dim), 1e-6, l2_scale}
-					enc->setBytes(bytes_of(&l2p, size_of(l2p)), 4)
-				}
-				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_kh), 1, 1}, MTL.Size{32, 1, 1})
 				enc->setBuffer(m_b_loutt, olout, 0); enc->setBuffer(m_b_rec_states, rec_off, 1)
 				enc->setBuffer(m_b_qlin_t, oqk, 2); enc->setBuffer(m_b_klin_t, oqk, 3)
 				enc->setBuffer(m_b_qkv2_t, oqkv + NS.UInteger(2 * key_dim * 4), 4)
@@ -7882,17 +7860,8 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 					enc->setBytes(bytes_of(&dp, size_of(dp)), 9)
 				}
 				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_vh), 1, 1}, MTL.Size{NS.Integer(head_v_dim), 1, 1})
-				enc->setBuffer(m_b_loutt, olout, 0); enc->setBuffer(m_b_loutt, olout, 1)
-				enc->setBuffer(m_weights, woff(raw_data(la.norm_w)), 2); enc->setBuffer(m_b_zt, oz, 3)
-				if g_qc_c {
-					enc->setComputePipelineState(m_pso_rmsgated_c)
-				} else {
-					enc->setComputePipelineState(m_pso_rmsgated)
-					ngp := struct { size: u32, eps: f32 }{u32(head_v_dim), eps}
-					enc->setBytes(bytes_of(&ngp, size_of(ngp)), 4)
-				}
-				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_vh), 1, 1}, MTL.Size{32, 1, 1})
 			}
+			enc_rmsgated_batch(enc, m_b_loutt, m_b_loutt, raw_data(la.norm_w), m_b_zt, head_v_dim, n_vh, n_real, eps)
 			} // end QPROF_NOLIN guard
 			enc_conv1d_update(enc, m_b_qkv_t, m_b_conv_states, conv_off, conv_dim, n_real, kernel)
 			enc_proj_fwd(enc, la.out.kind, raw_data(la.out.data), m_b_loutt, dim, T, value_dim, m_b_xb2t)
