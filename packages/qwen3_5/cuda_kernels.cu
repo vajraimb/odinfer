@@ -1426,10 +1426,27 @@ __device__ __forceinline__ void wmma_mma_rr(float& c0, float& c1, float& c2, flo
 __device__ __forceinline__ void wmma_store(float* p, int stride,
                                            float c0, float c1, float c2, float c3,
                                            float c4, float c5, float c6, float c7);
+__device__ __forceinline__ uint4 ld_u4_aligned(const unsigned char* p);
+
+/* 32 q8 bytes, two 16-byte loads, written in element order. */
+__device__ void store_q8_row(unsigned short* row, float d, uint4 q0, uint4 q1) {
+    unsigned w0 = q0.x, w1 = q0.y, w2 = q0.z, w3 = q0.w;
+    unsigned w4 = q1.x, w5 = q1.y, w6 = q1.z, w7 = q1.w;
+    unsigned w[8] = {w0, w1, w2, w3, w4, w5, w6, w7};
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        unsigned v = w[i];
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            row[i * 4 + s] = f32_to_f16(d * (float)(signed char)(unsigned char)(v & 0xffu));
+            v >>= 8;
+        }
+    }
+}
 
 __device__ void dequant_k256(unsigned short* dst, const unsigned char* kc, int k_pos, int kvh, int nb,
                              int nrows, int pos, int nvalid, int tid, int nthreads) {
-    /* One scale for 32 values. The old loop reloaded that half 32 times. */
+    /* One scale for 32 values. Two aligned 16-byte loads cover the q8 row. */
     for (int e = tid; e < nrows * 8; e += nthreads) {
         int r = e >> 3;
         int b = e & 7;
@@ -1440,7 +1457,7 @@ __device__ void dequant_k256(unsigned short* dst, const unsigned char* kc, int k
         }
         const unsigned char* bb = kc + ((size_t)(pos + r) * (size_t)k_pos + (size_t)(kvh * nb + b) * 34);
         float d = ld_f16(bb);
-        for (int j = 0; j < 32; ++j) row[j] = f32_to_f16(d * (float)(signed char)bb[2 + j]);
+        store_q8_row(row, d, ld_u4_aligned(bb + 2), ld_u4_aligned(bb + 18));
     }
 }
 
@@ -1458,10 +1475,8 @@ __device__ void dequant_v256(unsigned short* dst, const unsigned char* vc, int v
         float d = ld_f16(vb);
         int idx = (int)vb[2];
         float ov = ld_f16(vb + 4);
-        for (int j = 0; j < 32; ++j) {
-            float v = (j == idx) ? ov : d * (float)(signed char)vb[6 + j];
-            row[j] = f32_to_f16(v);
-        }
+        store_q8_row(row, d, ld_u4_aligned(vb + 6), ld_u4_aligned(vb + 22));
+        if ((unsigned)idx < 32u) row[idx] = f32_to_f16(ov);
     }
 }
 
@@ -3985,8 +4000,10 @@ extern "C" __global__ void gemv2_q5_k(const unsigned char* wb, const signed char
     int p = t >> 1;
     int half = t & 1;
     int nb = n >> 8;
+    int b0, b1;
+    k_range(nb, &b0, &b1);
     float acc = 0.f;
-    for (int b = 0; b < nb; ++b) {
+    for (int b = b0; b < b1; ++b) {
         uint4 hdr = make_uint4(0, 0, 0, 0);
         uint4 qv = make_uint4(0, 0, 0, 0);
         uint4 hv = make_uint4(0, 0, 0, 0);
@@ -4763,6 +4780,21 @@ __device__ __forceinline__ unsigned mmqk_xs(const unsigned* xs, int k4, int tok)
     return xs[k4 * 64 + tok];
 }
 
+/* Four Q5 values from one ql word and the matching qh word. hi=0 is the
+   low nibble (group 2p), hi=1 the high nibble (group 2p+1). */
+__device__ __forceinline__ int q5_pack4(unsigned ql, unsigned qh, int hi, unsigned bit) {
+    int o = 0;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        unsigned byte = (ql >> (8 * k)) & 0xffu;
+        unsigned hb = (qh >> (8 * k)) & 0xffu;
+        int nib = hi ? (int)(byte >> 4) : (int)(byte & 0xfu);
+        int v = nib + ((hb & bit) ? 16 : 0);
+        o |= (v & 0xff) << (8 * k);
+    }
+    return o;
+}
+
 /* Q4's opt-in 64-row kernel and the pair kernels use sm_70
    launch_bounds(256, 2). The default 4-row kernels do not: that bound caps
    them at 128 registers, and the 32-row tile that won on the V100 had none.
@@ -4884,8 +4916,92 @@ __device__ void mmqk_warp(const unsigned char* wb, const unsigned char* wb2, con
                             }
                         }
                     }
+                } else if (Q6 == 2) {
+                    /* Q5_K: same q8 tile as Q4. ql is 32 bytes per pair of
+                       groups, qh is the 32 high bits shared by every pair. */
+#pragma unroll 1
+                    for (int p = 0; p < 4; ++p) {
+                        float s00 = 0.f, s10 = 0.f, s01 = 0.f, s11 = 0.f;
+                        float2 u00, u10, u01, u11;
+                        u00 = u10 = u01 = u11 = make_float2(0.f, 0.f);
+                        int lg0 = p * 2;
+                        int lg1 = lg0 + 1;
+                        if (live0) {
+                            s00 = scs[lg0 * BN + lane];
+                            s10 = scs[lg1 * BN + lane];
+                            u00 = sus[lg0 * BN + lane];
+                            u10 = sus[lg1 * BN + lane];
+                        }
+                        if (live1) {
+                            s01 = scs[lg0 * BN + 32 + lane];
+                            s11 = scs[lg1 * BN + 32 + lane];
+                            u01 = sus[lg0 * BN + 32 + lane];
+                            u11 = sus[lg1 * BN + 32 + lane];
+                        }
+                        unsigned bit_lo = 1u << (2 * p);
+                        unsigned bit_hi = bit_lo << 1;
+#pragma unroll
+                        for (int rg = 0; rg < ROWS; rg += 4) {
+                            uint4 hdr[4], ql0[4], ql1[4], qh0[4], qh1[4];
+#pragma unroll
+                            for (int r = 0; r < 4; ++r) {
+                                hdr[r] = ql0[r] = ql1[r] = qh0[r] = qh1[r] = make_uint4(0, 0, 0, 0);
+                                int rr = row0 + rg + r;
+                                if (rr < d) {
+                                    const unsigned char* blk = wuse + ((size_t)rr * (size_t)nb + (size_t)sb) * 176;
+                                    hdr[r] = *(const uint4*)blk;
+                                    qh0[r] = *(const uint4*)(blk + 16);
+                                    qh1[r] = *(const uint4*)(blk + 32);
+                                    ql0[r] = *(const uint4*)(blk + 48 + p * 32);
+                                    ql1[r] = *(const uint4*)(blk + 64 + p * 32);
+                                }
+                            }
+                            int dlo0[4], dlo1[4], dhi0[4], dhi1[4];
+#pragma unroll
+                            for (int r = 0; r < 4; ++r) {
+                                dlo0[r] = 0; dlo1[r] = 0; dhi0[r] = 0; dhi1[r] = 0;
+                            }
+#pragma unroll
+                            for (int i = 0; i < 8; ++i) {
+                                int klo = p * 16 + i;
+                                int khi = klo + 8;
+                                unsigned xlo0 = mmqk_xs(xs, klo, lane);
+                                unsigned xlo1 = mmqk_xs(xs, klo, 32 + lane);
+                                unsigned xhi0 = mmqk_xs(xs, khi, lane);
+                                unsigned xhi1 = mmqk_xs(xs, khi, 32 + lane);
+#pragma unroll
+                                for (int r = 0; r < 4; ++r) {
+                                    unsigned qw = (i < 4) ? u4_word(ql0[r], i) : u4_word(ql1[r], i - 4);
+                                    unsigned hw = (i < 4) ? u4_word(qh0[r], i) : u4_word(qh1[r], i - 4);
+                                    int lo = q5_pack4(qw, hw, 0, bit_lo);
+                                    int hi = q5_pack4(qw, hw, 1, bit_hi);
+                                    dlo0[r] = dp4a_s32(lo, (int)xlo0, dlo0[r]);
+                                    dlo1[r] = dp4a_s32(lo, (int)xlo1, dlo1[r]);
+                                    dhi0[r] = dp4a_s32(hi, (int)xhi0, dhi0[r]);
+                                    dhi1[r] = dp4a_s32(hi, (int)xhi1, dhi1[r]);
+                                }
+                            }
+#pragma unroll
+                            for (int r = 0; r < 4; ++r) {
+                                if (row0 + rg + r >= d) continue;
+                                int sc0, m0, sc1, m1;
+                                scale_min_hdr(p * 2, hdr[r], &sc0, &m0);
+                                scale_min_hdr(p * 2 + 1, hdr[r], &sc1, &m1);
+                                float dW = f16_bits(hdr[r].x & 0xffff);
+                                float dmin = f16_bits(hdr[r].x >> 16);
+                                if (live0) {
+                                    a[m][rg + r] += (dW * (float)sc0) * s00 * (float)dlo0[r] - (dmin * (float)m0) * (u00.x + u00.y);
+                                    a[m][rg + r] += (dW * (float)sc1) * s10 * (float)dhi0[r] - (dmin * (float)m1) * (u10.x + u10.y);
+                                }
+                                if (live1) {
+                                    b[m][rg + r] += (dW * (float)sc0) * s01 * (float)dlo1[r] - (dmin * (float)m0) * (u01.x + u01.y);
+                                    b[m][rg + r] += (dW * (float)sc1) * s11 * (float)dhi1[r] - (dmin * (float)m1) * (u11.x + u11.y);
+                                }
+                            }
+                        }
+                    }
                 } else {
-    #pragma unroll 1
+#pragma unroll 1
                     for (int slot = 0; slot < 8; ++slot) {
                         int half = slot >> 2;
                         int piece = slot & 3;
@@ -5002,6 +5118,11 @@ extern "C" __global__ void
 mmqk_q6_k(const unsigned char* wb, const unsigned* xpack, const float* scale, const float2* sum16,
           float* out, int n, int d, int T) {
     mmqk_warp<1, 4, 0>(wb, 0, xpack, scale, sum16, out, 0, n, d, T);
+}
+extern "C" __global__ void
+mmqk_q5_k(const unsigned char* wb, const unsigned* xpack, const float* scale, const float2* sum16,
+          float* out, int n, int d, int T) {
+    mmqk_warp<2, 4, 0>(wb, 0, xpack, scale, sum16, out, 0, n, d, T);
 }
 extern "C" __global__ void __launch_bounds__(256, 2)
 mmqk_q4_pair(const unsigned char* wb, const unsigned char* wb2, const unsigned* xpack, const float* scale, const float2* sum16,
