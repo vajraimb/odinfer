@@ -42,6 +42,11 @@ _cuda_import_keep :: proc() {
 when GPU_CUDA {
 
 CUDA_MAX_BATCH :: 128
+// Mixed-V attention parts. 32 positions fill one warp (one lane, one key).
+// Below ATTN_PART_MIN the one-block kernel is already under a millisecond
+// for the whole model, and it stays bit-identical to the previous decode.
+ATTN_PART :: 32
+ATTN_PART_MIN :: 128
 // Q5_0 / Q8_0 below this stay on the old GEMV. The new kernel lost at 2048x2048.
 GEMV_SMALL_BYTES :: 16 * 1024 * 1024
 PROF_MAX :: 8192
@@ -101,6 +106,8 @@ d_qkv, d_qkv2, d_z, d_b, d_a, d_qlin, d_klin, d_lout: cu.Device_Ptr
 @(private)
 d_logits, d_scores, d_partial, d_moe_logits, d_moe_wt, d_moe_sel: cu.Device_Ptr
 @(private)
+d_part_m, d_part_l, d_part_o: cu.Device_Ptr
+@(private)
 d_kc, d_vc, d_conv, d_rec: cu.Device_Ptr
 
 @(private)
@@ -144,6 +151,8 @@ g_tc2_block: bool // ODINFER_CUDA_TC2_BLOCK=1: T>64 uses the 64x64 block-scale t
 g_tc2_reuse: bool // ODINFER_CUDA_TC2_REUSE=1: T>64 reuses one scalar weight tile across 128 tokens
 @(private)
 g_attn_batch: bool // prefill attention is one launch per chunk
+@(private)
+g_attn_split: bool // mixed-V attention splits npos into 32-token parts
 @(private)
 g_fuse_norm: bool // ODINFER_CUDA_FUSE_NORM=1: side-buffer residual_norm (slower)
 @(private)
@@ -211,7 +220,7 @@ k_gemv2r1_q4, k_gemv2r1_q6: cu.Function
 @(private)
 k_rmsnorm, k_qnorm, k_rope, k_gate, k_gate_q, k_swiglu, k_swiglu_q, k_residual, k_axpy: cu.Function
 @(private)
-k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v: cu.Function
+k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v, k_attn_part, k_attn_red: cu.Function
 @(private)
 k_conv, k_l2, k_delta, k_delta_chunk, k_rmsgate, k_rmsgate_q, k_moe_topk: cu.Function
 @(private)
@@ -256,11 +265,11 @@ ck :: proc(err: cu.Error, what: string) -> bool {
 }
 
 @(private)
-klaunch :: proc(fn: cu.Function, gx, gy, gz, bx, by, bz: u32, args: []rawptr, what: string) -> bool {
+klaunch :: proc(fn: cu.Function, gx, gy, gz, bx, by, bz: u32, args: []rawptr, what: string, shared: u32 = 0) -> bool {
 	if g_count_launches {
 		g_launches += 1
 	}
-	ok := ck(cu.launch(fn, gx, gy, gz, bx, by, bz, 0, args, g_launch_stream), what)
+	ok := ck(cu.launch(fn, gx, gy, gz, bx, by, bz, shared, args, g_launch_stream), what)
 	if ok && g_profile && g_prof_ready && !g_capturing {
 		if g_prof_n >= PROF_MAX {
 			profile_flush()
@@ -1019,6 +1028,83 @@ attn_q8v_batch :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos0, T: int) -> bool {
 	return klaunch(k_attn_q8v, u32(g_heads), u32(T), 1, 128, 1, 1, args[:], "attn_q8v")
 }
 
+// True when the split kernels are the ones that should run for this npos.
+// f16 and symmetric Q8 stay on the one-block kernel. So does a short
+// context: npos < 128 was under a millisecond across every full layer.
+@(private)
+attn_part_ok :: proc(npos: int) -> bool {
+	if !g_attn_split || d_part_m == 0 || k_attn_part == nil || k_attn_red == nil {
+		return false
+	}
+	if npos < ATTN_PART_MIN || npos > g_seq {
+		return false
+	}
+	if g_head < 32 || g_head > 256 || g_head % 32 != 0 || g_kv_heads < 1 || g_heads < 1 {
+		return false
+	}
+	mul := g_heads / g_kv_heads
+	if mul < 1 || mul > 16 || mul * g_kv_heads != g_heads {
+		return false
+	}
+	need := (g_seq + ATTN_PART - 1) / ATTN_PART
+	splits := (npos + ATTN_PART - 1) / ATTN_PART
+	return splits >= 1 && splits <= need
+}
+
+@(private)
+attn_part_smem :: proc(kv_mul: int) -> u32 {
+	nb := g_head / 32
+	bytes := kv_mul * g_head * 4 + ATTN_PART * nb * 34 + ATTN_PART * nb * 40
+	return u32(bytes)
+}
+
+@(private)
+attn_q8v_part_launch :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos: int) -> bool {
+	npos := pos + 1
+	mul := g_heads / g_kv_heads
+	nsplit := (npos + ATTN_PART - 1) / ATTN_PART
+	a, b, c := q, kc, vc
+	pm, pl, po := d_part_m, d_part_l, d_part_o
+	hd := i32(g_head)
+	kb, vb := i32(g_k_pos), i32(g_v_pos)
+	km, nh := i32(mul), i32(g_heads)
+	ps, part := i32(pos), i32(ATTN_PART)
+	slot: cu.Device_Ptr
+	args := [?]rawptr{&a, &b, &c, &pm, &pl, &po, &hd, &kb, &vb, &km, &nh, &ps, &part, &slot}
+	if !klaunch(k_attn_part, u32(g_kv_heads), u32(nsplit), 1, 128, 1, 1, args[:], "attn_part", attn_part_smem(mul)) {
+		return false
+	}
+	out := xb3
+	ns := i32(nsplit)
+	rargs := [?]rawptr{&out, &pm, &pl, &po, &hd, &nh, &ns}
+	return klaunch(k_attn_red, u32(g_heads), 1, 1, 128, 1, 1, rargs[:], "attn_red")
+}
+
+@(private)
+attn_q8v_dispatch :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos: int) -> bool {
+	if pos < 0 || !attn_part_ok(pos + 1) {
+		return attn_q8v_call(q, kc, vc, xb3, pos)
+	}
+	return attn_q8v_part_launch(q, kc, vc, xb3, pos)
+}
+
+@(private)
+attn_q8v_batch_dispatch :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos0, T: int) -> bool {
+	// The whole chunk is past the threshold, so every token is long enough
+	// that one split launch fills the SMs. A chunk that still contains a
+	// short token stays on the single heads-by-tokens launch.
+	if T > 0 && attn_part_ok(pos0 + 1) {
+		attdim := g_heads * g_head
+		for ti in 0 ..< T {
+			if !attn_q8v_part_launch(fp(q, ti * attdim), kc, vc, fp(xb3, ti * attdim), pos0 + ti) {
+				return false
+			}
+		}
+		return true
+	}
+	return attn_q8v_batch(q, kc, vc, xb3, pos0, T)
+}
+
 @(private)
 launch_conv :: proc(outp, inp, state, weight: cu.Device_Ptr, conv_dim, kernel: int) -> bool {
 	a, b, c, d := outp, inp, state, weight
@@ -1118,6 +1204,8 @@ bind_kernels :: proc() -> bool {
 	k_attn_q8 = get_fn("attention_q8")
 	k_store_q8v = get_fn("store_kv_q8v")
 	k_attn_q8v = get_fn("attention_q8v")
+	k_attn_part = get_fn("attention_q8v_part")
+	k_attn_red = get_fn("attention_q8v_reduce")
 	k_conv = get_fn("conv1d_step")
 	k_l2 = get_fn("l2norm_scale")
 	k_delta = get_fn("delta_recurrent")
@@ -1148,7 +1236,7 @@ bind_kernels :: proc() -> bool {
 	k_gemv2r1_q6 = get_fn("gemv2r1_q6_k")
 	handles := [?]cu.Function{
 		k_rmsnorm, k_qnorm, k_rope, k_gate, k_swiglu, k_residual, k_axpy,
-		k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v,
+		k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v, k_attn_part, k_attn_red,
 		k_conv, k_l2, k_delta, k_delta_chunk, k_rmsgate, k_rmsgate_q, k_moe_topk,
 		k_gate_q, k_swiglu_q,
 		k_tc2_q4, k_tc2_q6, k_tc2s_q4, k_tc2s_q6, k_tc2m_q4, k_tc2m_q6, k_tc2r_q4, k_tc2r_q6,
@@ -1285,6 +1373,22 @@ alloc_acts :: proc(t: ^Transformer, T: int) -> bool {
 		}
 		d_scores, ok = alloc_bytes(batch * one); if !ok do return false
 		g_score_batch = batch
+	}
+	d_part_m, d_part_l, d_part_o = 0, 0, 0
+	if g_attn_split && p.n_heads > 0 && p.head_dim >= 32 && p.head_dim <= 256 && p.head_dim % 32 == 0 && p.seq_len > 0 {
+		nsplit := (p.seq_len + ATTN_PART - 1) / ATTN_PART
+		if nsplit < 1 {
+			nsplit = 1
+		}
+		pm, okm := alloc_bytes(nsplit * p.n_heads * 4)
+		pl, okl := alloc_bytes(nsplit * p.n_heads * 4)
+		po, oko := alloc_bytes(nsplit * p.n_heads * p.head_dim * 4)
+		if !okm || !okl || !oko {
+			fmt.eprintln("cuda: split-attention buffer did not fit; using the one-block kernel")
+			g_attn_split = false
+		} else {
+			d_part_m, d_part_l, d_part_o = pm, pl, po
+		}
 	}
 	d_partial, ok = alloc_bytes(dim * 4); if !ok do return false
 	max_k := dim
@@ -1482,6 +1586,8 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	// vs 208.3, 2000 tokens 192.4 vs 202.7; 27B 581 tokens 66.9 vs 70.8). Leave off.
 	g_tc2_reuse = os.get_env("ODINFER_CUDA_TC2_REUSE", context.temp_allocator) == "1"
 	g_attn_batch = os.get_env("ODINFER_CUDA_ATTN_BATCH", context.temp_allocator) != "0"
+	// Default on. =0 keeps attention_q8v (one block per query head).
+	g_attn_split = os.get_env("ODINFER_CUDA_ATTN_SPLIT", context.temp_allocator) != "0"
 	// Side-buffer residual_norm was slower than accum GEMV + rmsnorm_q8
 	// (9B 1.99 vs 1.41 ms, 27B 4.96 vs 3.53). Opt in.
 	g_fuse_norm = os.get_env("ODINFER_CUDA_FUSE_NORM", context.temp_allocator) == "1"
@@ -1498,6 +1604,13 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	// synced the device every token, and capture dropped split-K. =1 opts in.
 	g_use_graph = os.get_env("ODINFER_CUDA_GRAPH", context.temp_allocator) == "1"
 	if g_profile {
+		g_use_graph = false
+	}
+	// A captured graph freezes the split count. The next token has a longer
+	// sequence, so the replay would drop the new key. The old kernel reads
+	// npos from the device and can be captured.
+	if g_attn_split && g_use_graph {
+		fmt.eprintln("cuda: graph off while split attention is on; ODINFER_CUDA_ATTN_SPLIT=0 keeps the old kernel and can capture")
 		g_use_graph = false
 	}
 	if g_phase {
@@ -1617,8 +1730,8 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 			g_v_layer = kv_v_mix_layer_bytes(p.seq_len, g_kv_dim)
 			g_v_bytes = kv_v_mix_total_bytes(p.n_full, p.seq_len, g_kv_dim)
 			do_store = store_q8v_call
-			do_attn = attn_q8v_call
-			do_attn_batch = attn_q8v_batch
+			do_attn = attn_q8v_dispatch
+			do_attn_batch = attn_q8v_batch_dispatch
 		} else {
 			g_v_pos = g_k_pos
 			g_v_layer = g_k_layer
@@ -1776,6 +1889,14 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 				}
 			}
 		}
+	}
+	split_live := g_attn_split && d_part_m != 0 && g_head >= 32 && g_head <= 256 && g_head % 32 == 0 && g_kv_heads > 0 && g_heads / g_kv_heads >= 1 && g_heads / g_kv_heads <= 16 && (g_heads / g_kv_heads) * g_kv_heads == g_heads
+	if split_live {
+		fmt.eprintln("cuda: attn split on for mixed-V full attention when npos>=128 (32-token parts + reduce). ODINFER_CUDA_ATTN_SPLIT=0 is the one-block kernel")
+	} else if !g_attn_split {
+		fmt.eprintln("cuda: attn split off (ODINFER_CUDA_ATTN_SPLIT=0)")
+	} else {
+		fmt.eprintln("cuda: attn split off for this model (head_dim must be a multiple of 32 in 32..256, kv_mul 1..16)")
 	}
 	if g_use_graph {
 		fmt.eprintln("cuda: graph on for dense T=1 (ODINFER_CUDA_GRAPH=1; MoE stays eager)")
