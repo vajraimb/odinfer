@@ -49,7 +49,10 @@ you isolate per-stage GPU time. Never enable in production.
 | `ODINFER_CUDA_GEMV` | auto | Decode GEMV. Unset: dp4a bandwidth kernel; Q5_0 and Q8_0 under 16 MiB stay on the scalar kernel. `new`: bandwidth kernel for those small shapes too. `old` or `0`: scalar GEMV for everything. |
 | `ODINFER_CUDA_GEMV_ROWS` | `4` | Q4_K / Q6_K rows per warp. Unset is four. `1` selects the one-row kernel, which was slower on the V100S. |
 | `ODINFER_CUDA_GEMV_WARPS` | `8` | Warps per bandwidth-GEMV block, 1..16. V100S tuning knob. The warp count is not shrunk per shape. |
-| `ODINFER_CUDA_GEMV_MMVQ` | on | One warp per row for Q4_K, Q6_K, and Q5_K (`gemv2_q4w` / `q6w` / `q5w`). Q4 gate+up with K≥5120 is `gemv2_q4wp`. 9B (K=4096) stays two launches. `=0` restores the 4-row kernels (`gemv2_q4`, `gemv2_q4p`, `gemv2_q6s`, `gemv2_q5_k`). |
+| `ODINFER_CUDA_GEMV_MMVQ` | on | One warp per row for Q4_K, Q6_K, and Q5_K. Q4 gate+up with K≥5120 is `gemv2_q4wp`. 9B (K=4096) stays two launches. `=0` restores the 4-row kernels. |
+| `ODINFER_CUDA_GEMV_Q5` | `w` | `w` is aligned `gemv2_q5w`. `k` is `gemv2_q5_k` (2.97 ms vs 3.06 for `q5w` on #24). `w2` is two rows sharing x. |
+| `ODINFER_CUDA_WGEMM_BK` | `64` | `=32` is the smaller prefill tile (40960-byte smem). Default stays BK=64. |
+| `ODINFER_CUDA_ATTN_PARTS` | off | `=4` or `=8` forces that many WMMA KV parts. Unset keeps the 80-block planner (2 parts on a 512-token, 4-KV-head chunk). |
 | `ODINFER_CUDA_GEMV_SPLIT` | on | Q4_K / Q6_K decode with `rows≤8192` splits K and `atomicAdd`s the partials. `=0` is one K range. |
 | `ODINFER_CUDA_GEMV_SPLITS` | auto | Unset uses 2-way on short-row matrices whose K still has 12 superblocks per half, and 4-way otherwise. 27B w2 is staged plus that 2-way (bench `q6s2`). 9B w2 is direct 2-way (bench `s2`). `r4` is not the decode launch. `=4` is the flat split. |
 | `ODINFER_CUDA_GEMV_FUSE` | auto | Q4 gate+up with K≥5120 is one kernel (`gemv2_q4p`). 9B (K=4096) stays two launches. `=1` forces the pair. `=0` is two GEMVs. `--bench-gemv` prints `pair` versus `two r4` on the w1 shapes. |
