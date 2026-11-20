@@ -192,7 +192,9 @@ g_mmqk_wide: bool // Q4 tile is 64 rows only when ODINFER_CUDA_MMQK_ROWS=8; defa
 @(private)
 g_attn_long: bool // decode npos>=2048 uses 128-wide parts; ODINFER_CUDA_ATTN_LONG=0 keeps 32
 @(private)
-g_delta_wmma: bool // chunked gated-delta WMMA; ODINFER_CUDA_DELTA_WMMA=1, default off
+g_delta_wmma: bool // chunked gated-delta WMMA for 128x128; ODINFER_CUDA_DELTA_WMMA=0 keeps the recurrence
+@(private)
+g_wmma_smem: bool // attention_q8v_wmma raised its dynamic smem to ATTN_WMMA_SMEM
 @(private)
 g_mmq_ok: bool
 @(private)
@@ -1271,13 +1273,14 @@ attn_q8v_flash_launch :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos0, T: int) -> bo
 	return klaunch(k_attn_flash, u32(g_kv_heads), u32(gy), 1, 128, 1, 1, args[:], "attn_flash", u32(attn_flash_smem(br, mul, g_head)))
 }
 
-// WMMA prefill. 16 query tokens share one dequantized 32-token K/V tile.
-// head_dim is 256. The sequence is split so the grid covers the SMs.
-// Shared memory is K + V + Q + scores + P, 44096 bytes, under the 48 KB default.
-ATTN_WMMA_BQ :: 16
-ATTN_WMMA_BC :: 32
+// WMMA prefill. 32 query tokens share one dequantized 64-token K tile, then
+// the same buffer holds V. head_dim is 256 and kv_mul is at most 8.
+// Shared memory is 91136 bytes, so the dynamic cap has to be raised.
+ATTN_WMMA_BQ :: 32
+ATTN_WMMA_BC :: 64
 ATTN_WMMA_PARTS :: 8
-ATTN_WMMA_SMEM :: 44096
+ATTN_WMMA_SMEM :: 91136
+ATTN_WMMA_HEADS :: 8
 ATTN_WMMA_TARGET :: 80
 
 Attn_Wmma_Plan :: struct {
@@ -1327,7 +1330,7 @@ attn_wmma_ok :: proc() -> bool {
 		return false
 	}
 	mul := g_heads / g_kv_heads
-	return mul >= 1 && mul <= 16 && mul * g_kv_heads == g_heads
+	return g_wmma_smem && mul >= 1 && mul <= ATTN_WMMA_HEADS && mul * g_kv_heads == g_heads
 }
 
 @(private)
@@ -1493,8 +1496,9 @@ launch_delta_chunk :: proc(outp, state, q, k, v, b, a, decay, dt: cu.Device_Ptr,
 	// 128x128 is 64 KiB, past the 48 KiB default, so this needs the attribute
 	// set at bind time. A larger head stays on the global kernel.
 	bytes := hkd * hvd * 4
-	// Chunked WY + WMMA. Default off: fp16 operands drift, and the recurrent
-	// kernel is the text-matched path. 128x128 only; other heads stay here.
+	// Chunked WY + WMMA. 27B text matched and the delta bucket dropped
+	// (13237 ms to 11057 at 8000 tokens). =0 is the fp32 recurrence.
+	// 128x128 only; other heads stay on the smem recurrence.
 	if g_delta_wmma && k_delta_wmma != nil && hkd == 128 && hvd == 128 {
 		return klaunch(k_delta_wmma, u32(nvh), 1, 1, 256, 1, 1, args[:], "delta_wmma", 49152)
 	}
@@ -1632,6 +1636,10 @@ bind_kernels :: proc() -> bool {
 	g_delta_sm = cu.func_set_max_dynamic_shared(k_delta_sm, 65536) == cu.OK
 	if !g_delta_sm {
 		fmt.eprintln("cuda: delta state stays in global memory (cuFuncSetAttribute failed)")
+	}
+	g_wmma_smem = cu.func_set_max_dynamic_shared(k_attn_wmma, ATTN_WMMA_SMEM) == cu.OK
+	if !g_wmma_smem {
+		fmt.eprintln("cuda: prefill wmma stays on attention_q8v (cuFuncSetAttribute failed)")
 	}
 	return true
 }
@@ -1997,7 +2005,7 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	g_prefill_fuse = os.get_env("ODINFER_CUDA_PREFILL_FUSE", context.temp_allocator) == "1"
 	g_mmqk_wide = os.get_env("ODINFER_CUDA_MMQK_ROWS", context.temp_allocator) == "8"
 	g_attn_long = os.get_env("ODINFER_CUDA_ATTN_LONG", context.temp_allocator) != "0"
-	g_delta_wmma = os.get_env("ODINFER_CUDA_DELTA_WMMA", context.temp_allocator) == "1"
+	g_delta_wmma = os.get_env("ODINFER_CUDA_DELTA_WMMA", context.temp_allocator) != "0"
 	g_chunk_req = 512
 	if s := os.get_env("ODINFER_CUDA_PREFILL_CHUNK", context.temp_allocator); s != "" {
 		if v, ok := strconv.parse_int(s); ok && v >= 16 && v <= 512 && v % 16 == 0 {
@@ -2308,7 +2316,9 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	}
 	fmt.eprintfln("cuda: prefill chunk {} (ODINFER_CUDA_PREFILL_CHUNK, default 512)", chosen)
 	if g_delta_wmma {
-		fmt.eprintln("cuda: delta wmma on for 128x128 prefill chunks (WY, fp16 tensor cores). Not the text-matched path. ODINFER_CUDA_DELTA_WMMA=0 is the recurrent kernel")
+		fmt.eprintln("cuda: delta wmma on for 128x128 prefill chunks (WY, fp16 tensor cores). ODINFER_CUDA_DELTA_WMMA=0 is the recurrent kernel")
+	} else {
+		fmt.eprintln("cuda: delta wmma off (ODINFER_CUDA_DELTA_WMMA=0)")
 	}
 	if g_delta_sm {
 		fmt.eprintln("cuda: delta prefill keeps a head state of at most 64 KiB in shared memory")
@@ -2405,9 +2415,9 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 		fmt.eprintln("cuda: attn split off for this model (head_dim must be a multiple of 32 in 32..256, kv_mul 1..16)")
 	}
 	if attn_wmma_ok() {
-		fmt.eprintln("cuda: prefill wmma on (16 query tokens, 32-token KV tiles, fp16 tensor cores, online softmax). ODINFER_CUDA_PREFILL_FLASH=0 is attention_q8v")
+		fmt.eprintln("cuda: prefill wmma on (32 query tokens, 64-token KV tiles, fp16 tensor cores, online softmax). ODINFER_CUDA_PREFILL_FLASH=0 is attention_q8v")
 	} else if g_prefill_mode == 2 {
-		fmt.eprintln("cuda: prefill wmma off for this model (needs mixed-V head_dim 256); attention_q8v")
+		fmt.eprintln("cuda: prefill wmma off for this model (needs mixed-V head_dim 256, kv_mul<=8, and 91136 bytes of dynamic smem); attention_q8v")
 	} else if attn_flash_ok() {
 		fmt.eprintf("cuda: prefill flash on (br=%d, fp32, slower than attention_q8v on the 9B). ODINFER_CUDA_PREFILL_FLASH=0 is attention_q8v\n", g_flash_br)
 	} else if g_prefill_mode == 1 {
@@ -2487,7 +2497,7 @@ cuda_full :: proc(tr: ^Transformer, l, pos0, T: int) {
 	// Store every token before attention. Query t only reads KV through
 	// position t, so writing the rest of the chunk first does not change
 	// the scores. Flash is one launch for the whole chunk. A block holds a
-	// few query tokens and one KV head, stages each 32-token K/V tile once,
+	// few query tokens and one KV head, stages each 64-token K tile once,
 	// and reuses it across the query heads in the group. The flops stay
 	// O(N^2).
 	for ti in 0 ..< T {
