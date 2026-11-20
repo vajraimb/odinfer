@@ -1289,6 +1289,156 @@ run_attn_split :: proc() -> bool {
 	return ok
 }
 
+// Prefill flash against attention_q8v on one mixed-V cache. kv_mul is 6,
+// the 27B group, so K and V for a 32-token tile are loaded once and reused
+// by every query head in the group. Each case is a causal chunk: token tok
+// attends through pos0+tok. T=128 is a full production chunk; T=7 is a
+// partial last query tile (br is 2 for this shape). Online softmax is the
+// same fp32 merge as the split reduce, applied as tiles arrive, so it is
+// not bit-exact. Allowance is 2e-2 absolute plus 1e-3 times |reference|.
+@(private)
+run_attn_flash :: proc() -> bool {
+	hd := 256
+	n_kv := 2
+	kv_mul := 6
+	n_heads := n_kv * kv_mul
+	npos_max := 32768
+	t_max := 128
+	nb_head := hd / 32
+	kv_dim := n_kv * hd
+	nb := kv_dim / 32
+	k_pos := nb * Q8_0_BLOCK_BYTES
+	v_pos := nb * Q8_V_MIX_BLOCK_BYTES
+	br := attn_flash_pick(kv_mul, hd)
+	if br < 1 {
+		fmt.eprintln("cuda_selftest: attn flash does not fit this shape")
+		return false
+	}
+	kc := make([]u8, npos_max * k_pos)
+	vc := make([]u8, npos_max * v_pos)
+	q := make([]f32, t_max * n_heads * hd)
+	blk := make([]f32, 32)
+	defer delete(kc)
+	defer delete(vc)
+	defer delete(q)
+	defer delete(blk)
+	for t in 0 ..< npos_max {
+		for kvh in 0 ..< n_kv {
+			for b in 0 ..< nb_head {
+				gid := kvh * nb_head + b
+				for j in 0 ..< 32 {
+					i := b * 32 + j
+					blk[j] = (f32((i * 3 + t * 5 + kvh * 7) % 11) - 5) * 0.15
+				}
+				quantize_q8_block(blk, kc[t * k_pos + gid * Q8_0_BLOCK_BYTES:][:Q8_0_BLOCK_BYTES])
+				for j in 0 ..< 32 {
+					i := b * 32 + j
+					blk[j] = (f32((i * 2 + t + kvh) % 9) - 4) * 0.2
+					if j == 3 {
+						blk[j] = 3.5 + f32(t) * 0.01
+					}
+				}
+				quantize_q8_v_mix_block(blk, vc[t * v_pos + gid * Q8_V_MIX_BLOCK_BYTES:][:Q8_V_MIX_BLOCK_BYTES])
+			}
+		}
+	}
+	for tok in 0 ..< t_max {
+		for h in 0 ..< n_heads {
+			for i in 0 ..< hd {
+				q[(tok * n_heads + h) * hd + i] = (f32((i + h * 3 + tok * 5) % 13) - 6) * 0.1
+			}
+		}
+	}
+	dq, _ := cu.alloc(len(q) * 4)
+	dkc, _ := cu.alloc(len(kc))
+	dvc, _ := cu.alloc(len(vc))
+	dxb, _ := cu.alloc(t_max * n_heads * hd * 4)
+	dref, _ := cu.alloc(n_heads * hd * 4)
+	dsc, _ := cu.alloc(n_heads * npos_max * 4)
+	defer cu.free(dq)
+	defer cu.free(dkc)
+	defer cu.free(dvc)
+	defer cu.free(dxb)
+	defer cu.free(dref)
+	defer cu.free(dsc)
+	if dq == 0 || dkc == 0 || dvc == 0 || dxb == 0 || dref == 0 || dsc == 0 {
+		fmt.eprintln("cuda_selftest: attn flash alloc failed")
+		return false
+	}
+	if cu.upload(dq, raw_data(q), len(q) * 4) != cu.OK || cu.upload(dkc, raw_data(kc), len(kc)) != cu.OK || cu.upload(dvc, raw_data(vc), len(vc)) != cu.OK {
+		fmt.eprintln("cuda_selftest: attn flash upload failed")
+		return false
+	}
+	old_fn := s_fn("attention_q8v")
+	flash_fn := s_fn("attention_q8v_flash")
+	if old_fn == nil || flash_fn == nil {
+		fmt.eprintln("cuda_selftest: attn flash kernels missing")
+		return false
+	}
+	smem := u32(attn_flash_smem(br, kv_mul, hd))
+	got_old := make([]f32, t_max * n_heads * hd)
+	got_new := make([]f32, t_max * n_heads * hd)
+	one := make([]f32, n_heads * hd)
+	defer delete(got_old)
+	defer delete(got_new)
+	defer delete(one)
+	// npos is the context the last token of the chunk can see. pos0 = npos-T.
+	cases := [?][2]int{{128, 128}, {128, 7}, {128, 4}, {300, 4}, {1800, 4}, {8192, 4}, {32768, 4}}
+	ok := true
+	for cs in cases {
+		npos := cs[0]
+		T := cs[1]
+		pos0 := npos - T
+		kca, vca, sc := dkc, dvc, dsc
+		ihd := i32(hd)
+		ikb := i32(k_pos)
+		ivb := i32(v_pos)
+		mul := i32(kv_mul)
+		sl := i32(npos_max)
+		slot: cu.Device_Ptr
+		stride0 := i32(0)
+		for tok in 0 ..< T {
+			qa := cu.ptr_add(dq, tok * n_heads * hd * 4)
+			xb := dref
+			ps := i32(pos0 + tok)
+			oargs := [?]rawptr{&qa, &kca, &vca, &xb, &sc, &ihd, &ikb, &ivb, &mul, &ps, &sl, &slot, &stride0}
+			if cu.launch(old_fn, u32(n_heads), 1, 1, 128, 1, 1, 0, oargs[:]) != cu.OK || cu.sync() != cu.OK {
+				fmt.eprintfln("cuda_selftest: attention_q8v launch failed at npos {} T {}", npos, T)
+				return false
+			}
+			if cu.download(raw_data(one), dref, len(one) * 4) != cu.OK {
+				return false
+			}
+			copy(got_old[tok * n_heads * hd:], one)
+		}
+		qa := dq
+		xb := dxb
+		nh := i32(n_heads)
+		ps := i32(pos0)
+		nt := i32(T)
+		stride := i32(n_heads * hd)
+		ibr := i32(br)
+		fargs := [?]rawptr{&qa, &kca, &vca, &xb, &ihd, &ikb, &ivb, &mul, &nh, &ps, &nt, &stride, &ibr}
+		gy := u32((T + br - 1) / br)
+		if cu.launch(flash_fn, u32(n_kv), gy, 1, 128, 1, 1, smem, fargs[:]) != cu.OK || cu.sync() != cu.OK {
+			fmt.eprintfln("cuda_selftest: attention_q8v_flash launch failed at npos {} T {}", npos, T)
+			return false
+		}
+		nfloat := T * n_heads * hd
+		if cu.download(raw_data(got_new), dxb, nfloat * 4) != cu.OK {
+			return false
+		}
+		st: Case_Err
+		for i in 0 ..< nfloat {
+			s_note(&st, fmt.tprintf("flash[%d] npos %d T %d", i, npos, T), got_new[i], got_old[i], 2e-2, 1e-3)
+		}
+		if !s_report(fmt.tprintf("attn_flash npos={} T={}", npos, T), st, 2e-2, 1e-3) {
+			ok = false
+		}
+	}
+	return ok
+}
+
 @(private)
 run_delta :: proc() -> bool {
 	hkd, hvd := 4, 4
@@ -1623,6 +1773,9 @@ cuda_selftest :: proc() -> bool {
 		ok = false
 	}
 	if !run_attn_split() {
+		ok = false
+	}
+	if !run_attn_flash() {
 		ok = false
 	}
 	if !run_delta() {

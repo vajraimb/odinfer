@@ -154,7 +154,11 @@ g_tc2_reuse: bool // ODINFER_CUDA_TC2_REUSE=1: T>64 reuses one scalar weight til
 @(private)
 g_attn_batch: bool // prefill attention is one launch per chunk
 @(private)
-g_attn_split: bool // mixed-V attention splits npos into 32-token parts
+g_attn_split: bool // mixed-V decode splits npos into 32-token parts
+@(private)
+g_prefill_flash: bool // mixed-V prefill uses attention_q8v_flash
+@(private)
+g_flash_br: int // query tokens per flash block (0: kernel does not fit)
 @(private)
 g_fuse_norm: bool // ODINFER_CUDA_FUSE_NORM=1: side-buffer residual_norm (slower)
 @(private)
@@ -222,7 +226,7 @@ k_gemv2r1_q4, k_gemv2r1_q6: cu.Function
 @(private)
 k_rmsnorm, k_qnorm, k_rope, k_gate, k_gate_q, k_swiglu, k_swiglu_q, k_residual, k_axpy: cu.Function
 @(private)
-k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v, k_attn_part, k_attn_red: cu.Function
+k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v, k_attn_part, k_attn_red, k_attn_flash: cu.Function
 @(private)
 k_conv, k_l2, k_delta, k_delta_chunk, k_rmsgate, k_rmsgate_q, k_moe_topk: cu.Function
 @(private)
@@ -1034,6 +1038,73 @@ attn_q8v_batch :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos0, T: int) -> bool {
 	return klaunch(k_attn_q8v, u32(g_heads), u32(T), 1, 128, 1, 1, args[:], "attn_q8v")
 }
 
+// V100 default dynamic shared memory is 48 KB. Above that needs an opt-in
+// to 96 KB, which this kernel does not request. The bytes must match
+// attention_q8v_flash: Q and the running output for `br` query tokens times
+// every query head in the group, the online max/sum, 16-byte pad, then one
+// 32-token Q8_0 K tile and mixed-V tile.
+ATTN_FLASH_SMEM :: 48 * 1024
+
+@(private)
+attn_flash_smem :: proc(br, kv_mul, head: int) -> int {
+	if br < 1 || kv_mul < 1 || head < 32 || head % 32 != 0 {
+		return ATTN_FLASH_SMEM + 1
+	}
+	nb := head / 32
+	cap := br * kv_mul
+	fbytes := cap * head * 4 * 2 + cap * 8
+	fbytes = (fbytes + 15) / 16 * 16
+	kv := 32 * nb * 34 + 32 * nb * 40
+	return fbytes + kv
+}
+
+@(private)
+attn_flash_pick :: proc(kv_mul, head: int) -> int {
+	if kv_mul < 1 || kv_mul > 16 || head < 32 || head > 256 || head % 32 != 0 {
+		return 0
+	}
+	cands := [?]int{4, 3, 2, 1}
+	for br in cands {
+		if attn_flash_smem(br, kv_mul, head) <= ATTN_FLASH_SMEM {
+			return br
+		}
+	}
+	return 0
+}
+
+@(private)
+attn_flash_ok :: proc() -> bool {
+	if !g_prefill_flash || g_flash_br < 1 || k_attn_flash == nil || !g_kv_v_mix {
+		return false
+	}
+	if g_kv_heads < 1 || g_heads < 1 || g_head < 32 || g_head > 256 || g_head % 32 != 0 {
+		return false
+	}
+	mul := g_heads / g_kv_heads
+	if mul < 1 || mul > 16 || mul * g_kv_heads != g_heads {
+		return false
+	}
+	return attn_flash_smem(g_flash_br, mul, g_head) <= ATTN_FLASH_SMEM
+}
+
+@(private)
+attn_q8v_flash_launch :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos0, T: int) -> bool {
+	mul := g_heads / g_kv_heads
+	br := g_flash_br
+	gy := (T + br - 1) / br
+	if T < 1 || gy < 1 || gy > CUDA_GRID_Y_MAX {
+		return false
+	}
+	a, b, c, d := q, kc, vc, xb3
+	hd := i32(g_head)
+	kb, vb := i32(g_k_pos), i32(g_v_pos)
+	km, nh := i32(mul), i32(g_heads)
+	ps, nt := i32(pos0), i32(T)
+	stride, ibr := i32(g_heads * g_head), i32(br)
+	args := [?]rawptr{&a, &b, &c, &d, &hd, &kb, &vb, &km, &nh, &ps, &nt, &stride, &ibr}
+	return klaunch(k_attn_flash, u32(g_kv_heads), u32(gy), 1, 128, 1, 1, args[:], "attn_flash", u32(attn_flash_smem(br, mul, g_head)))
+}
+
 // True when the split kernels are the ones that should run for this npos.
 // f16 and symmetric Q8 stay on the one-block kernel. So does a short
 // context: npos < 128 was under a millisecond across every full layer.
@@ -1195,6 +1266,7 @@ bind_kernels :: proc() -> bool {
 	k_attn_q8v = get_fn("attention_q8v")
 	k_attn_part = get_fn("attention_q8v_part")
 	k_attn_red = get_fn("attention_q8v_reduce")
+	k_attn_flash = get_fn("attention_q8v_flash")
 	k_conv = get_fn("conv1d_step")
 	k_l2 = get_fn("l2norm_scale")
 	k_delta = get_fn("delta_recurrent")
@@ -1225,7 +1297,7 @@ bind_kernels :: proc() -> bool {
 	k_gemv2r1_q6 = get_fn("gemv2r1_q6_k")
 	handles := [?]cu.Function{
 		k_rmsnorm, k_qnorm, k_rope, k_gate, k_swiglu, k_residual, k_axpy,
-		k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v, k_attn_part, k_attn_red,
+		k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v, k_attn_part, k_attn_red, k_attn_flash,
 		k_conv, k_l2, k_delta, k_delta_chunk, k_rmsgate, k_rmsgate_q, k_moe_topk,
 		k_gate_q, k_swiglu_q,
 		k_tc2_q4, k_tc2_q6, k_tc2s_q4, k_tc2s_q6, k_tc2m_q4, k_tc2m_q6, k_tc2r_q4, k_tc2r_q6,
@@ -1579,6 +1651,9 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	g_attn_batch = os.get_env("ODINFER_CUDA_ATTN_BATCH", context.temp_allocator) != "0"
 	// Default on. =0 keeps attention_q8v (one block per query head).
 	g_attn_split = os.get_env("ODINFER_CUDA_ATTN_SPLIT", context.temp_allocator) != "0"
+	// Default on for mixed-V prefill. =0 is attention_q8v. Decode is unchanged.
+	g_prefill_flash = os.get_env("ODINFER_CUDA_PREFILL_FLASH", context.temp_allocator) != "0"
+	g_flash_br = 0
 	// Side-buffer residual_norm was slower than accum GEMV + rmsnorm_q8
 	// (9B 1.99 vs 1.41 ms, 27B 4.96 vs 3.53). Opt in.
 	g_fuse_norm = os.get_env("ODINFER_CUDA_FUSE_NORM", context.temp_allocator) == "1"
@@ -1736,10 +1811,10 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 			g_v_bytes = kv_v_mix_total_bytes(p.n_full, p.seq_len, g_kv_dim)
 			do_store = store_q8v_call
 			do_attn = attn_q8v_dispatch
-			// Prefill stays on the one-block kernel. On the V100S the split
-			// path inside a T=128 chunk was slower (27B 905 tokens 63.6 vs
-			// 71.7 tok/s, 9B 193.5 vs 212.0) because each token relaunched
-			// the parts. Decode is the path that was latency-bound.
+			// Fallback prefill. attention_q8v_flash replaces this when the
+			// shape fits in 48 KB. The per-token split inside a T=128 chunk
+			// stays off: on the V100S it was slower (27B 905 tokens 63.6 vs
+			// 71.7 tok/s) because each token relaunched the parts.
 			do_attn_batch = attn_q8v_batch
 		} else {
 			g_v_pos = g_k_pos
@@ -1899,13 +1974,24 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 			}
 		}
 	}
+	g_flash_br = 0
+	if g_prefill_flash && g_kv_v_mix && g_kv_heads > 0 && g_heads > 0 {
+		g_flash_br = attn_flash_pick(g_heads / g_kv_heads, g_head)
+	}
 	split_live := g_attn_split && d_part_m != 0 && g_head >= 32 && g_head <= 256 && g_head % 32 == 0 && g_kv_heads > 0 && g_heads / g_kv_heads >= 1 && g_heads / g_kv_heads <= 16 && (g_heads / g_kv_heads) * g_kv_heads == g_heads
 	if split_live {
-		fmt.eprintln("cuda: attn split on for mixed-V decode when npos>=128 (32-token parts + reduce). Prefill stays on attention_q8v. ODINFER_CUDA_ATTN_SPLIT=0 is the one-block kernel")
+		fmt.eprintln("cuda: attn split on for mixed-V decode when npos>=128 (32-token parts + reduce). ODINFER_CUDA_ATTN_SPLIT=0 is the one-block kernel for decode")
 	} else if !g_attn_split {
 		fmt.eprintln("cuda: attn split off (ODINFER_CUDA_ATTN_SPLIT=0)")
 	} else {
 		fmt.eprintln("cuda: attn split off for this model (head_dim must be a multiple of 32 in 32..256, kv_mul 1..16)")
+	}
+	if attn_flash_ok() {
+		fmt.eprintf("cuda: prefill flash on (br=%d, 32-token KV tiles, online softmax, no score row). ODINFER_CUDA_PREFILL_FLASH=0 is attention_q8v\n", g_flash_br)
+	} else if !g_prefill_flash {
+		fmt.eprintln("cuda: prefill flash off (ODINFER_CUDA_PREFILL_FLASH=0)")
+	} else if g_kv_v_mix {
+		fmt.eprintln("cuda: prefill flash off for this model (48 KB shared memory or head shape); attention_q8v")
 	}
 	if g_use_graph {
 		fmt.eprintln("cuda: graph on for dense T=1 (ODINFER_CUDA_GRAPH=1; MoE stays eager)")
@@ -1974,8 +2060,10 @@ cuda_full :: proc(tr: ^Transformer, l, pos0, T: int) {
 	vc := cu.ptr_add(d_vc, slot * g_v_layer)
 	// Store every token before attention. Query t only reads KV through
 	// position t, so writing the rest of the chunk first does not change
-	// the scores. The per-token launch was one block per head and left
-	// most SMs idle; the chunk launch is still O(N^2) flops.
+	// the scores. Flash is one launch for the whole chunk. A block holds a
+	// few query tokens and one KV head, stages each 32-token K/V tile once,
+	// and reuses it across the query heads in the group. The flops stay
+	// O(N^2).
 	for ti in 0 ..< T {
 		qrow := fp(d_q, ti * attdim)
 		krow := fp(d_k, ti * kvdim)
@@ -1985,7 +2073,12 @@ cuda_full :: proc(tr: ^Transformer, l, pos0, T: int) {
 		must(launch_rope(krow, p.head_dim, pos, p.rope_theta, p.rotary_dim, p.n_kv_heads))
 		must(do_store(krow, vrow, kc, vc, pos))
 	}
-	batch := T > 1 && g_attn_batch && g_score_batch > 1 && do_attn_batch != nil
+	flashed := false
+	if T > 1 && attn_flash_ok() {
+		must(attn_q8v_flash_launch(d_q, kc, vc, d_xb3, pos0, T))
+		flashed = true
+	}
+	batch := !flashed && T > 1 && g_attn_batch && g_score_batch > 1 && do_attn_batch != nil
 	if batch {
 		for base := 0; base < T; base += g_score_batch {
 			ntok := min(g_score_batch, T - base)
@@ -1995,7 +2088,7 @@ cuda_full :: proc(tr: ^Transformer, l, pos0, T: int) {
 	for ti in 0 ..< T {
 		qproj := fp(d_qproj, ti * qdim)
 		xb3 := fp(d_xb3, ti * attdim)
-		if !batch {
+		if !batch && !flashed {
 			must(do_attn(fp(d_q, ti * attdim), kc, vc, xb3, pos0 + ti))
 		}
 		must(launch_gate(xb3, qproj, p.head_dim, p.n_heads, T == 1))
