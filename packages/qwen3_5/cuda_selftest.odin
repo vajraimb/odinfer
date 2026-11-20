@@ -404,6 +404,63 @@ run_gemv2 :: proc(kind: ggml.GGML_Type, rows, cols: int, atol, rtol: f32) -> boo
 				return false
 			}
 		}
+		pfn := s_fn("gemv2_q4_pair_k")
+		if pfn == nil {
+			fmt.eprintln("cuda_selftest: gemv2_q4_pair_k missing")
+			return false
+		}
+		raw2 := fill_weight(kind, rows, cols)
+		defer delete(raw2)
+		for i in 0 ..< len(raw2) {
+			raw2[i] += 3
+		}
+		dw2, ep2 := cu.alloc(len(raw2) + 64)
+		dy0, ey0 := cu.alloc(rows * 4)
+		dy1, ey1 := cu.alloc(rows * 4)
+		defer cu.free(dw2)
+		defer cu.free(dy0)
+		defer cu.free(dy1)
+		if ep2 != cu.OK || ey0 != cu.OK || ey1 != cu.OK {
+			fmt.eprintln("cuda_selftest: gemv2_q4_pair alloc failed")
+			return false
+		}
+		cu.upload(dw2, raw_data(raw2), len(raw2))
+		w2p, y0p, y1p := dw2, dy0, dy1
+		acc = 0
+		one := [?]rawptr{&w2p, &qs, &sc, &sm, &y1p, &nn, &dd, &acc}
+		if cu.launch(fn, gx, 1, 1, bx, 1, 1, 0, one[:]) != cu.OK || cu.sync() != cu.OK {
+			fmt.eprintln("cuda_selftest: gemv2_q4 pair reference launch failed")
+			return false
+		}
+		ref1 := make([]f32, rows)
+		defer delete(ref1)
+		cu.download(raw_data(ref1), dy1, rows * 4)
+		acc = 0
+		back := [?]rawptr{&wb, &qs, &sc, &sm, &yy, &nn, &dd, &acc}
+		if cu.launch(fn, gx, 1, 1, bx, 1, 1, 0, back[:]) != cu.OK || cu.sync() != cu.OK {
+			fmt.eprintln("cuda_selftest: gemv2_q4 pair reference launch failed")
+			return false
+		}
+		cu.download(raw_data(got), dy, rows * 4)
+		pargs := [?]rawptr{&wb, &w2p, &qs, &sc, &sm, &y0p, &y1p, &nn, &dd}
+		if cu.launch(pfn, gx, 1, 1, bx, 1, 1, 0, pargs[:]) != cu.OK || cu.sync() != cu.OK {
+			fmt.eprintln("cuda_selftest: gemv2_q4_pair_k launch failed")
+			return false
+		}
+		pair0 := make([]f32, rows)
+		pair1 := make([]f32, rows)
+		defer delete(pair0)
+		defer delete(pair1)
+		cu.download(raw_data(pair0), dy0, rows * 4)
+		cu.download(raw_data(pair1), dy1, rows * 4)
+		st = {}
+		for r in 0 ..< rows {
+			s_note(&st, fmt.tprintf("gemv2_q4_pair y0 row %d", r), pair0[r], got[r], 1e-4, 1e-5)
+			s_note(&st, fmt.tprintf("gemv2_q4_pair y1 row %d", r), pair1[r], ref1[r], 1e-4, 1e-5)
+		}
+		if !s_report(fmt.tprintf("gemv2_q4_pair %dx%d", rows, cols), st, 1e-4, 1e-5) {
+			return false
+		}
 	}
 	if kind == .Q6_K {
 		sfn := s_fn("gemv2_q6s_k")
@@ -2636,6 +2693,7 @@ cuda_gemv_bench :: proc() {
 		}
 	}
 	fmt.eprintfln("cuda_gemv: T=1  peak %.0f GB/s (ODINFER_CUDA_PEAK_GBS). GB/s counts the weight bytes only.", peak)
+	fmt.eprintln("cuda_gemv: r4 is gy=1 of the unstaged kernel. dec is the production launch (Q6 staged when K>=16384 or rows>8192, split from the 80-SM rule). pair is one K sweep of two Q4 matrices versus two r4 launches.")
 	shapes := [?]Gemv_Shape{
 		{"9B w1", .Q4_K, 12288, 4096},
 		{"9B wq", .Q4_K, 8192, 4096},
@@ -2804,6 +2862,66 @@ gemv_bench_one :: proc(sh: Gemv_Shape, peak: f64) {
 		_, r1_gbs := gemv_gbs(sh.kind, sh.rows, sh.cols, r1_ms)
 		fmt.eprintfln("    r1   %.3f ms  %.1f GB/s  %.1f%% of peak", r1_ms, r1_gbs, r1_gbs / peak * 100)
 	}
+	dec_fn := nw
+	dec_name := "r4"
+	if sh.kind == .Q6_K && (sh.cols >= 16384 || sh.rows > 8192) {
+		if sfn := s_fn("gemv2_q6s_k"); sfn != nil {
+			dec_fn = sfn
+			dec_name = "q6s"
+		}
+	}
+	dec_sp := u32(1)
+	if (sh.kind == .Q4_K || sh.kind == .Q6_K) && sh.rows > 0 && sh.rows <= 8192 {
+		nb := sh.cols / 256
+		if nb >= 4 {
+			dec_sp = 4
+			wn := (sh.rows + 3) / 4
+			if nb / 2 >= 12 && wn < 80 * 32 {
+				dec_sp = 2
+			}
+		} else if nb >= 2 {
+			dec_sp = 2
+		}
+	}
+	dec_ms: f64 = -1
+	if dec_fn != nil {
+		if sh.kind == .Q4_K || sh.kind == .Q5_K {
+			args := [?]rawptr{&wb, &qs, &sc, &sm, &yy, &nn, &dd, &acc}
+			if dec_sp > 1 {
+				dec_ms = gemv_time_split(dec_fn, args[:], gx, dec_sp, bx, dy, sh.rows * 4, warm, iters)
+			} else {
+				dec_ms = gemv_time(dec_fn, args[:], gx, 1, bx, warm, iters)
+			}
+		} else {
+			args := [?]rawptr{&wb, &qs, &sc, &yy, &nn, &dd, &acc}
+			if dec_sp > 1 {
+				dec_ms = gemv_time_split(dec_fn, args[:], gx, dec_sp, bx, dy, sh.rows * 4, warm, iters)
+			} else {
+				dec_ms = gemv_time(dec_fn, args[:], gx, 1, bx, warm, iters)
+			}
+		}
+	}
+	if dec_ms > 0 {
+		_, dec_gbs := gemv_gbs(sh.kind, sh.rows, sh.cols, dec_ms)
+		fmt.eprintfln("    dec  %.3f ms  %.1f GB/s  %.1f%% of peak  (%s gy={})", dec_ms, dec_gbs, dec_gbs / peak * 100, dec_name, dec_sp)
+	}
+	if sh.kind == .Q4_K && (sh.name == "9B w1" || sh.name == "27B w1") {
+		pfn := s_fn("gemv2_q4_pair_k")
+		dy2, ey2 := cu.alloc(sh.rows * 4)
+		if pfn != nil && ey2 == cu.OK {
+			two := gemv_time_twice(nw, wb, qs, sc, sm, yy, nn, dd, acc, gx, bx, warm, iters)
+			w0 := wb
+			y2 := dy2
+			pargs := [?]rawptr{&w0, &wb, &qs, &sc, &sm, &yy, &y2, &nn, &dd}
+			pms := gemv_time(pfn, pargs[:], gx, 1, bx, warm, iters)
+			if two > 0 && pms > 0 {
+				fmt.eprintfln("    pair %.3f ms   two r4 %.3f ms  (same weights twice, one x)", pms, two)
+			}
+		}
+		if ey2 == cu.OK {
+			cu.free(dy2)
+		}
+	}
 	fmt.eprintfln("    old  %.3f ms  %.1f GB/s  %.1f%% of peak", old_ms, old_gbs, old_gbs / peak * 100)
 }
 
@@ -2838,6 +2956,31 @@ gemv_time_split :: proc(fn: cu.Function, args: []rawptr, gx, gy, bx: u32, y: cu.
 			return -1
 		}
 		if cu.launch(fn, gx, gy, 1, bx, 1, 1, 0, args) != cu.OK {
+			return -1
+		}
+		cu.sync()
+	}
+	return f64(time.duration_milliseconds(time.since(t0))) / f64(iters)
+}
+
+// Two Q4 GEMVs back to back, the gate+up decode pair before fusion.
+@(private)
+gemv_time_twice :: proc(fn: cu.Function, wb, qs, sc, sm, yy: cu.Device_Ptr, nn, dd, acc: i32, gx, bx: u32, warm, iters: int) -> f64 {
+	w := wb
+	q, s, m, y := qs, sc, sm, yy
+	n, d, a := nn, dd, acc
+	args := [?]rawptr{&w, &q, &s, &m, &y, &n, &d, &a}
+	for _ in 0 ..< warm {
+		cu.launch(fn, gx, 1, 1, bx, 1, 1, 0, args[:])
+		cu.launch(fn, gx, 1, 1, bx, 1, 1, 0, args[:])
+	}
+	cu.sync()
+	t0 := time.now()
+	for _ in 0 ..< iters {
+		if cu.launch(fn, gx, 1, 1, bx, 1, 1, 0, args[:]) != cu.OK {
+			return -1
+		}
+		if cu.launch(fn, gx, 1, 1, bx, 1, 1, 0, args[:]) != cu.OK {
 			return -1
 		}
 		cu.sync()

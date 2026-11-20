@@ -50,7 +50,8 @@ you isolate per-stage GPU time. Never enable in production.
 | `ODINFER_CUDA_GEMV_ROWS` | `4` | Q4_K / Q6_K rows per warp. Unset is four. `1` selects the one-row kernel, which was slower on the V100S. |
 | `ODINFER_CUDA_GEMV_WARPS` | `8` | Warps per bandwidth-GEMV block, 1..16. V100S tuning knob. |
 | `ODINFER_CUDA_GEMV_SPLIT` | on | Q4_K / Q6_K decode with `rows≤8192` splits K and `atomicAdd`s the partials. `=0` is one K range. |
-| `ODINFER_CUDA_GEMV_SPLITS` | auto | Unset uses 2-way on short-row matrices whose K still has 12 superblocks per half (27B wo, 27B w2) and 4-way otherwise. `=4` is the previous flat split. The unsplit `--bench-gemv` line was 27B wo 398 GB/s (35%) and w2 345 GB/s (30%), against wq at 48%. |
+| `ODINFER_CUDA_GEMV_SPLITS` | auto | Unset uses 2-way on short-row matrices whose K still has 12 superblocks per half, and 4-way otherwise. 27B w2 is staged plus that 2-way (bench `q6s2`). 9B w2 is direct 2-way (bench `s2`). `r4` is not the decode launch. `=4` is the flat split. |
+| `ODINFER_CUDA_GEMV_FUSE` | on | Tall Q4 gate+up is one kernel (`gemv2_q4p`). `=0` is two GEMVs. `--bench-gemv` prints `pair` versus `two r4` on the w1 shapes. |
 | `ODINFER_CUDA_TC2` | on | Q4_K / Q6_K prefill (K multiple of 256). `T<=64` uses the 32-token fp16 tile. `T>64` uses the scalar-dequant tile. `=0` uses the scalar tile at every T. |
 | `ODINFER_CUDA_TC2_WIDE` | off | `=1` uses the 128-token tile for `T>64`. Slower than the scalar tile at 581 and 2000 tokens on the V100S. |
 | `ODINFER_CUDA_TC2_BLOCK` | off | `=1` uses `tc2m`. Measured slower on the V100S and it changed a sampled token. Leave off. |
@@ -61,7 +62,7 @@ you isolate per-stage GPU time. Never enable in production.
 | `ODINFER_CUDA_PREFILL_FUSE` | off | `=1` makes gate+up and K+V share one q8 stage. It was neutral on a V100 (9B at 8000 tokens, 332 off vs 333 on) and the linear bucket was slower. |
 | `ODINFER_CUDA_MMQK_ROWS` | `4` | Default Q4 tile is 32 rows per block. `=8` selects the 64-row tile, which was slower on a V100. Q6 stays at 32 either way. |
 | `ODINFER_CUDA_ATTN_LONG` | on | Mixed-V decode, `npos>=2048`, head_dim 256, 4 or 6 query heads per KV head. 128 positions per block. `=0` keeps 32-token parts. |
-| `ODINFER_CUDA_DELTA_WMMA` | on | 128×128 prefill state uses a 16-token WMMA gated-delta chunk. On the 27B, text matched and the delta bucket at 8000 tokens went from 13237 ms to 11057. `=0` is the fp32 recurrence. |
+| `ODINFER_CUDA_DELTA_WMMA` | on | 128×128 prefill state uses a 16-token WMMA gated-delta chunk. The scalar passes hoist the per-column scale. The earlier chunk dropped the 27B 8000-token delta bucket from 13237 ms to 11057. `=0` is the fp32 recurrence. |
 | `ODINFER_CUDA_PREFILL_CHUNK` | `512` | Tokens per prefill forward. A multiple of 16 from 16 to 512. Anything else is ignored. On the scalar tile, 9B at 16000 tokens was 183/207/213 tok/s for 128/256/512. A size that does not fit falls back through 256, 128, 32, 8, 1, and does not grow past the request. |
 | `ODINFER_CUDA_ATTN_BATCH` | on | Prefill full attention launches once per chunk (heads by tokens). `=0` launches once per token. |
 | `ODINFER_CUDA_ATTN_SPLIT` | on | Mixed-V decode (`T==1`, `npos>=128`) uses 32-token parts and a reduce (`attn_part`, `attn_red`). Does not select the prefill kernel. `=0` is the one-block kernel for decode. fp32 merge tolerance versus `attention_q8v` is `2e-2 + 1e-3*|ref|`. Disables the CUDA graph. |
@@ -72,7 +73,7 @@ you isolate per-stage GPU time. Never enable in production.
 | `ODINFER_CUDA_Q6_STAGE` | auto | Unset stages a Q6 GEMV only when K≥16384 or rows>8192. `=1` stages every Q6 GEMV. `=0` uses direct loads. |
 | `ODINFER_CUDA_SMOKE_PREFILL` | unset | `cuda_smoke` only. `=N` prefills N tokens of a fixed repeated sentence instead of the short 2+2 prompt. |
 | `ODINFER_CUDA_LOGITS` | unset | `cuda_smoke` only. `=1` prints the top-5 logits at the first decode position and the next one, and the margin to EOS 248046. |
-| `ODINFER_CUDA_GRAPH` | off | `=1` captures dense `T==1` decode as one CUDA graph. MoE and prefill stay eager. Off while `ODINFER_CUDA_PROFILE=1`. |
+| `ODINFER_CUDA_GRAPH` | off | `=1` captures dense `T==1` decode as one CUDA graph and recaptures when the split-attention part count changes. MoE and prefill stay eager. Off while `ODINFER_CUDA_PROFILE=1`. |
 | `ODINFER_CUDA_PROFILE` | off | `=1` prints per-kernel GPU time for each forward (disables the graph). The 8192-event ring is aggregated by kernel name as it fills, so a long prefill is complete. |
 | `ODINFER_CUDA_PHASE` | off | `=1` prints one `cuda: phase` line per forward (linear, attn, kv, norm, delta, other) and one `cuda: phase prefill` total across the prefill chunks. Same events as `PROFILE`. Not a production tok/s. |
 | `ODINFER_PHASE` | off | `=1` prints CPU time for the grammar mask and the tool-call grammar mask on each sample. |

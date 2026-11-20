@@ -1933,7 +1933,6 @@ extern "C" __global__ void delta_chunk_wmma(float* out, float* state_all, const 
     float* attq = att + 256;
     float* decay = attq + 256;
     float* beta = decay + 16;
-    float* row = beta + 16;
     unsigned short* As = (unsigned short*)(delta_wmma_sm + 35456);
     unsigned short* Bs = As + 512;
     float* store = (float*)(delta_wmma_sm + 40576);
@@ -2017,31 +2016,44 @@ extern "C" __global__ void delta_chunk_wmma(float* out, float* state_all, const 
             for (int i = 0; i < 16; ++i) decay[i] = dec[i];
         }
         __syncthreads();
-        for (int i = 0; i < 16; ++i) {
-            for (int d = tid; d < 128; d += 256) {
-                float s = 0.f;
-                float qe = qbuf[i * 128 + d] * expf(decay[i]);
-                for (int p = 0; p < 16; ++p) {
-                    float w = kbuf[p * 128 + d] * beta[p] * expf(decay[p]);
-                    s += att[i * 16 + p] * w;
-                }
-                row[d] = s;
-                qbuf[i * 128 + d] = qe;
+        /* The per-column scale does not depend on the row i, and exp(decay)
+           was being recomputed 16 times. tid and tid+128 own the same d and
+           split the 16 rows. Each thread writes only its own i, so the old
+           per-row syncthreads around row[] is not required. One sync publishes
+           cdbuf and qbuf before kbuf is overwritten. */
+        {
+            int d = tid & 127;
+            int i0 = (tid < 128) ? 0 : 8;
+            float wk[16];
+#pragma unroll
+            for (int p = 0; p < 16; ++p) {
+                wk[p] = kbuf[p * 128 + d] * beta[p] * expf(decay[p]);
             }
-            __syncthreads();
-            for (int d = tid; d < 128; d += 256) cdbuf[i * 128 + d] = row[d];
-            __syncthreads();
-        }
-        for (int i = 0; i < 16; ++i) {
-            for (int d = tid; d < 128; d += 256) {
+#pragma unroll
+            for (int i = i0; i < i0 + 8; ++i) {
                 float s = 0.f;
-                for (int p = 0; p < 16; ++p) s += att[i * 16 + p] * vbuf[p * 128 + d] * beta[p];
-                row[d] = s;
+#pragma unroll
+                for (int p = 0; p < 16; ++p) s += att[i * 16 + p] * wk[p];
+                cdbuf[i * 128 + d] = s;
+                qbuf[i * 128 + d] *= expf(decay[i]);
             }
-            __syncthreads();
-            for (int d = tid; d < 128; d += 256) kbuf[i * 128 + d] = row[d];
-            __syncthreads();
         }
+        __syncthreads();
+        {
+            int d = tid & 127;
+            int i0 = (tid < 128) ? 0 : 8;
+            float vv[16];
+#pragma unroll
+            for (int p = 0; p < 16; ++p) vv[p] = vbuf[p * 128 + d] * beta[p];
+#pragma unroll
+            for (int i = i0; i < i0 + 8; ++i) {
+                float s = 0.f;
+#pragma unroll
+                for (int p = 0; p < 16; ++p) s += att[i * 16 + p] * vv[p];
+                kbuf[i * 128 + d] = s;
+            }
+        }
+        __syncthreads();
         float vp0 = 0.f, vp1 = 0.f, vp2 = 0.f, vp3 = 0.f, vp4 = 0.f, vp5 = 0.f, vp6 = 0.f, vp7 = 0.f;
         float oi0 = 0.f, oi1 = 0.f, oi2 = 0.f, oi3 = 0.f, oi4 = 0.f, oi5 = 0.f, oi6 = 0.f, oi7 = 0.f;
         int v0 = warp * 16;
@@ -2088,21 +2100,25 @@ extern "C" __global__ void delta_chunk_wmma(float* out, float* state_all, const 
         __syncthreads();
         for (int e = tid; e < 2048; e += 256) vbuf[e] = kbuf[e] - vbuf[e];
         __syncthreads();
-        for (int i = 0; i < 16; ++i) {
-            for (int d = tid; d < 128; d += 256) {
+        {
+            int d = tid & 127;
+            int i0 = (tid < 128) ? 0 : 8;
+            float vv[16];
+#pragma unroll
+            for (int p = 0; p < 16; ++p) vv[p] = vbuf[p * 128 + d];
+#pragma unroll
+            for (int i = i0; i < i0 + 8; ++i) {
                 float s = cdbuf[i * 128 + d];
-                for (int p = 0; p < 16; ++p) s += attq[i * 16 + p] * vbuf[p * 128 + d];
-                row[d] = s;
+#pragma unroll
+                for (int p = 0; p < 16; ++p) s += attq[i * 16 + p] * vv[p];
+                cdbuf[i * 128 + d] = s;
+                if (i < nloc) {
+                    float* oout = out + ((size_t)(base + i) * (size_t)n_v_heads + (size_t)vh) * 128;
+                    oout[d] = s;
+                }
             }
-            __syncthreads();
-            for (int d = tid; d < 128; d += 256) cdbuf[i * 128 + d] = row[d];
-            __syncthreads();
-            if (i < nloc) {
-                float* oout = out + ((size_t)(base + i) * (size_t)n_v_heads + (size_t)vh) * 128;
-                for (int d = tid; d < 128; d += 256) oout[d] = cdbuf[i * 128 + d];
-            }
-            __syncthreads();
         }
+        __syncthreads();
         float last = expf(decay[15]);
         for (int nt = 0; nt < 8; ++nt) {
             int col = nt * 16;
@@ -3336,6 +3352,76 @@ extern "C" __global__ void gemv2_q4_k(const unsigned char* wb, const signed char
 extern "C" __global__ void gemv2_q4nc_k(const unsigned char* wb, const signed char* xq, const float* xd, const float2* sum16,
                                         float* out, int n, int d, int accumulate) {
     GEMV2_Q4_BODY(LD_NC)
+}
+
+/* One K sweep, two Q4_K matrices that share x (gate and up). x is loaded
+   once per super-block; both weight streams are issued before the dots.
+   gy is 1: the host keeps split-K on the two-launch path. Same math as
+   two gemv2_q4_k calls. */
+__device__ __forceinline__ float q4_acc(uint4 hdr, uint4 qv, uint4 xlo, uint4 xhi, float2 slo, float2 shi,
+                                        const float* xd, int b, int t) {
+    int p = t >> 1;
+    int half = t & 1;
+    float dW = f16_bits(hdr.x & 0xffff);
+    float dmin = f16_bits(hdr.x >> 16);
+    int sc0, m0, sc1, m1;
+    scale_min_hdr(p * 2, hdr, &sc0, &m0);
+    scale_min_hdr(p * 2 + 1, hdr, &sc1, &m1);
+    int group = b * 8 + p * 2;
+    int dot_lo = dot_nib(qv, xlo, 0);
+    int dot_hi = dot_nib(qv, xhi, 1);
+    float sum_lo = half ? slo.y : slo.x;
+    float sum_hi = half ? shi.y : shi.x;
+    float acc = (dW * (float)sc0) * xd[group] * (float)dot_lo - (dmin * (float)m0) * sum_lo;
+    acc += (dW * (float)sc1) * xd[group + 1] * (float)dot_hi - (dmin * (float)m1) * sum_hi;
+    return acc;
+}
+
+extern "C" __global__ void gemv2_q4_pair_k(const unsigned char* w0, const unsigned char* w1,
+                                           const signed char* xq, const float* xd, const float2* sum16,
+                                           float* y0, float* y1, int n, int d) {
+    int lane = (int)threadIdx.x & 31;
+    int warp = (int)threadIdx.x >> 5;
+    int sub = lane >> 3;
+    int t = lane & 7;
+    int row = ((int)blockIdx.x * ((int)blockDim.x >> 5) + warp) * 4 + sub;
+    int nb = n >> 8;
+    float acc0 = 0.f, acc1 = 0.f;
+    for (int b = 0; b < nb; ++b) {
+        uint4 h0 = make_uint4(0, 0, 0, 0);
+        uint4 h1 = make_uint4(0, 0, 0, 0);
+        uint4 q0 = make_uint4(0, 0, 0, 0);
+        uint4 q1 = make_uint4(0, 0, 0, 0);
+        if (row < d) {
+            const unsigned char* blk0 = w0 + ((size_t)row * (size_t)nb + (size_t)b) * 144;
+            const unsigned char* blk1 = w1 + ((size_t)row * (size_t)nb + (size_t)b) * 144;
+            if (t == 0) {
+                h0 = ld_global_v4(blk0);
+                h1 = ld_global_v4(blk1);
+            }
+            q0 = ld_global_v4(blk0 + 16 + t * 16);
+            q1 = ld_global_v4(blk1 + 16 + t * 16);
+        }
+        int src = lane & ~7;
+        h0 = shfl_u4(h0, src);
+        h1 = shfl_u4(h1, src);
+        if (row < d) {
+            int p = t >> 1;
+            int half = t & 1;
+            int group = b * 8 + p * 2;
+            int off = half * 16;
+            uint4 xlo = ld_global_v4(xq + (size_t)group * 32 + off);
+            uint4 xhi = ld_global_v4(xq + (size_t)(group + 1) * 32 + off);
+            float2 slo = sum16[group];
+            float2 shi = sum16[group + 1];
+            acc0 += q4_acc(h0, q0, xlo, xhi, slo, shi, xd, b, t);
+            acc1 += q4_acc(h1, q1, xlo, xhi, slo, shi, xd, b, t);
+        }
+    }
+    acc0 = warp8_sum(acc0);
+    acc1 = warp8_sum(acc1);
+    store_row(y0, row, d, t == 0, acc0, 0);
+    store_row(y1, row, d, t == 0, acc1, 0);
 }
 
 #undef GEMV2_Q4_BODY
