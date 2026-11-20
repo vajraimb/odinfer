@@ -110,6 +110,8 @@ d_logits, d_scores, d_partial, d_moe_logits, d_moe_wt, d_moe_sel: cu.Device_Ptr
 @(private)
 d_part_m, d_part_l, d_part_o: cu.Device_Ptr
 @(private)
+d_wmma_o, d_wmma_m, d_wmma_l: cu.Device_Ptr
+@(private)
 d_kc, d_vc, d_conv, d_rec: cu.Device_Ptr
 
 @(private)
@@ -156,9 +158,9 @@ g_attn_batch: bool // prefill attention is one launch per chunk
 @(private)
 g_attn_split: bool // mixed-V decode splits npos into 32-token parts
 @(private)
-g_prefill_flash: bool // mixed-V prefill uses attention_q8v_flash
+g_prefill_mode: int // 0 attention_q8v, 1 fp32 flash, 2 wmma prefill
 @(private)
-g_flash_br: int // query tokens per flash block (0: kernel does not fit)
+g_flash_br: int // query tokens per fp32 flash block (0: kernel does not fit)
 @(private)
 g_fuse_norm: bool // ODINFER_CUDA_FUSE_NORM=1: side-buffer residual_norm (slower)
 @(private)
@@ -226,7 +228,7 @@ k_gemv2r1_q4, k_gemv2r1_q6: cu.Function
 @(private)
 k_rmsnorm, k_qnorm, k_rope, k_gate, k_gate_q, k_swiglu, k_swiglu_q, k_residual, k_axpy: cu.Function
 @(private)
-k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v, k_attn_part, k_attn_red, k_attn_flash: cu.Function
+k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v, k_attn_part, k_attn_red, k_attn_flash, k_attn_wmma, k_attn_wred: cu.Function
 @(private)
 k_conv, k_l2, k_delta, k_delta_chunk, k_rmsgate, k_rmsgate_q, k_moe_topk: cu.Function
 @(private)
@@ -1074,7 +1076,7 @@ attn_flash_pick :: proc(kv_mul, head: int) -> int {
 
 @(private)
 attn_flash_ok :: proc() -> bool {
-	if !g_prefill_flash || g_flash_br < 1 || k_attn_flash == nil || !g_kv_v_mix {
+	if g_prefill_mode != 1 || g_flash_br < 1 || k_attn_flash == nil || !g_kv_v_mix {
 		return false
 	}
 	if g_kv_heads < 1 || g_heads < 1 || g_head < 32 || g_head > 256 || g_head % 32 != 0 {
@@ -1103,6 +1105,90 @@ attn_q8v_flash_launch :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos0, T: int) -> bo
 	stride, ibr := i32(g_heads * g_head), i32(br)
 	args := [?]rawptr{&a, &b, &c, &d, &hd, &kb, &vb, &km, &nh, &ps, &nt, &stride, &ibr}
 	return klaunch(k_attn_flash, u32(g_kv_heads), u32(gy), 1, 128, 1, 1, args[:], "attn_flash", u32(attn_flash_smem(br, mul, g_head)))
+}
+
+// WMMA prefill. 16 query tokens share one dequantized 32-token K/V tile.
+// head_dim is 256. The sequence is split so the grid covers the SMs.
+// Shared memory is K + V + Q + scores + P, 44096 bytes, under the 48 KB default.
+ATTN_WMMA_BQ :: 16
+ATTN_WMMA_BC :: 32
+ATTN_WMMA_PARTS :: 8
+ATTN_WMMA_SMEM :: 44096
+ATTN_WMMA_TARGET :: 80
+
+Attn_Wmma_Plan :: struct {
+	q_tiles: int,
+	nparts:  int,
+	part_len: int,
+}
+
+@(private)
+attn_wmma_plan :: proc(T, pos0, n_kv: int) -> Attn_Wmma_Plan {
+	q_tiles := (T + ATTN_WMMA_BQ - 1) / ATTN_WMMA_BQ
+	if q_tiles < 1 {
+		q_tiles = 1
+	}
+	kv_len := pos0 + T
+	if kv_len < 1 {
+		kv_len = 1
+	}
+	tiles := (kv_len + ATTN_WMMA_BC - 1) / ATTN_WMMA_BC
+	if tiles < 1 {
+		tiles = 1
+	}
+	base := q_tiles * n_kv
+	if base < 1 {
+		base = 1
+	}
+	nparts := (ATTN_WMMA_TARGET + base - 1) / base
+	if nparts < 1 {
+		nparts = 1
+	}
+	if nparts > ATTN_WMMA_PARTS {
+		nparts = ATTN_WMMA_PARTS
+	}
+	if nparts > tiles {
+		nparts = tiles
+	}
+	part_tiles := (tiles + nparts - 1) / nparts
+	return Attn_Wmma_Plan{q_tiles, nparts, part_tiles * ATTN_WMMA_BC}
+}
+
+@(private)
+attn_wmma_ok :: proc() -> bool {
+	if g_prefill_mode != 2 || !g_kv_v_mix || k_attn_wmma == nil || k_attn_wred == nil || d_wmma_o == 0 {
+		return false
+	}
+	if g_head != 256 || g_kv_heads < 1 || g_heads < 1 {
+		return false
+	}
+	mul := g_heads / g_kv_heads
+	return mul >= 1 && mul <= 16 && mul * g_kv_heads == g_heads
+}
+
+@(private)
+attn_wmma_launch :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos0, T: int) -> bool {
+	plan := attn_wmma_plan(T, pos0, g_kv_heads)
+	max_tiles := (CUDA_MAX_BATCH + ATTN_WMMA_BQ - 1) / ATTN_WMMA_BQ
+	if T < 1 || plan.q_tiles > max_tiles || plan.nparts < 1 || plan.nparts > ATTN_WMMA_PARTS {
+		return false
+	}
+	a, b, c := q, kc, vc
+	po, pm, pl := d_wmma_o, d_wmma_m, d_wmma_l
+	hd := i32(g_head)
+	kb, vb := i32(g_k_pos), i32(g_v_pos)
+	mul, nh := i32(g_heads / g_kv_heads), i32(g_heads)
+	ps, nt := i32(pos0), i32(T)
+	stride := i32(g_heads * g_head)
+	qt, plen := i32(plan.q_tiles), i32(plan.part_len)
+	args := [?]rawptr{&a, &b, &c, &po, &pm, &pl, &hd, &kb, &vb, &mul, &nh, &ps, &nt, &stride, &qt, &plen}
+	if !klaunch(k_attn_wmma, u32(plan.q_tiles), u32(g_kv_heads), u32(plan.nparts), 512, 1, 1, args[:], "attn_wmma", u32(ATTN_WMMA_SMEM)) {
+		return false
+	}
+	out := xb3
+	np := i32(plan.nparts)
+	rargs := [?]rawptr{&out, &po, &pm, &pl, &nh, &qt, &np, &ps, &nt, &stride}
+	return klaunch(k_attn_wred, u32(g_heads), u32(plan.q_tiles), 1, 128, 1, 1, rargs[:], "attn_wred")
 }
 
 // True when the split kernels are the ones that should run for this npos.
@@ -1267,6 +1353,8 @@ bind_kernels :: proc() -> bool {
 	k_attn_part = get_fn("attention_q8v_part")
 	k_attn_red = get_fn("attention_q8v_reduce")
 	k_attn_flash = get_fn("attention_q8v_flash")
+	k_attn_wmma = get_fn("attention_q8v_wmma")
+	k_attn_wred = get_fn("attention_q8v_wmma_reduce")
 	k_conv = get_fn("conv1d_step")
 	k_l2 = get_fn("l2norm_scale")
 	k_delta = get_fn("delta_recurrent")
@@ -1297,7 +1385,7 @@ bind_kernels :: proc() -> bool {
 	k_gemv2r1_q6 = get_fn("gemv2r1_q6_k")
 	handles := [?]cu.Function{
 		k_rmsnorm, k_qnorm, k_rope, k_gate, k_swiglu, k_residual, k_axpy,
-		k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v, k_attn_part, k_attn_red, k_attn_flash,
+		k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v, k_attn_part, k_attn_red, k_attn_flash, k_attn_wmma, k_attn_wred,
 		k_conv, k_l2, k_delta, k_delta_chunk, k_rmsgate, k_rmsgate_q, k_moe_topk,
 		k_gate_q, k_swiglu_q,
 		k_tc2_q4, k_tc2_q6, k_tc2s_q4, k_tc2s_q6, k_tc2m_q4, k_tc2m_q6, k_tc2r_q4, k_tc2r_q6,
@@ -1438,6 +1526,23 @@ alloc_acts :: proc(t: ^Transformer, T: int) -> bool {
 		g_score_batch = batch
 	}
 	d_part_m, d_part_l, d_part_o = 0, 0, 0
+	d_wmma_o, d_wmma_m, d_wmma_l = 0, 0, 0
+	if g_prefill_mode == 2 && p.head_dim == 256 && p.n_heads > 0 && T > 0 {
+		max_tiles := (T + ATTN_WMMA_BQ - 1) / ATTN_WMMA_BQ
+		if max_tiles < 1 {
+			max_tiles = 1
+		}
+		nslot := ATTN_WMMA_PARTS * max_tiles * p.n_heads * ATTN_WMMA_BQ
+		wo, okw := alloc_bytes(nslot * p.head_dim * 4)
+		wm, okm := alloc_bytes(nslot * 4)
+		wl, okl := alloc_bytes(nslot * 4)
+		if !okw || !okm || !okl {
+			fmt.eprintln("cuda: wmma prefill buffer did not fit; attention_q8v")
+			g_prefill_mode = 0
+		} else {
+			d_wmma_o, d_wmma_m, d_wmma_l = wo, wm, wl
+		}
+	}
 	if g_attn_split && p.n_heads > 0 && p.head_dim >= 32 && p.head_dim <= 256 && p.head_dim % 32 == 0 && p.seq_len > 0 {
 		nsplit := (p.seq_len + ATTN_PART - 1) / ATTN_PART
 		if nsplit < 1 {
@@ -1651,8 +1756,15 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	g_attn_batch = os.get_env("ODINFER_CUDA_ATTN_BATCH", context.temp_allocator) != "0"
 	// Default on. =0 keeps attention_q8v (one block per query head).
 	g_attn_split = os.get_env("ODINFER_CUDA_ATTN_SPLIT", context.temp_allocator) != "0"
-	// Default on for mixed-V prefill. =0 is attention_q8v. Decode is unchanged.
-	g_prefill_flash = os.get_env("ODINFER_CUDA_PREFILL_FLASH", context.temp_allocator) != "0"
+	// Default is attention_q8v. The fp32 flash was slower on the 9B V100
+	// (16000 tokens 80.7 vs 114.2 tok/s). =1 keeps that kernel. =2 is the
+	// WMMA prefill, opt-in until a V100 run shows it is faster.
+	g_prefill_mode = 0
+	if s := os.get_env("ODINFER_CUDA_PREFILL_FLASH", context.temp_allocator); s == "1" {
+		g_prefill_mode = 1
+	} else if s == "2" {
+		g_prefill_mode = 2
+	}
 	g_flash_br = 0
 	// Side-buffer residual_norm was slower than accum GEMV + rmsnorm_q8
 	// (9B 1.99 vs 1.41 ms, 27B 4.96 vs 3.53). Opt in.
@@ -1975,7 +2087,7 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 		}
 	}
 	g_flash_br = 0
-	if g_prefill_flash && g_kv_v_mix && g_kv_heads > 0 && g_heads > 0 {
+	if g_prefill_mode == 1 && g_kv_v_mix && g_kv_heads > 0 && g_heads > 0 {
 		g_flash_br = attn_flash_pick(g_heads / g_kv_heads, g_head)
 	}
 	split_live := g_attn_split && d_part_m != 0 && g_head >= 32 && g_head <= 256 && g_head % 32 == 0 && g_kv_heads > 0 && g_heads / g_kv_heads >= 1 && g_heads / g_kv_heads <= 16 && (g_heads / g_kv_heads) * g_kv_heads == g_heads
@@ -1986,12 +2098,16 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	} else {
 		fmt.eprintln("cuda: attn split off for this model (head_dim must be a multiple of 32 in 32..256, kv_mul 1..16)")
 	}
-	if attn_flash_ok() {
-		fmt.eprintf("cuda: prefill flash on (br=%d, 32-token KV tiles, online softmax, no score row). ODINFER_CUDA_PREFILL_FLASH=0 is attention_q8v\n", g_flash_br)
-	} else if !g_prefill_flash {
-		fmt.eprintln("cuda: prefill flash off (ODINFER_CUDA_PREFILL_FLASH=0)")
-	} else if g_kv_v_mix {
+	if attn_wmma_ok() {
+		fmt.eprintln("cuda: prefill wmma on (16 query tokens, 32-token KV tiles, fp16 tensor cores, online softmax). ODINFER_CUDA_PREFILL_FLASH=0 is attention_q8v")
+	} else if g_prefill_mode == 2 {
+		fmt.eprintln("cuda: prefill wmma off for this model (needs mixed-V head_dim 256); attention_q8v")
+	} else if attn_flash_ok() {
+		fmt.eprintf("cuda: prefill flash on (br=%d, fp32, slower than attention_q8v on the 9B). ODINFER_CUDA_PREFILL_FLASH=0 is attention_q8v\n", g_flash_br)
+	} else if g_prefill_mode == 1 {
 		fmt.eprintln("cuda: prefill flash off for this model (48 KB shared memory or head shape); attention_q8v")
+	} else {
+		fmt.eprintln("cuda: prefill attention is attention_q8v (ODINFER_CUDA_PREFILL_FLASH=1 fp32 flash, =2 wmma)")
 	}
 	if g_use_graph {
 		fmt.eprintln("cuda: graph on for dense T=1 (ODINFER_CUDA_GRAPH=1; MoE stays eager)")
@@ -2074,7 +2190,10 @@ cuda_full :: proc(tr: ^Transformer, l, pos0, T: int) {
 		must(do_store(krow, vrow, kc, vc, pos))
 	}
 	flashed := false
-	if T > 1 && attn_flash_ok() {
+	if T > 1 && attn_wmma_ok() {
+		must(attn_wmma_launch(d_q, kc, vc, d_xb3, pos0, T))
+		flashed = true
+	} else if T > 1 && attn_flash_ok() {
 		must(attn_q8v_flash_launch(d_q, kc, vc, d_xb3, pos0, T))
 		flashed = true
 	}

@@ -1439,6 +1439,187 @@ run_attn_flash :: proc() -> bool {
 	return ok
 }
 
+// WMMA prefill against attention_q8v. fp16 Q/K/V products, fp32 accumulate,
+// online softmax. kv_mul 4 is the 9B group (16 tokens x 4 heads = 64 queries).
+// kv_mul 6 is the 27B group. Allowance is 1e-1 absolute plus 5e-2 times
+// |reference|, wider than the fp32 flash band because the products are fp16.
+@(private)
+run_attn_wmma :: proc() -> bool {
+	ok := true
+	wide := [?][2]int{{128, 16}, {128, 7}, {128, 64}, {300, 16}, {1800, 16}, {8192, 16}, {32768, 16}}
+	short := [?][2]int{{128, 16}, {1800, 16}}
+	if !run_attn_wmma_shape(4, wide[:]) {
+		ok = false
+	}
+	if !run_attn_wmma_shape(6, short[:]) {
+		ok = false
+	}
+	return ok
+}
+
+@(private)
+run_attn_wmma_shape :: proc(kv_mul: int, cases: [][2]int) -> bool {
+	hd := 256
+	n_kv := 2
+	n_heads := n_kv * kv_mul
+	npos_max := 1
+	t_max := 1
+	for cs in cases {
+		if cs[0] > npos_max {
+			npos_max = cs[0]
+		}
+		if cs[1] > t_max {
+			t_max = cs[1]
+		}
+	}
+	nb_head := hd / 32
+	kv_dim := n_kv * hd
+	nb := kv_dim / 32
+	k_pos := nb * Q8_0_BLOCK_BYTES
+	v_pos := nb * Q8_V_MIX_BLOCK_BYTES
+	kc := make([]u8, npos_max * k_pos)
+	vc := make([]u8, npos_max * v_pos)
+	q := make([]f32, t_max * n_heads * hd)
+	blk := make([]f32, 32)
+	defer delete(kc)
+	defer delete(vc)
+	defer delete(q)
+	defer delete(blk)
+	for t in 0 ..< npos_max {
+		for kvh in 0 ..< n_kv {
+			for b in 0 ..< nb_head {
+				gid := kvh * nb_head + b
+				for j in 0 ..< 32 {
+					i := b * 32 + j
+					blk[j] = (f32((i * 3 + t * 5 + kvh * 7) % 11) - 5) * 0.15
+				}
+				quantize_q8_block(blk, kc[t * k_pos + gid * Q8_0_BLOCK_BYTES:][:Q8_0_BLOCK_BYTES])
+				for j in 0 ..< 32 {
+					i := b * 32 + j
+					blk[j] = (f32((i * 2 + t + kvh) % 9) - 4) * 0.2
+					if j == 3 {
+						blk[j] = 3.5 + f32(t) * 0.01
+					}
+				}
+				quantize_q8_v_mix_block(blk, vc[t * v_pos + gid * Q8_V_MIX_BLOCK_BYTES:][:Q8_V_MIX_BLOCK_BYTES])
+			}
+		}
+	}
+	for tok in 0 ..< t_max {
+		for h in 0 ..< n_heads {
+			for i in 0 ..< hd {
+				q[(tok * n_heads + h) * hd + i] = (f32((i + h * 3 + tok * 5) % 13) - 6) * 0.1
+			}
+		}
+	}
+	q_cap := (t_max + ATTN_WMMA_BQ - 1) / ATTN_WMMA_BQ
+	nslot := ATTN_WMMA_PARTS * q_cap * n_heads * ATTN_WMMA_BQ
+	dq, _ := cu.alloc(len(q) * 4)
+	dkc, _ := cu.alloc(len(kc))
+	dvc, _ := cu.alloc(len(vc))
+	dxb, _ := cu.alloc(t_max * n_heads * hd * 4)
+	dref, _ := cu.alloc(n_heads * hd * 4)
+	dsc, _ := cu.alloc(n_heads * npos_max * 4)
+	dpo, _ := cu.alloc(nslot * hd * 4)
+	dpm, _ := cu.alloc(nslot * 4)
+	dpl, _ := cu.alloc(nslot * 4)
+	defer cu.free(dq)
+	defer cu.free(dkc)
+	defer cu.free(dvc)
+	defer cu.free(dxb)
+	defer cu.free(dref)
+	defer cu.free(dsc)
+	defer cu.free(dpo)
+	defer cu.free(dpm)
+	defer cu.free(dpl)
+	if dq == 0 || dkc == 0 || dvc == 0 || dxb == 0 || dref == 0 || dsc == 0 || dpo == 0 || dpm == 0 || dpl == 0 {
+		fmt.eprintln("cuda_selftest: attn wmma alloc failed")
+		return false
+	}
+	if cu.upload(dq, raw_data(q), len(q) * 4) != cu.OK || cu.upload(dkc, raw_data(kc), len(kc)) != cu.OK || cu.upload(dvc, raw_data(vc), len(vc)) != cu.OK {
+		fmt.eprintln("cuda_selftest: attn wmma upload failed")
+		return false
+	}
+	old_fn := s_fn("attention_q8v")
+	wmma_fn := s_fn("attention_q8v_wmma")
+	red_fn := s_fn("attention_q8v_wmma_reduce")
+	if old_fn == nil || wmma_fn == nil || red_fn == nil {
+		fmt.eprintln("cuda_selftest: attn wmma kernels missing")
+		return false
+	}
+	got_old := make([]f32, t_max * n_heads * hd)
+	got_new := make([]f32, t_max * n_heads * hd)
+	one := make([]f32, n_heads * hd)
+	defer delete(got_old)
+	defer delete(got_new)
+	defer delete(one)
+	ok := true
+	for cs in cases {
+		npos := cs[0]
+		T := cs[1]
+		if T > npos {
+			fmt.eprintfln("cuda_selftest: attn wmma T {} > npos {}", T, npos)
+			return false
+		}
+		pos0 := npos - T
+		plan := attn_wmma_plan(T, pos0, n_kv)
+		kca, vca, sc := dkc, dvc, dsc
+		ihd := i32(hd)
+		ikb := i32(k_pos)
+		ivb := i32(v_pos)
+		mul := i32(kv_mul)
+		sl := i32(npos_max)
+		slot: cu.Device_Ptr
+		stride0 := i32(0)
+		for tok in 0 ..< T {
+			qa := cu.ptr_add(dq, tok * n_heads * hd * 4)
+			xb := dref
+			ps := i32(pos0 + tok)
+			oargs := [?]rawptr{&qa, &kca, &vca, &xb, &sc, &ihd, &ikb, &ivb, &mul, &ps, &sl, &slot, &stride0}
+			if cu.launch(old_fn, u32(n_heads), 1, 1, 128, 1, 1, 0, oargs[:]) != cu.OK || cu.sync() != cu.OK {
+				fmt.eprintfln("cuda_selftest: attention_q8v launch failed at wmma npos {} T {}", npos, T)
+				return false
+			}
+			if cu.download(raw_data(one), dref, len(one) * 4) != cu.OK {
+				return false
+			}
+			copy(got_old[tok * n_heads * hd:], one)
+		}
+		qa := dq
+		po, pm, pl := dpo, dpm, dpl
+		nh := i32(n_heads)
+		ps := i32(pos0)
+		nt := i32(T)
+		stride := i32(n_heads * hd)
+		qt := i32(plan.q_tiles)
+		plen := i32(plan.part_len)
+		fargs := [?]rawptr{&qa, &kca, &vca, &po, &pm, &pl, &ihd, &ikb, &ivb, &mul, &nh, &ps, &nt, &stride, &qt, &plen}
+		if cu.launch(wmma_fn, u32(plan.q_tiles), u32(n_kv), u32(plan.nparts), 512, 1, 1, u32(ATTN_WMMA_SMEM), fargs[:]) != cu.OK || cu.sync() != cu.OK {
+			fmt.eprintfln("cuda_selftest: attention_q8v_wmma launch failed at npos {} T {}", npos, T)
+			return false
+		}
+		out := dxb
+		np := i32(plan.nparts)
+		rargs := [?]rawptr{&out, &po, &pm, &pl, &nh, &qt, &np, &ps, &nt, &stride}
+		if cu.launch(red_fn, u32(n_heads), u32(plan.q_tiles), 1, 128, 1, 1, 0, rargs[:]) != cu.OK || cu.sync() != cu.OK {
+			fmt.eprintfln("cuda_selftest: attention_q8v_wmma_reduce launch failed at npos {} T {}", npos, T)
+			return false
+		}
+		nfloat := T * n_heads * hd
+		if cu.download(raw_data(got_new), dxb, nfloat * 4) != cu.OK {
+			return false
+		}
+		st: Case_Err
+		for i in 0 ..< nfloat {
+			s_note(&st, fmt.tprintf("wmma[%d] npos %d T %d kv_mul %d", i, npos, T, kv_mul), got_new[i], got_old[i], 1e-1, 5e-2)
+		}
+		if !s_report(fmt.tprintf("attn_wmma kv_mul={} npos={} T={}", kv_mul, npos, T), st, 1e-1, 5e-2) {
+			ok = false
+		}
+	}
+	return ok
+}
+
 @(private)
 run_delta :: proc() -> bool {
 	hkd, hvd := 4, 4
@@ -1776,6 +1957,9 @@ cuda_selftest :: proc() -> bool {
 		ok = false
 	}
 	if !run_attn_flash() {
+		ok = false
+	}
+	if !run_attn_wmma() {
 		ok = false
 	}
 	if !run_delta() {
