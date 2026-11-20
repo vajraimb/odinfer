@@ -640,7 +640,7 @@ handle_chat :: proc(body: string) -> string {
 
 	t_start := time_to_ms()
 	t_first := t_start
-	max_tokens := 256
+	max_tokens := gen_limit(parse_int_field(body, "max_tokens", DEFAULT_MAX_GEN), g_state.pos)
 	gen := 0
 	next: int = 0
 
@@ -1636,8 +1636,7 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 		return
 	}
 
-	max_tokens := parse_int_field(body, "num_predict", 256)
-	if max_tokens == 0 { max_tokens = 256 }
+	max_tokens := parse_int_field(body, "num_predict", DEFAULT_MAX_GEN)
 	// Honor Ollama options.temperature (previously parsed only on the OpenAI
 	// path and ignored there). temperature=0 selects greedy argmax in the
 	// sampler — required by the prefix-cache bit-identical regression test.
@@ -1906,6 +1905,7 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 	}
 
 	finish_reason := "stop"
+	max_tokens = gen_limit(max_tokens, g_state.pos)
 	for gen < max_tokens {
 		if next == EOS { finish_reason = "stop"; break }
 		decoded := tok35.decode_token_id(&g_state.tok, next)
@@ -2035,7 +2035,7 @@ sse_end :: proc(client: net.TCP_Socket) {
 
 handle_openai_responses_stream :: proc(client: net.TCP_Socket, body: string) {
 	input_str := extract_responses_input(body)
-	max_tokens := parse_int_field(body, "max_output_tokens", 256)
+	max_tokens := parse_int_field(body, "max_output_tokens", DEFAULT_MAX_GEN)
 
 	resp_id := fmt.tprintf("resp_%d", time_to_ms())
 
@@ -2092,6 +2092,7 @@ handle_openai_responses_stream :: proc(client: net.TCP_Socket, body: string) {
 		next = sampler.sample(&g_state.samp, logits)
 	}
 
+	max_tokens = gen_limit(max_tokens, g_state.pos)
 	for gen < max_tokens {
 		if next == EOS { break }
 		decoded := tok35.decode_token_id(&g_state.tok, next)
@@ -2481,8 +2482,10 @@ handle_openai_chat :: proc(body: string) -> string {
 		return `{"error":{"message":"no messages found","type":"invalid_request_error"}}`
 	}
 
-	// Optional: parse max_tokens (default 256), temperature (default 0.6)
-	max_tokens := parse_int_field(body, "max_tokens", 256)
+	// Optional: parse max_tokens (default 4096), temperature (default 0.6).
+	// parse_int_field returns the first "max_tokens": in the body, so a
+	// message that contains that substring wins over the real field.
+	max_tokens := parse_int_field(body, "max_tokens", DEFAULT_MAX_GEN)
 	temperature := parse_f32_field(body, "temperature", 0.6)
 	_ = temperature  // currently unused; could set on sampler
 
@@ -2609,6 +2612,7 @@ handle_openai_chat :: proc(body: string) -> string {
 		return `{"error":{"message":"empty prompt","type":"internal_error"}}`
 	}
 
+	max_tokens = gen_limit(max_tokens, g_state.pos)
 	for gen < max_tokens {
 		if next == EOS { break }
 		decoded := tok35.decode_token_id(&g_state.tok, next)
@@ -2663,6 +2667,29 @@ handle_openai_chat :: proc(body: string) -> string {
 	fmt.eprintfln("[perf] openai_chat: parse/render={}ms reset={}ms encode={}ms prefill={}ms decode={}ms (ttft={}ms, tps={:.2f}, fwd_cpu={}ms) build_resp={}ms total={}ms (gen={})",
 		t1-t0, t2-t1, t3-t2, t4-t3, t_total, ttft, tps, fwd_cpu_ms, time_to_ms()-t5, time_to_ms()-t0, gen)
 	return final
+}
+
+DEFAULT_MAX_GEN :: 4096
+
+// How many tokens this turn may generate. requested < 1 (missing field, 0,
+// or a non-number) uses DEFAULT_MAX_GEN. The result is also capped by the
+// positions still free: generation starts at `pos` (the last prompt token)
+// and the loop stops once pos reaches seq_len, which allows seq_len-pos
+// new tokens.
+gen_limit :: proc(requested, pos: int) -> int {
+	seq := q35.engine_config(&g_state.engine).seq_len
+	remain := seq - pos
+	if remain < 1 {
+		return 0
+	}
+	n := requested
+	if n < 1 {
+		n = DEFAULT_MAX_GEN
+	}
+	if n > remain {
+		n = remain
+	}
+	return n
 }
 
 parse_int_field :: proc(json, field: string, def: int) -> int {
@@ -2790,7 +2817,7 @@ mcp_handle :: proc(line: string) -> (string, bool) {
 	case "notifications/initialized", "notifications/cancelled":
 		return "", false
 	case "tools/list":
-		return fmt.tprintf(`{{"jsonrpc":"2.0","id":%s,"result":{{"tools":[{{"name":"odin.chat","description":"Run the local Qwen3/Qwen3.5 model (odin-infer) on a chat request and return the generated reply.","inputSchema":{{"type":"object","properties":{{"messages":{{"type":"array","description":"Chat messages in OpenAI format (role/content)."}},"max_tokens":{{"type":"integer","description":"Maximum tokens to generate.","default":256}},"temperature":{{"type":"number","description":"Sampling temperature (0 = greedy).","default":0.6}}}},"required":["messages"]}}}},{{"name":"odin.models","description":"List the loaded model and engine status.","inputSchema":{{"type":"object","properties":{{}}}}}}]}}}}`, id), respond
+		return fmt.tprintf(`{{"jsonrpc":"2.0","id":%s,"result":{{"tools":[{{"name":"odin.chat","description":"Run the local Qwen3/Qwen3.5 model (odin-infer) on a chat request and return the generated reply.","inputSchema":{{"type":"object","properties":{{"messages":{{"type":"array","description":"Chat messages in OpenAI format (role/content)."}},"max_tokens":{{"type":"integer","description":"Maximum tokens to generate.","default":4096}},"temperature":{{"type":"number","description":"Sampling temperature (0 = greedy).","default":0.6}}}},"required":["messages"]}}}},{{"name":"odin.models","description":"List the loaded model and engine status.","inputSchema":{{"type":"object","properties":{{}}}}}}]}}}}`, id), respond
 	case "tools/call":
 		name := extract_json_field(line, "name")
 		switch name {

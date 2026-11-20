@@ -134,7 +134,7 @@ not as fresh chat turns.
 - No conversation history UI (refresh loses chat log)
 - No chat over the wire for non-Qwen3.5 models (path is hardcoded to q35)
 - Server is single-threaded; concurrent requests queue
-- 256-token generation cap per turn
+- Default generation cap is 4096 tokens, also capped by the context still free. `/api/chat` reads `max_tokens` (the dashboard field), `/api/chat` Ollama reads `num_predict`, `/v1/chat/completions` reads `max_tokens`, `/v1/responses` reads `max_output_tokens`
 
 ## Future work
 

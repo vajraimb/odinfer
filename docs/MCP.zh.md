@@ -19,7 +19,7 @@ bin/odin-serve <model.gguf> --mcp --metal [--max-ctx 4096]
 
 | 工具 | 说明 | 参数 |
 |---|---|---|
-| `odin.chat` | 用本地模型生成回复 | `messages`（OpenAI 格式，必填）、`max_tokens`（默认 256）、`temperature`（默认 0.6） |
+| `odin.chat` | 用本地模型生成回复 | `messages`（OpenAI 格式，必填）、`max_tokens`（默认 4096，同时不超过剩余上下文）、`temperature`（默认 0.6） |
 | `odin.models` | 已加载模型与引擎状态 | 无 |
 
 `odin.chat` 复用服务端的 OpenAI 处理路径（每请求无状态：reset → prefill →

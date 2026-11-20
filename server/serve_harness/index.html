@@ -40,7 +40,7 @@
   .msg-bot { color: #e4e4ed; white-space: pre-wrap; }
   .msg-meta { color: #6e7280; font-size: 11px; margin-top: 4px; }
   .input-row { display: flex; gap: 8px; margin-top: 12px; }
-  input[type=text] {
+  input[type=text], input[type=number] {
     flex: 1;
     background: #15151c;
     border: 1px solid #2a2a36;
@@ -80,6 +80,7 @@
     <div class="chat-log" id="log"></div>
     <div class="input-row">
       <input type="text" id="prompt" placeholder="Ask…" autofocus>
+      <input type="number" id="maxtok" min="1" value="4096" title="max tokens" style="width:96px;flex:none">
       <button id="send" onclick="send()">send</button>
     </div>
     <div class="live" id="live"></div>
@@ -132,10 +133,14 @@ async function send() {
 
   const t0 = performance.now();
   try {
+    let maxTok = parseInt(document.getElementById('maxtok').value, 10);
+    if (!Number.isFinite(maxTok) || maxTok < 1) maxTok = 4096;
     const r = await fetchJSON('/api/chat', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({message: msg}),
+      // max_tokens first: parse_int_field keeps the first occurrence, and
+      // the message text can contain the same key.
+      body: JSON.stringify({max_tokens: maxTok, message: msg}),
     });
     const t1 = performance.now();
     if (r.error) {

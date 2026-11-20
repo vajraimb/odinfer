@@ -1158,8 +1158,9 @@ run_kv_attn :: proc() -> bool {
 
 // Split attention against attention_q8v on one cache. head_dim 256, two KV
 // heads, four query heads per KV head, so every warp in the part kernel is
-// live. Lengths cover one position, a full part, a partial tail, and the
-// long decode sizes (300, 1800). Allowance is the same band as attention_q8v
+// live. Lengths cover one position, a full part, a partial tail, the
+// previous long decode sizes (300, 1800), and the contexts this server
+// now runs (8192, 32768). Allowance is the same band as attention_q8v
 // vs the CPU reference. The fp32 softmax merge is not bit-exact.
 @(private)
 run_attn_split :: proc() -> bool {
@@ -1167,7 +1168,7 @@ run_attn_split :: proc() -> bool {
 	n_kv := 2
 	kv_mul := 4
 	n_heads := n_kv * kv_mul
-	npos_max := 1800
+	npos_max := 32768
 	nb_head := hd / 32
 	kv_dim := n_kv * hd
 	nb := kv_dim / 32
@@ -1239,7 +1240,7 @@ run_attn_split :: proc() -> bool {
 	got_new := make([]f32, n_heads * hd)
 	defer delete(got_old)
 	defer delete(got_new)
-	lengths := [?]int{1, 32, 33, 70, 128, 300, 1800}
+	lengths := [?]int{1, 32, 33, 70, 128, 300, 1800, 8192, 32768}
 	ok := true
 	for npos in lengths {
 		qa, kca, vca, xb, sc := dq, dkc, dvc, dxb, dsc

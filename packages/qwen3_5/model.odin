@@ -528,6 +528,9 @@ build_transformer :: proc(t: ^Transformer, checkpoint_path: string, max_ctx: int
 	if t.config.seq_len <= 0 {
 		t.config.seq_len = max_ctx
 	}
+	if max_ctx > t.config.max_seq {
+		fmt.eprintf("qwen3_5: --max-ctx %d clamped to GGUF context_length %d\n", max_ctx, t.config.max_seq)
+	}
 
 	// layer index -> per-type slot lookup tables
 	t.full_slot = make([]int, t.config.n_layers)
