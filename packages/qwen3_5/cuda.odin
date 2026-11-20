@@ -154,6 +154,12 @@ g_gemv_rows: int // 0 or 4: four rows/warp. 1: one row/warp.
 @(private)
 g_gemv_split: bool // short Q4_K / Q6_K GEMV splits K across grid.y
 @(private)
+g_gemv_splits_force: int // ODINFER_CUDA_GEMV_SPLITS; 0 picks from the shape
+@(private)
+g_sm_count: int
+@(private)
+g_wgemm_min: int // T below this uses mmqk; ODINFER_CUDA_WGEMM_MIN, default 128
+@(private)
 g_q6_stage: int // -1 auto, 0 direct loads, 1 staged loads
 @(private)
 g_tc2_wide: bool // ODINFER_CUDA_TC2_WIDE=1: T>64 uses the 128-token tile
@@ -626,17 +632,35 @@ launch_gemv2 :: proc(fn: cu.Function, kind: ggml.GGML_Type, w, y: cu.Device_Ptr,
 		rows_per = warps * 8
 	}
 	splits := 1
-	// Short Q4/Q6 rows (wq, wo, w2) do not fill the SMs. Split K so more
-	// blocks are in flight. Tall rows stay one split. Capture includes the
-	// split only when the zeroing memset can be recorded on g_stream.
+	// Rows at or under 8192 do not fill the SMs, so K is split. Tall rows
+	// (27B wq, 12288) stay one split and were the 48% shape. 4-way on 27B wo
+	// (5120 x 6144, 24 superblocks) leaves a 6-block loop; the unsplit bench
+	// of that shape was 35% of peak against wq's 48%. When halving the split
+	// still leaves 12 superblocks and the matrix is under 32 warps per SM,
+	// use 2-way. ODINFER_CUDA_GEMV_SPLITS=4 restores the flat 4-way.
 	// float atomicAdd order is not deterministic. Greedy argmax can flip
-	// when two logits are within a few ulps, which showed up as EOS landing
-	// at different steps on the old attention kernel. The attention kernels
-	// themselves do not race.
+	// when two logits are within a few ulps. Capture includes the split only
+	// when the zeroing memset can be recorded on g_stream.
 	if g_gemv_split && !r1 && (kind == .Q4_K || kind == .Q6_K) && d > 0 && d <= 8192 {
 		nb := n / 256
-		if nb >= 4 {
+		if g_gemv_splits_force > 0 {
+			splits = g_gemv_splits_force
+			if splits > nb {
+				splits = nb
+			}
+			if splits < 1 {
+				splits = 1
+			}
+		} else if nb >= 4 {
 			splits = 4
+			sms := g_sm_count
+			if sms < 1 {
+				sms = 80
+			}
+			warps := (d + 3) / 4
+			if nb / 2 >= 12 && warps < sms * 32 {
+				splits = 2
+			}
 		} else if nb >= 2 {
 			splits = 2
 		}
@@ -826,7 +850,7 @@ wgemm_applies :: proc(kind: ggml.GGML_Type, n, tcount: int) -> bool {
 	if !g_prefill_wgemm || !g_wgemm_smem || k_wgemm_q4 == nil || k_wgemm_q6 == nil {
 		return false
 	}
-	if n <= 0 || n % 256 != 0 || tcount <= 1 || tcount > g_max_t {
+	if n <= 0 || n % 256 != 0 || tcount <= 1 || tcount > g_max_t || tcount < g_wgemm_min {
 		return false
 	}
 	return kind == .Q4_K || kind == .Q6_K
@@ -2006,6 +2030,12 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 		return false
 	}
 	g_sm_major = int(major)
+	nsm: c.int
+	if cu.drv.DeviceGetAttribute(&nsm, cu.ATTR_MULTIPROCESSOR_COUNT, g_dev) == cu.OK && nsm > 0 {
+		g_sm_count = int(nsm)
+	} else {
+		g_sm_count = 80
+	}
 	tc_env := os.get_env("ODINFER_CUDA_TC", context.temp_allocator)
 	if tc_env == "0" {
 		g_tc_mode = 0
@@ -2036,6 +2066,12 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 		}
 	}
 	g_gemv_split = os.get_env("ODINFER_CUDA_GEMV_SPLIT", context.temp_allocator) != "0"
+	g_gemv_splits_force = 0
+	if s := os.get_env("ODINFER_CUDA_GEMV_SPLITS", context.temp_allocator); s != "" {
+		if v, ok := strconv.parse_int(s); ok && v >= 1 && v <= 8 {
+			g_gemv_splits_force = int(v)
+		}
+	}
 	g_q6_stage = -1
 	if s := os.get_env("ODINFER_CUDA_Q6_STAGE", context.temp_allocator); s == "0" {
 		g_q6_stage = 0
@@ -2047,6 +2083,14 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	g_prefill_gemm = os.get_env("ODINFER_CUDA_PREFILL_GEMM", context.temp_allocator) != "0"
 	// Default is the fp16 128x128 tile. =mmqk keeps the q8 dp4a tile.
 	g_prefill_wgemm = g_prefill_gemm && os.get_env("ODINFER_CUDA_PREFILL_LINEAR", context.temp_allocator) != "mmqk"
+	// A 24-token prefill on the 128-wide tile was 1661/824 ms against 896/452
+	// for mmqk. T below this stays on mmqk. 0 forces wgemm at every T>1.
+	g_wgemm_min = 128
+	if s := os.get_env("ODINFER_CUDA_WGEMM_MIN", context.temp_allocator); s != "" {
+		if v, ok := strconv.parse_int(s); ok && v >= 0 && v <= 512 {
+			g_wgemm_min = int(v)
+		}
+	}
 	// Fusion was neutral on the V100 and the linear bucket got slower, so it
 	// stays available and off. The 64-row Q4 tile was slower than 32.
 	g_prefill_fuse = os.get_env("ODINFER_CUDA_PREFILL_FUSE", context.temp_allocator) == "1"
@@ -2347,7 +2391,7 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	}
 	fmt.eprintfln("cuda: tensor cores %s  WMMA 16x16x16 fp16, fp32 acc", tc_note)
 	if g_prefill_wgemm && g_wgemm_smem {
-		fmt.eprintln("cuda: prefill linear is wgemm for Q4_K/Q6_K T>1 (fp16, 128x128, BK=64, stride 80). Not timed. ODINFER_CUDA_PREFILL_LINEAR=mmqk keeps mmqk. ODINFER_CUDA_PREFILL_GEMM=0 keeps tc2/tc")
+		fmt.eprintfln("cuda: prefill linear is wgemm for Q4_K/Q6_K T>={} (fp16, 128x128, BK=64, stride 80). T below that is mmqk. ODINFER_CUDA_WGEMM_MIN=0 forces wgemm. ODINFER_CUDA_PREFILL_LINEAR=mmqk keeps mmqk. ODINFER_CUDA_PREFILL_GEMM=0 keeps tc2/tc", g_wgemm_min)
 	} else if g_prefill_gemm {
 		fmt.eprintln("cuda: prefill gemm on for Q4_K/Q6_K T>1 (mmqk, q8 in smem, dp4a, 32 rows x 64 tokens). ODINFER_CUDA_PREFILL_GEMM=0 keeps tc2/tc")
 		if g_prefill_fuse {
@@ -2392,7 +2436,11 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 		fmt.eprintln("cuda: Q4 GEMV uses ld.global.nc (ODINFER_CUDA_Q4_NC=1). Slower than plain ld.global on the V100S")
 	}
 	if g_gemv_split {
-		fmt.eprintln("cuda: gemv split-K on for Q4_K/Q6_K with rows<=8192 (ODINFER_CUDA_GEMV_SPLIT=0 disables it)")
+		if g_gemv_splits_force > 0 {
+			fmt.eprintfln("cuda: gemv split-K forced to {} for Q4_K/Q6_K with rows<=8192 (ODINFER_CUDA_GEMV_SPLITS)", g_gemv_splits_force)
+		} else {
+			fmt.eprintln("cuda: gemv split-K is 2-way when halving still leaves 12 superblocks and the matrix is under 32 warps/SM (27B wo, 27B w2). Other short rows stay 4-way. ODINFER_CUDA_GEMV_SPLITS=4 restores that. ODINFER_CUDA_GEMV_SPLIT=0 disables the split")
+		}
 	}
 	if g_gemv_new {
 		rows_note := "4 rows/warp"
@@ -2532,7 +2580,7 @@ cuda_full :: proc(tr: ^Transformer, l, pos0, T: int) {
 	attdim := p.n_heads * p.head_dim
 	eps := p.rms_eps
 	must(launch_mm(fa.wq, d_xb, d_qproj, dim, qdim, T))
-	if g_prefill_fuse && !g_prefill_wgemm && fa.wk.kind == fa.wv.kind && mmqk_applies(fa.wk.kind, dim, T) {
+	if g_prefill_fuse && !wgemm_applies(fa.wk.kind, dim, T) && fa.wk.kind == fa.wv.kind && mmqk_applies(fa.wk.kind, dim, T) {
 		must(launch_mmqk_pair(fa.wk.kind, wptr(raw_data(fa.wk.data)), wptr(raw_data(fa.wv.data)), d_xb, d_k, d_v, dim, kvdim, T))
 	} else {
 		must(launch_mm(fa.wk, d_xb, d_k, dim, kvdim, T))
@@ -2668,7 +2716,7 @@ cuda_mlp :: proc(tr: ^Transformer, l, T: int, next_norm: cu.Device_Ptr) {
 	} else {
 		must(launch_rmsnorm(d_x, d_xb, dev_f32(lw.ffn_norm), T, dim, p.rms_eps))
 	}
-	if g_prefill_fuse && !g_prefill_wgemm && lw.w1.kind == lw.w3.kind && mmqk_applies(lw.w1.kind, dim, T) {
+	if g_prefill_fuse && !wgemm_applies(lw.w1.kind, dim, T) && lw.w1.kind == lw.w3.kind && mmqk_applies(lw.w1.kind, dim, T) {
 		must(launch_mmqk_pair(lw.w1.kind, wptr(raw_data(lw.w1.data)), wptr(raw_data(lw.w3.data)), d_xb, d_hb, d_hb2, dim, hid, T))
 	} else {
 		must(launch_mm(lw.w1, d_xb, d_hb, dim, hid, T))
