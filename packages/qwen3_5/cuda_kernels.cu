@@ -888,7 +888,9 @@ extern "C" __global__ void attention_q8v(const float* q, const unsigned char* kc
     }
 }
 
-/* Split decode / long prefill attention for the mixed-V cache.
+/* Split decode attention for the mixed-V cache. Prefill stays on
+   attention_q8v: running the parts once per token of a T=128 chunk was
+   slower on the V100S (about 10% on 905 and 1805 token prefills).
    attention_q8v is one block per query head. Its V loop walks every
    position on each thread, so a long context uses a handful of SMs and
    the time grows linearly with npos even though the KV row is a few

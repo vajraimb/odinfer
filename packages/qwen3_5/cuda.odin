@@ -572,6 +572,10 @@ launch_gemv2 :: proc(fn: cu.Function, kind: ggml.GGML_Type, w, y: cu.Device_Ptr,
 	// Short Q4/Q6 rows (wq, wo, w2) do not fill the SMs. Split K so more
 	// blocks are in flight. Tall rows stay one split. Capture includes the
 	// split only when the zeroing memset can be recorded on g_stream.
+	// float atomicAdd order is not deterministic. Greedy argmax can flip
+	// when two logits are within a few ulps, which showed up as EOS landing
+	// at different steps on the old attention kernel. The attention kernels
+	// themselves do not race.
 	if g_gemv_split && !r1 && (kind == .Q4_K || kind == .Q6_K) && d > 0 && d <= 8192 {
 		nb := n / 256
 		if nb >= 4 {
@@ -1086,23 +1090,6 @@ attn_q8v_dispatch :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos: int) -> bool {
 		return attn_q8v_call(q, kc, vc, xb3, pos)
 	}
 	return attn_q8v_part_launch(q, kc, vc, xb3, pos)
-}
-
-@(private)
-attn_q8v_batch_dispatch :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos0, T: int) -> bool {
-	// The whole chunk is past the threshold, so every token is long enough
-	// that one split launch fills the SMs. A chunk that still contains a
-	// short token stays on the single heads-by-tokens launch.
-	if T > 0 && attn_part_ok(pos0 + 1) {
-		attdim := g_heads * g_head
-		for ti in 0 ..< T {
-			if !attn_q8v_part_launch(fp(q, ti * attdim), kc, vc, fp(xb3, ti * attdim), pos0 + ti) {
-				return false
-			}
-		}
-		return true
-	}
-	return attn_q8v_batch(q, kc, vc, xb3, pos0, T)
 }
 
 @(private)
@@ -1731,7 +1718,11 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 			g_v_bytes = kv_v_mix_total_bytes(p.n_full, p.seq_len, g_kv_dim)
 			do_store = store_q8v_call
 			do_attn = attn_q8v_dispatch
-			do_attn_batch = attn_q8v_batch_dispatch
+			// Prefill stays on the one-block kernel. On the V100S the split
+			// path inside a T=128 chunk was slower (27B 905 tokens 63.6 vs
+			// 71.7 tok/s, 9B 193.5 vs 212.0) because each token relaunched
+			// the parts. Decode is the path that was latency-bound.
+			do_attn_batch = attn_q8v_batch
 		} else {
 			g_v_pos = g_k_pos
 			g_v_layer = g_k_layer
@@ -1892,7 +1883,7 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	}
 	split_live := g_attn_split && d_part_m != 0 && g_head >= 32 && g_head <= 256 && g_head % 32 == 0 && g_kv_heads > 0 && g_heads / g_kv_heads >= 1 && g_heads / g_kv_heads <= 16 && (g_heads / g_kv_heads) * g_kv_heads == g_heads
 	if split_live {
-		fmt.eprintln("cuda: attn split on for mixed-V full attention when npos>=128 (32-token parts + reduce). ODINFER_CUDA_ATTN_SPLIT=0 is the one-block kernel")
+		fmt.eprintln("cuda: attn split on for mixed-V decode when npos>=128 (32-token parts + reduce). Prefill stays on attention_q8v. ODINFER_CUDA_ATTN_SPLIT=0 is the one-block kernel")
 	} else if !g_attn_split {
 		fmt.eprintln("cuda: attn split off (ODINFER_CUDA_ATTN_SPLIT=0)")
 	} else {
