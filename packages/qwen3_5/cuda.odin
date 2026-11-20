@@ -41,6 +41,8 @@ _cuda_import_keep :: proc() {
 
 when GPU_CUDA {
 
+// Pre-init fallback for cuda_batch_max. The allocated prefill chunk is
+// g_max_t (ODINFER_CUDA_PREFILL_CHUNK, default 512).
 CUDA_MAX_BATCH :: 128
 // Mixed-V attention parts. 32 positions fill one warp (one lane, one key).
 // Below ATTN_PART_MIN the one-block kernel is already under a millisecond
@@ -178,9 +180,9 @@ g_pos_host: i32 // stable source for the async decode-pos copy
 @(private)
 g_tc2: bool // Q4_K / Q6_K prefill uses the block-dequant WMMA kernel
 @(private)
-g_prefill_gemm: bool // Q4_K / Q6_K T>1 uses pgemm; ODINFER_CUDA_PREFILL_GEMM=0 keeps tc/tc2
+g_prefill_gemm: bool // Q4_K / Q6_K T>1 uses mmqk dp4a; ODINFER_CUDA_PREFILL_GEMM=0 keeps tc/tc2
 @(private)
-g_chunk_req: int // ODINFER_CUDA_PREFILL_CHUNK, default 128
+g_chunk_req: int // ODINFER_CUDA_PREFILL_CHUNK, default 512
 @(private)
 g_delta_sm: bool // delta chunk keeps the state matrix in shared memory
 @(private)
@@ -226,6 +228,8 @@ g_launch_stream: rawptr
 @(private)
 d_xq, d_xd, d_xs: cu.Device_Ptr
 @(private)
+d_mmq_q, d_mmq_d, d_mmq_s: cu.Device_Ptr // K-major q8 for the prefill dp4a GEMM
+@(private)
 g_q8_cap, g_q8_n: int
 @(private)
 g_q8_src: cu.Device_Ptr
@@ -247,6 +251,8 @@ k_conv, k_l2, k_delta, k_delta_chunk, k_delta_sm, k_rmsgate, k_rmsgate_q, k_moe_
 k_tc2_q4, k_tc2_q6, k_tc2s_q4, k_tc2s_q6, k_tc2m_q4, k_tc2m_q6, k_tc2r_q4, k_tc2r_q6: cu.Function
 @(private)
 k_pgemm_q4, k_pgemm_q6: cu.Function
+@(private)
+k_quant_batch, k_mmqk_q4, k_mmqk_q6: cu.Function
 
 Prof_Bin :: struct {
 	name:  string,
@@ -274,7 +280,10 @@ cuda_batch_max :: proc() -> int {
 	if g_max_t > 0 {
 		return g_max_t
 	}
-	return CUDA_MAX_BATCH
+	if g_chunk_req > 0 {
+		return g_chunk_req
+	}
+	return 512
 }
 
 @(private)
@@ -778,29 +787,62 @@ launch_tc :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d, tcount: in
 	return klaunch(fn, gx, gy, 1, 512, 1, 1, args[:], "tc")
 }
 
+// Q4_K / Q6_K prefill. Activations are quantized to q8 once, then dp4a
+// against the stored nibbles. pgemm (fp16 dequant + WMMA) stays in the
+// module for the kernel test and is not launched: on the V100 it was slower
+// than the scalar tile (9B prefill 905/16000 tokens 174/154 vs 222/183 tok/s;
+// a T=128 chunk's linear time 584 vs 450 ms).
+// ODINFER_CUDA_PREFILL_GEMM=0 keeps tc2 (T<=64) and the scalar tile.
+@(private)
+mmqk_applies :: proc(kind: ggml.GGML_Type, n, tcount: int) -> bool {
+	if !g_prefill_gemm || d_mmq_q == 0 || k_quant_batch == nil || k_mmqk_q4 == nil {
+		return false
+	}
+	if n <= 0 || n % 256 != 0 || n > g_q8_cap || tcount <= 1 || tcount > g_max_t {
+		return false
+	}
+	return kind == .Q4_K || kind == .Q6_K
+}
+
+@(private)
+launch_mmqk :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d, tcount: int) -> bool {
+	fn := k_mmqk_q4
+	if kind == .Q6_K {
+		fn = k_mmqk_q6
+	}
+	xx, qp, sc, sm := x, d_mmq_q, d_mmq_d, d_mmq_s
+	nn, tt := i32(n), i32(tcount)
+	qargs := [?]rawptr{&xx, &qp, &sc, &sm, &nn, &tt}
+	ng := n / 32
+	blocks := u32((ng * tcount + 255) / 256)
+	if blocks < 1 {
+		blocks = 1
+	}
+	if !klaunch(k_quant_batch, blocks, 1, 1, 256, 1, 1, qargs[:], "mmqk_q") {
+		return false
+	}
+	wb, yy := w, y
+	dd := i32(d)
+	args := [?]rawptr{&wb, &qp, &sc, &sm, &yy, &nn, &dd, &tt}
+	gx := u32((d + 31) / 32)
+	gy := u32((tcount + 63) / 64)
+	if gx < 1 {
+		gx = 1
+	}
+	if gy < 1 {
+		gy = 1
+	}
+	return klaunch(fn, gx, gy, 1, 256, 1, 1, args[:], "mmqk")
+}
+
 @(private)
 launch_mm :: proc(t: Tensor, x, y: cu.Device_Ptr, n, d, tcount: int) -> bool {
 	w := wptr(raw_data(t.data))
 	if tcount <= 1 {
 		return launch_gemv(t.kind, w, x, y, n, d)
 	}
-	// Q4_K / Q6_K prefill. Block dequant into fp16, then a 64x64x128 WMMA.
-	// A short tail (T<16) is included: auto mode would otherwise leave it on
-	// MMQ while the rest of the prefill used this tile. TC=0 still skips it.
-	// ODINFER_CUDA_PREFILL_GEMM=0 keeps tc2 (T<=64) and the scalar tile.
-	if g_prefill_gemm && g_sm_major >= 7 && g_tc_mode != 0 && n > 0 && n % 256 == 0 && (t.kind == .Q4_K || t.kind == .Q6_K) {
-		fn := k_pgemm_q4
-		if t.kind == .Q6_K {
-			fn = k_pgemm_q6
-		}
-		if fn != nil {
-			wb, xx, yy := w, x, y
-			nn, dd, tt := i32(n), i32(d), i32(tcount)
-			args := [?]rawptr{&wb, &xx, &yy, &nn, &dd, &tt}
-			gx := u32((d + 63) / 64)
-			gy := u32((tcount + 63) / 64)
-			return klaunch(fn, gx, gy, 1, 512, 1, 1, args[:], "pgemm")
-		}
+	if mmqk_applies(t.kind, n, tcount) {
+		return launch_mmqk(t.kind, w, x, y, n, d, tcount)
 	}
 	if use_tensor_cores(tcount) && tc_fn[int(t.kind)] != nil {
 		return launch_tc(t.kind, w, x, y, n, d, tcount)
@@ -1406,6 +1448,9 @@ bind_kernels :: proc() -> bool {
 	k_delta_sm = get_fn("delta_recurrent_chunk_sm")
 	k_pgemm_q4 = get_fn("pgemm_q4_k")
 	k_pgemm_q6 = get_fn("pgemm_q6_k")
+	k_quant_batch = get_fn("quant_q8_batch")
+	k_mmqk_q4 = get_fn("mmqk_q4_k")
+	k_mmqk_q6 = get_fn("mmqk_q6_k")
 	k_tc2_q4 = get_fn("tc2_q4_k")
 	k_tc2_q6 = get_fn("tc2_q6_k")
 	k_tc2s_q4 = get_fn("tc2s_q4_k")
@@ -1438,7 +1483,7 @@ bind_kernels :: proc() -> bool {
 		k_tc2_q4, k_tc2_q6, k_tc2s_q4, k_tc2s_q6, k_tc2m_q4, k_tc2m_q6, k_tc2r_q4, k_tc2r_q6,
 		k_quant, k_rmsnorm_q8, k_res_norm, k_gemv2_q4, k_gemv2_q4nc, k_gemv2_q4x, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50,
 		k_gemv2r1_q4, k_gemv2r1_q6,
-		k_pgemm_q4, k_pgemm_q6,
+		k_pgemm_q4, k_pgemm_q6, k_quant_batch, k_mmqk_q4, k_mmqk_q6,
 	}
 	for h in handles {
 		if h == nil {
@@ -1629,6 +1674,13 @@ alloc_acts :: proc(t: ^Transformer, T: int) -> bool {
 	d_xq, ok = alloc_bytes(max_k); if !ok do return false
 	d_xd, ok = alloc_bytes((max_k / 32) * 4); if !ok do return false
 	d_xs, ok = alloc_bytes((max_k / 32) * 8); if !ok do return false
+	d_mmq_q, d_mmq_d, d_mmq_s = 0, 0, 0
+	if g_prefill_gemm {
+		// One int8, one fp32 scale, and one float2 sum per activation, K-major.
+		d_mmq_q, ok = alloc_bytes(T * max_k); if !ok do return false
+		d_mmq_d, ok = alloc_bytes(T * (max_k / 32) * 4); if !ok do return false
+		d_mmq_s, ok = alloc_bytes(T * (max_k / 32) * 8); if !ok do return false
+	}
 	if p.is_moe {
 		d_moe_logits, ok = alloc_bytes(nexp * 4); if !ok do return false
 		d_moe_wt, ok = alloc_bytes(nexp * 4); if !ok do return false
@@ -1721,6 +1773,7 @@ cuda_destroy :: proc() {
 		g_ctx_held = false
 	}
 	d_xq, d_xd, d_xs = 0, 0, 0
+	d_mmq_q, d_mmq_d, d_mmq_s = 0, 0, 0
 	g_q8_valid = false
 	g_q8_cap = 0
 	delete(h_logits); h_logits = nil
@@ -1801,12 +1854,12 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	g_tc2 = os.get_env("ODINFER_CUDA_TC2", context.temp_allocator) != "0"
 	// Default on. =0 keeps tc2 for T<=64 and the scalar tile for T>64.
 	g_prefill_gemm = os.get_env("ODINFER_CUDA_PREFILL_GEMM", context.temp_allocator) != "0"
-	g_chunk_req = 128
+	g_chunk_req = 512
 	if s := os.get_env("ODINFER_CUDA_PREFILL_CHUNK", context.temp_allocator); s != "" {
 		if v, ok := strconv.parse_int(s); ok && v >= 16 && v <= 512 && v % 16 == 0 {
 			g_chunk_req = int(v)
 		} else {
-			fmt.eprintf("cuda: ODINFER_CUDA_PREFILL_CHUNK=%s ignored; using 128 (want a multiple of 16 from 16 to 512)\n", s)
+			fmt.eprintf("cuda: ODINFER_CUDA_PREFILL_CHUNK=%s ignored; using 512 (want a multiple of 16 from 16 to 512)\n", s)
 		}
 	}
 	// Wide tile lost to the scalar tile at 581 and 2000 tokens. Opt in.
@@ -2023,8 +2076,10 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	g_rec_bytes = rec_f * 4
 
 	chosen := 0
-	// The requested chunk is tried first. 128 is the validated attention size.
-	ladder := [?]int{g_chunk_req, CUDA_MAX_BATCH, 32, 8, 1}
+	// The requested chunk is tried first. Larger than the request is not
+	// tried. 512 is the default because a longer chunk was faster on the
+	// scalar tile (9B 16000 tokens, GEMM=0: 128/256/512 = 183/207/213 tok/s).
+	ladder := [?]int{g_chunk_req, 512, 256, 128, 32, 8, 1}
 	seen: [8]int
 	nseen := 0
 	for batch in ladder {
@@ -2035,7 +2090,7 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 				break
 			}
 		}
-		if already || batch < 1 {
+		if already || batch < 1 || batch > g_chunk_req {
 			continue
 		}
 		seen[nseen] = batch
@@ -2093,11 +2148,11 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	}
 	fmt.eprintfln("cuda: tensor cores %s  WMMA 16x16x16 fp16, fp32 acc", tc_note)
 	if g_prefill_gemm {
-		fmt.eprintln("cuda: prefill gemm on for Q4_K/Q6_K T>1 (pgemm, 64x64x128 block dequant, WMMA fp16, fp32 acc). ODINFER_CUDA_PREFILL_GEMM=0 keeps tc2/tc")
+		fmt.eprintln("cuda: prefill gemm on for Q4_K/Q6_K T>1 (mmqk, q8 activations, dp4a, 4 rows x 64 tokens). ODINFER_CUDA_PREFILL_GEMM=0 keeps tc2/tc. Not timed on a V100")
 	} else {
 		fmt.eprintln("cuda: prefill gemm off (ODINFER_CUDA_PREFILL_GEMM=0)")
 	}
-	fmt.eprintfln("cuda: prefill chunk {} (ODINFER_CUDA_PREFILL_CHUNK, default 128)", chosen)
+	fmt.eprintfln("cuda: prefill chunk {} (ODINFER_CUDA_PREFILL_CHUNK, default 512)", chosen)
 	if g_delta_sm {
 		fmt.eprintln("cuda: delta prefill keeps a head state of at most 64 KiB in shared memory")
 	}
@@ -2607,7 +2662,7 @@ phase_bucket :: proc(name: string) -> int {
 	if strings.has_prefix(name, "rmsnorm") || name == "residual_norm" || name == "qnorm" {
 		return 3
 	}
-	if strings.has_prefix(name, "gemv") || strings.has_prefix(name, "tc") || strings.has_prefix(name, "pgemm") || name == "mmq" {
+	if strings.has_prefix(name, "gemv") || strings.has_prefix(name, "tc") || strings.has_prefix(name, "pgemm") || strings.has_prefix(name, "mmqk") || name == "mmq" {
 		return 0
 	}
 	return 5
