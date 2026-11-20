@@ -182,6 +182,16 @@ g_tc2: bool // Q4_K / Q6_K prefill uses the block-dequant WMMA kernel
 @(private)
 g_prefill_gemm: bool // Q4_K / Q6_K T>1 uses mmqk dp4a; ODINFER_CUDA_PREFILL_GEMM=0 keeps tc/tc2
 @(private)
+g_prefill_fuse: bool // gate+up and K+V share one q8 stage; ODINFER_CUDA_PREFILL_FUSE=0 launches them apart
+@(private)
+g_mmqk_wide: bool // Q4 tile is 64 rows; ODINFER_CUDA_MMQK_ROWS=4 keeps the timed 32-row tile
+@(private)
+g_mmq_ok: bool
+@(private)
+g_mmq_x: cu.Device_Ptr
+@(private)
+g_mmq_n, g_mmq_t: int
+@(private)
 g_chunk_req: int // ODINFER_CUDA_PREFILL_CHUNK, default 512
 @(private)
 g_delta_sm: bool // delta chunk keeps the state matrix in shared memory
@@ -252,7 +262,7 @@ k_tc2_q4, k_tc2_q6, k_tc2s_q4, k_tc2s_q6, k_tc2m_q4, k_tc2m_q6, k_tc2r_q4, k_tc2
 @(private)
 k_pgemm_q4, k_pgemm_q6: cu.Function
 @(private)
-k_quant_batch, k_mmqk_q4, k_mmqk_q6: cu.Function
+k_quant_batch, k_mmqk_q4, k_mmqk_q4_r4, k_mmqk_q6, k_mmqk_q4_pair, k_mmqk_q6_pair: cu.Function
 
 Prof_Bin :: struct {
 	name:  string,
@@ -297,6 +307,8 @@ ck :: proc(err: cu.Error, what: string) -> bool {
 
 @(private)
 klaunch :: proc(fn: cu.Function, gx, gy, gz, bx, by, bz: u32, args: []rawptr, what: string, shared: u32 = 0) -> bool {
+	// Any later kernel may overwrite the activation this q8 was built from.
+	g_mmq_ok = false
 	if g_count_launches {
 		g_launches += 1
 	}
@@ -807,8 +819,12 @@ mmqk_applies :: proc(kind: ggml.GGML_Type, n, tcount: int) -> bool {
 @(private)
 launch_mmqk :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d, tcount: int) -> bool {
 	fn := k_mmqk_q4
+	wide := g_mmqk_wide
 	if kind == .Q6_K {
 		fn = k_mmqk_q6
+		wide = false
+	} else if !wide {
+		fn = k_mmqk_q4_r4
 	}
 	xx, qp, sc, sm := x, d_mmq_q, d_mmq_d, d_mmq_s
 	nn, tt := i32(n), i32(tcount)
@@ -818,13 +834,74 @@ launch_mmqk :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d, tcount: 
 	if blocks < 1 {
 		blocks = 1
 	}
-	if !klaunch(k_quant_batch, blocks, 1, 1, 256, 1, 1, qargs[:], "mmqk_q") {
-		return false
+	if !reuse_mmq(x, n, tcount) {
+		if !klaunch(k_quant_batch, blocks, 1, 1, 256, 1, 1, qargs[:], "mmqk_q") {
+			return false
+		}
 	}
 	wb, yy := w, y
 	dd := i32(d)
 	args := [?]rawptr{&wb, &qp, &sc, &sm, &yy, &nn, &dd, &tt}
-	// 8 warps * 4 rows, 64 tokens. Smem is one q8 superblock (22528 bytes).
+	// Q4 default is 8 rows/warp (64 rows). Q6, and Q4 with MMQK_ROWS=4, are 32.
+	bm := 32
+	if wide {
+		bm = 64
+	}
+	gx := u32((d + bm - 1) / bm)
+	gy := u32((tcount + 63) / 64)
+	if gx < 1 {
+		gx = 1
+	}
+	if gy < 1 {
+		gy = 1
+	}
+	if !klaunch(fn, gx, gy, 1, 256, 1, 1, args[:], "mmqk", 22528) {
+		return false
+	}
+	note_mmq(x, n, tcount)
+	return true
+}
+
+@(private)
+reuse_mmq :: proc(x: cu.Device_Ptr, n, tcount: int) -> bool {
+	return g_mmq_ok && g_mmq_x == x && g_mmq_n == n && g_mmq_t == tcount
+}
+
+@(private)
+note_mmq :: proc(x: cu.Device_Ptr, n, tcount: int) {
+	g_mmq_ok = true
+	g_mmq_x = x
+	g_mmq_n = n
+	g_mmq_t = tcount
+}
+
+// Same q8 tile, two same-shaped matrices. 4 rows/warp so the second set of
+// accumulators fits. Gate+up and K+V use this.
+@(private)
+launch_mmqk_pair :: proc(kind: ggml.GGML_Type, w0, w1, x, y0, y1: cu.Device_Ptr, n, d, tcount: int) -> bool {
+	fn := k_mmqk_q4_pair
+	if kind == .Q6_K {
+		fn = k_mmqk_q6_pair
+	}
+	if fn == nil {
+		return false
+	}
+	xx, qp, sc, sm := x, d_mmq_q, d_mmq_d, d_mmq_s
+	nn, tt := i32(n), i32(tcount)
+	if !reuse_mmq(x, n, tcount) {
+		qargs := [?]rawptr{&xx, &qp, &sc, &sm, &nn, &tt}
+		ng := n / 32
+		blocks := u32((ng * tcount + 255) / 256)
+		if blocks < 1 {
+			blocks = 1
+		}
+		if !klaunch(k_quant_batch, blocks, 1, 1, 256, 1, 1, qargs[:], "mmqk_q") {
+			return false
+		}
+	}
+	wb, wb2, yy, yy2 := w0, w1, y0, y1
+	dd := i32(d)
+	args := [?]rawptr{&wb, &wb2, &qp, &sc, &sm, &yy, &yy2, &nn, &dd, &tt}
 	gx := u32((d + 31) / 32)
 	gy := u32((tcount + 63) / 64)
 	if gx < 1 {
@@ -833,7 +910,11 @@ launch_mmqk :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d, tcount: 
 	if gy < 1 {
 		gy = 1
 	}
-	return klaunch(fn, gx, gy, 1, 256, 1, 1, args[:], "mmqk", 22528)
+	if !klaunch(fn, gx, gy, 1, 256, 1, 1, args[:], "mmqk", 22528) {
+		return false
+	}
+	note_mmq(x, n, tcount)
+	return true
 }
 
 @(private)
@@ -1451,7 +1532,10 @@ bind_kernels :: proc() -> bool {
 	k_pgemm_q6 = get_fn("pgemm_q6_k")
 	k_quant_batch = get_fn("quant_q8_batch")
 	k_mmqk_q4 = get_fn("mmqk_q4_k")
+	k_mmqk_q4_r4 = get_fn("mmqk_q4_r4")
 	k_mmqk_q6 = get_fn("mmqk_q6_k")
+	k_mmqk_q4_pair = get_fn("mmqk_q4_pair")
+	k_mmqk_q6_pair = get_fn("mmqk_q6_pair")
 	k_tc2_q4 = get_fn("tc2_q4_k")
 	k_tc2_q6 = get_fn("tc2_q6_k")
 	k_tc2s_q4 = get_fn("tc2s_q4_k")
@@ -1484,7 +1568,7 @@ bind_kernels :: proc() -> bool {
 		k_tc2_q4, k_tc2_q6, k_tc2s_q4, k_tc2s_q6, k_tc2m_q4, k_tc2m_q6, k_tc2r_q4, k_tc2r_q6,
 		k_quant, k_rmsnorm_q8, k_res_norm, k_gemv2_q4, k_gemv2_q4nc, k_gemv2_q4x, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50,
 		k_gemv2r1_q4, k_gemv2r1_q6,
-		k_pgemm_q4, k_pgemm_q6, k_quant_batch, k_mmqk_q4, k_mmqk_q6,
+		k_pgemm_q4, k_pgemm_q6, k_quant_batch, k_mmqk_q4, k_mmqk_q4_r4, k_mmqk_q6, k_mmqk_q4_pair, k_mmqk_q6_pair,
 	}
 	for h in handles {
 		if h == nil {
@@ -1855,6 +1939,8 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	g_tc2 = os.get_env("ODINFER_CUDA_TC2", context.temp_allocator) != "0"
 	// Default on. =0 keeps tc2 for T<=64 and the scalar tile for T>64.
 	g_prefill_gemm = os.get_env("ODINFER_CUDA_PREFILL_GEMM", context.temp_allocator) != "0"
+	g_prefill_fuse = os.get_env("ODINFER_CUDA_PREFILL_FUSE", context.temp_allocator) != "0"
+	g_mmqk_wide = os.get_env("ODINFER_CUDA_MMQK_ROWS", context.temp_allocator) != "4"
 	g_chunk_req = 512
 	if s := os.get_env("ODINFER_CUDA_PREFILL_CHUNK", context.temp_allocator); s != "" {
 		if v, ok := strconv.parse_int(s); ok && v >= 16 && v <= 512 && v % 16 == 0 {
@@ -2149,7 +2235,17 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	}
 	fmt.eprintfln("cuda: tensor cores %s  WMMA 16x16x16 fp16, fp32 acc", tc_note)
 	if g_prefill_gemm {
-		fmt.eprintln("cuda: prefill gemm on for Q4_K/Q6_K T>1 (mmqk, q8 in smem, dp4a, 32 rows x 64 tokens). ODINFER_CUDA_PREFILL_GEMM=0 keeps tc2/tc. Not timed on a V100")
+		fmt.eprintln("cuda: prefill gemm on for Q4_K/Q6_K T>1 (mmqk, q8 in smem, dp4a, Q4 64 rows x 64 tokens, Q6 32 rows). ODINFER_CUDA_PREFILL_GEMM=0 keeps tc2/tc. Not timed on a V100")
+		if g_prefill_fuse {
+			fmt.eprintln("cuda: prefill fuse on (gate+up and K+V share one q8 stage). ODINFER_CUDA_PREFILL_FUSE=0 launches them apart")
+		} else {
+			fmt.eprintln("cuda: prefill fuse off (ODINFER_CUDA_PREFILL_FUSE=0)")
+		}
+		if g_mmqk_wide {
+			fmt.eprintln("cuda: Q4 mmqk tile is 64 rows. ODINFER_CUDA_MMQK_ROWS=4 keeps the timed 32-row tile")
+		} else {
+			fmt.eprintln("cuda: Q4 mmqk tile is 32 rows (ODINFER_CUDA_MMQK_ROWS=4)")
+		}
 	} else {
 		fmt.eprintln("cuda: prefill gemm off (ODINFER_CUDA_PREFILL_GEMM=0)")
 	}
@@ -2314,8 +2410,12 @@ cuda_full :: proc(tr: ^Transformer, l, pos0, T: int) {
 	attdim := p.n_heads * p.head_dim
 	eps := p.rms_eps
 	must(launch_mm(fa.wq, d_xb, d_qproj, dim, qdim, T))
-	must(launch_mm(fa.wk, d_xb, d_k, dim, kvdim, T))
-	must(launch_mm(fa.wv, d_xb, d_v, dim, kvdim, T))
+	if g_prefill_fuse && fa.wk.kind == fa.wv.kind && mmqk_applies(fa.wk.kind, dim, T) {
+		must(launch_mmqk_pair(fa.wk.kind, wptr(raw_data(fa.wk.data)), wptr(raw_data(fa.wv.data)), d_xb, d_k, d_v, dim, kvdim, T))
+	} else {
+		must(launch_mm(fa.wk, d_xb, d_k, dim, kvdim, T))
+		must(launch_mm(fa.wv, d_xb, d_v, dim, kvdim, T))
+	}
 	must(launch_qnorm(d_qproj, d_q, dev_f32(fa.q_norm), T * p.n_heads, p.head_dim, eps))
 	must(launch_rmsnorm(d_k, d_k, dev_f32(fa.k_norm), T * p.n_kv_heads, p.head_dim, eps))
 	slot := tr.full_slot[l]
@@ -2446,8 +2546,12 @@ cuda_mlp :: proc(tr: ^Transformer, l, T: int, next_norm: cu.Device_Ptr) {
 	} else {
 		must(launch_rmsnorm(d_x, d_xb, dev_f32(lw.ffn_norm), T, dim, p.rms_eps))
 	}
-	must(launch_mm(lw.w1, d_xb, d_hb, dim, hid, T))
-	must(launch_mm(lw.w3, d_xb, d_hb2, dim, hid, T))
+	if g_prefill_fuse && lw.w1.kind == lw.w3.kind && mmqk_applies(lw.w1.kind, dim, T) {
+		must(launch_mmqk_pair(lw.w1.kind, wptr(raw_data(lw.w1.data)), wptr(raw_data(lw.w3.data)), d_xb, d_hb, d_hb2, dim, hid, T))
+	} else {
+		must(launch_mm(lw.w1, d_xb, d_hb, dim, hid, T))
+		must(launch_mm(lw.w3, d_xb, d_hb2, dim, hid, T))
+	}
 	// swiglu(gate, up): result lands in the gate buffer. w1 is gate, w3 is up.
 	must(launch_swiglu(d_hb, d_hb2, T * hid, T == 1))
 	applied := false
