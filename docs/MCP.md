@@ -20,7 +20,7 @@ afterwards `initialize → tools/list → tools/call` work directly.
 
 | Tool | Description | Parameters |
 |---|---|---|
-| `odin.chat` | Generate a reply with the local model | `messages` (OpenAI format, required), `max_tokens` (default 256), `temperature` (default 0.6) |
+| `odin.chat` | Generate a reply with the local model | `messages` (OpenAI format, required), `max_tokens` (default 4096, also capped by the context still free), `temperature` (default 0.6) |
 | `odin.models` | Loaded model and engine status | none |
 
 `odin.chat` reuses the server's OpenAI handler (stateless per request: reset →

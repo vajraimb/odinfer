@@ -47,6 +47,8 @@ CUDA_MAX_BATCH :: 128
 // for the whole model, and it stays bit-identical to the previous decode.
 ATTN_PART :: 32
 ATTN_PART_MIN :: 128
+// cuLaunchKernel grid.y maximum. Split attention uses one block per part.
+CUDA_GRID_Y_MAX :: 65535
 // Q5_0 / Q8_0 below this stay on the old GEMV. The new kernel lost at 2048x2048.
 GEMV_SMALL_BYTES :: 16 * 1024 * 1024
 PROF_MAX :: 8192
@@ -1052,7 +1054,7 @@ attn_part_ok :: proc(npos: int) -> bool {
 	}
 	need := (g_seq + ATTN_PART - 1) / ATTN_PART
 	splits := (npos + ATTN_PART - 1) / ATTN_PART
-	return splits >= 1 && splits <= need
+	return splits >= 1 && splits <= need && splits <= CUDA_GRID_Y_MAX
 }
 
 @(private)
@@ -1346,8 +1348,10 @@ alloc_acts :: proc(t: ^Transformer, T: int) -> bool {
 			return false
 		}
 		batch := 1
-		// One score row per (token, head). Cap the buffer at 256 MiB and
-		// batch the prefill attention in chunks of that many tokens.
+		// One score row per (token, head), length seq_len. The 256 MiB cap
+		// limits how many prefill tokens share one launch. It does not cap
+		// seq_len: a single row for this model stays under the cap out past
+		// the native 262144 context (24 heads * 262144 * 4 = 24 MiB).
 		if g_attn_batch && one > 0 && one <= 256 * 1024 * 1024 {
 			fit := (256 * 1024 * 1024) / one
 			if fit > T {
@@ -1703,6 +1707,20 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	g_hidden = p.hidden_dim
 	g_vocab = p.vocab_size
 	g_seq = p.seq_len
+	// Kernels take pos and seq_len as 32-bit ints. The byte offsets inside
+	// them are size_t, so the product itself is not the limit.
+	if g_seq > 2147483647 {
+		fmt.eprintf("cuda: seq_len %d does not fit in the kernel's 32-bit position\n", g_seq)
+		cuda_destroy()
+		return false
+	}
+	if g_attn_split {
+		nsplit := (g_seq + ATTN_PART - 1) / ATTN_PART
+		if nsplit > CUDA_GRID_Y_MAX {
+			fmt.eprintf("cuda: attn split off; %d parts exceed grid.y %d\n", nsplit, CUDA_GRID_Y_MAX)
+			g_attn_split = false
+		}
+	}
 	g_heads = p.n_heads
 	g_kv_heads = p.n_kv_heads
 	g_head = p.head_dim
@@ -1896,6 +1914,32 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	} else {
 		fmt.eprintln("cuda: graph off (ODINFER_CUDA_GRAPH=1 enables it; replay was slower than eager)")
 	}
+	kv_b := g_k_bytes + g_v_bytes
+	per := 0
+	if p.seq_len > 0 {
+		per = kv_b / p.seq_len
+	}
+	score_b := 0
+	if p.n_heads > 0 && p.seq_len > 0 {
+		score_b = g_score_batch * p.n_heads * p.seq_len * 4
+	}
+	split_b := 0
+	if d_part_o != 0 {
+		nsplit := (p.seq_len + ATTN_PART - 1) / ATTN_PART
+		split_b = nsplit * p.n_heads * (8 + p.head_dim * 4)
+	}
+	fmt.eprintf(
+		"cuda: ctx=%d/%d kv=%.2f GiB (%.0f B/token, %d full layers) scores=%.0f MiB x%d split=%.0f MiB rec=%.0f MiB\n",
+		p.seq_len,
+		p.max_seq,
+		f64(kv_b) / f64(1024 * 1024 * 1024),
+		f64(per),
+		p.n_full,
+		f64(score_b) / f64(1024 * 1024),
+		g_score_batch,
+		f64(split_b) / f64(1024 * 1024),
+		f64(g_rec_bytes) / f64(1024 * 1024),
+	)
 	return true
 }
 
