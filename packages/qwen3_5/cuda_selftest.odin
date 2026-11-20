@@ -863,9 +863,10 @@ run_mmqk :: proc(kind: ggml.GGML_Type, rows, cols, T: int) -> bool {
 	wb, yy := dw, dy
 	dd := i32(rows)
 	args := [?]rawptr{&wb, &qp, &sc, &sm, &yy, &nn, &dd, &tt}
+	// 256 threads, 32 rows x 64 tokens, 22528 bytes of staged q8.
 	gx := u32((rows + 31) / 32)
 	gy := u32((T + 63) / 64)
-	if cu.launch(fn, gx, gy, 1, 256, 1, 1, 0, args[:]) != cu.OK || cu.sync() != cu.OK {
+	if cu.launch(fn, gx, gy, 1, 256, 1, 1, 22528, args[:]) != cu.OK || cu.sync() != cu.OK {
 		fmt.eprintf("cuda_selftest: %s launch failed\n", name)
 		return false
 	}
