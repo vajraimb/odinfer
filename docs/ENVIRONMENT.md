@@ -49,13 +49,15 @@ you isolate per-stage GPU time. Never enable in production.
 | `ODINFER_CUDA_GEMV` | auto | Decode GEMV. Unset: dp4a bandwidth kernel; Q5_0 and Q8_0 under 16 MiB stay on the scalar kernel. `new`: bandwidth kernel for those small shapes too. `old` or `0`: scalar GEMV for everything. |
 | `ODINFER_CUDA_GEMV_ROWS` | `4` | Q4_K / Q6_K rows per warp. Unset is four. `1` selects the one-row kernel, which was slower on the V100S. |
 | `ODINFER_CUDA_GEMV_WARPS` | `8` | Warps per bandwidth-GEMV block, 1..16. V100S tuning knob. |
-| `ODINFER_CUDA_GEMV_SPLIT` | on | Q4_K / Q6_K decode with `rows≤8192` splits K four ways and `atomicAdd`s the partials. `=0` is one K range. |
+| `ODINFER_CUDA_GEMV_SPLIT` | on | Q4_K / Q6_K decode with `rows≤8192` splits K and `atomicAdd`s the partials. `=0` is one K range. |
+| `ODINFER_CUDA_GEMV_SPLITS` | auto | Unset uses 2-way on short-row matrices whose K still has 12 superblocks per half (27B wo, 27B w2) and 4-way otherwise. `=4` is the previous flat split. The unsplit `--bench-gemv` line was 27B wo 398 GB/s (35%) and w2 345 GB/s (30%), against wq at 48%. |
 | `ODINFER_CUDA_TC2` | on | Q4_K / Q6_K prefill (K multiple of 256). `T<=64` uses the 32-token fp16 tile. `T>64` uses the scalar-dequant tile. `=0` uses the scalar tile at every T. |
 | `ODINFER_CUDA_TC2_WIDE` | off | `=1` uses the 128-token tile for `T>64`. Slower than the scalar tile at 581 and 2000 tokens on the V100S. |
 | `ODINFER_CUDA_TC2_BLOCK` | off | `=1` uses `tc2m`. Measured slower on the V100S and it changed a sampled token. Leave off. |
 | `ODINFER_CUDA_TC2_REUSE` | off | `=1` uses `tc2r` for `T>64` (profile name `tc2r`). The scalar tile's weight dequant is reused across 128 tokens. Unmeasured. If several `TC2_*` flags are set, this one is used. |
 | `ODINFER_CUDA_PREFILL_GEMM` | on | Q4_K / Q6_K prefill (`T>1`, K multiple of 256). Default is `wgemm`: one fp16 dequant of the weight tile, fp16 activations, a 128×128 WMMA tile. Not timed. `ODINFER_CUDA_PREFILL_LINEAR=mmqk` keeps `mmqk` (q8, one staged superblock, int8 dp4a, 32 rows by 64 tokens). On a V100 with chunk 512 that tile was 9B at 905/1805/8000/16000 371.70/376.91/337.20/290.49 tok/s and the 27B at 905/8000/16000 124.00/112.97/97.43. `=0` keeps `tc2` for `T<=64` and the scalar tile for `T>64`. `wgemm` allows `5e-2 + 5e-2*|ref|` against the fp32 CPU GEMV. `mmqk` allows `2e-3 + 2e-3*|ref|` against `gemv2`. |
-| `ODINFER_CUDA_PREFILL_LINEAR` | `wgemm` | `=mmqk` selects the dp4a tile. Unset is `wgemm`. Ignored when `ODINFER_CUDA_PREFILL_GEMM=0`. |
+| `ODINFER_CUDA_PREFILL_LINEAR` | `wgemm` | `=mmqk` selects the dp4a tile. Unset is `wgemm` for `T` at or above `ODINFER_CUDA_WGEMM_MIN`. Ignored when `ODINFER_CUDA_PREFILL_GEMM=0`. |
+| `ODINFER_CUDA_WGEMM_MIN` | `128` | Q4_K / Q6_K prefill below this token count uses `mmqk`. A 24-token prefill was 1661/824 ms on `wgemm` against 896/452 on `mmqk`. `=0` keeps `wgemm` for every `T>1`. |
 | `ODINFER_CUDA_PREFILL_FUSE` | off | `=1` makes gate+up and K+V share one q8 stage. It was neutral on a V100 (9B at 8000 tokens, 332 off vs 333 on) and the linear bucket was slower. |
 | `ODINFER_CUDA_MMQK_ROWS` | `4` | Default Q4 tile is 32 rows per block. `=8` selects the 64-row tile, which was slower on a V100. Q6 stays at 32 either way. |
 | `ODINFER_CUDA_ATTN_LONG` | on | Mixed-V decode, `npos>=2048`, head_dim 256, 4 or 6 query heads per KV head. 128 positions per block. `=0` keeps 32-token parts. |
