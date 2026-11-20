@@ -1523,11 +1523,16 @@ extern "C" __global__ void delta_recurrent(float* out, float* state_all, const f
     }
 }
 
-/* One launch for a whole prefill chunk. Token t depends on the state left
-   by token t-1, so the T loop stays inside the block and cannot be split
-   across blocks. That is O(T) per head, not O(T^2): each token touches the
-   head_k by head_v state a constant number of times. Heads stay parallel
-   (one block per value head). */
+/* One launch for a whole prefill chunk. Token t depends on the gated state
+   left by token t-1, so the T loop stays inside the block. A parallel scan
+   would be a different algorithm, not a local change. The work is O(T) per
+   head: each token touches the head_k by head_v state a constant number of
+   times. Heads stay parallel (one block per value head).
+   delta_recurrent_chunk_sm is the same math with that matrix resident in
+   dynamic shared memory for the chunk. The host uses it when the matrix is
+   at most 64 KiB (Qwen3.5 is 128x128, 64 KiB) and cuFuncSetAttribute raised
+   the dynamic-smem cap. Columns do not cross threads, so the only barriers
+   are the load and the store. */
 extern "C" __global__ void delta_recurrent_chunk(float* out, float* state_all, const float* q_lin, const float* k_lin,
                                                  const float* v_vec, const float* b_vec, const float* a_vec,
                                                  const float* a_decay, const float* dt_bias,
@@ -1556,6 +1561,43 @@ extern "C" __global__ void delta_recurrent_chunk(float* out, float* state_all, c
         }
         __syncthreads();
     }
+}
+
+extern "C" __global__ void delta_recurrent_chunk_sm(float* out, float* state_all, const float* q_lin, const float* k_lin,
+                                                    const float* v_vec, const float* b_vec, const float* a_vec,
+                                                    const float* a_decay, const float* dt_bias,
+                                                    int head_k_dim, int head_v_dim, int n_k_heads, int n_v_heads, int T,
+                                                    int q_stride, int v_stride) {
+    extern __shared__ __align__(16) unsigned char delta_sm[];
+    int vh = (int)blockIdx.x;
+    int hkd = head_k_dim, hvd = head_v_dim;
+    int tid = (int)threadIdx.x;
+    int kh = vh % n_k_heads;
+    float* sst = (float*)delta_sm;
+    float* gst = state_all + (size_t)vh * (size_t)hkd * (size_t)hvd;
+    int cells = hkd * hvd;
+    for (int e = tid; e < cells; e += (int)blockDim.x) sst[e] = gst[e];
+    __syncthreads();
+    for (int t = 0; t < T; ++t) {
+        const float* qt = q_lin + (size_t)t * (size_t)q_stride + (size_t)kh * (size_t)hkd;
+        const float* kt = k_lin + (size_t)t * (size_t)q_stride + (size_t)kh * (size_t)hkd;
+        const float* vt = v_vec + (size_t)t * (size_t)v_stride + (size_t)vh * (size_t)hvd;
+        float beta = sigmoid_stable(b_vec[(size_t)t * (size_t)n_v_heads + vh]);
+        float g_decay = expf(a_decay[vh] * softplus_stable(a_vec[(size_t)t * (size_t)n_v_heads + vh] + dt_bias[vh]));
+        float* oout = out + ((size_t)t * (size_t)n_v_heads + (size_t)vh) * (size_t)hvd;
+        for (int j = tid; j < hvd; j += (int)blockDim.x) {
+            for (int i = 0; i < hkd; ++i) sst[(size_t)i * (size_t)hvd + j] *= g_decay;
+            float kv_mem = 0.f;
+            for (int i = 0; i < hkd; ++i) kv_mem += sst[(size_t)i * (size_t)hvd + j] * kt[i];
+            float delta = (vt[j] - kv_mem) * beta;
+            for (int i = 0; i < hkd; ++i) sst[(size_t)i * (size_t)hvd + j] += kt[i] * delta;
+            float o = 0.f;
+            for (int i = 0; i < hkd; ++i) o += sst[(size_t)i * (size_t)hvd + j] * qt[i];
+            oout[j] = o;
+        }
+    }
+    __syncthreads();
+    for (int e = tid; e < cells; e += (int)blockDim.x) gst[e] = sst[e];
 }
 
 extern "C" __global__ void rmsnorm_gated(float* out, const float* inp, const float* weight, const float* gate, int size, float eps) {
@@ -3255,6 +3297,99 @@ extern "C" __global__ void gemv2r1_q4_k(const unsigned char* wb, const signed ch
     }
     acc = warp_sum(acc);
     store_row(out, row, d, lane == 0, acc, accumulate);
+}
+
+/* Q4_K / Q6_K prefill GEMM. One block owns 64 tokens by 64 rows, BK=128,
+   512 threads (16 warps). Weights are expanded with tc2_dequant_row (one
+   32-element slice per thread, the same expansion as tc2s) into fp16 shared
+   memory. Activations are narrowed to fp16. WMMA 16x16x16 accumulates in
+   fp32. K must be a multiple of 256 so every K step is a whole quant slice
+   and the float4 activation load stays inside the row. T==1 never launches
+   this. ODINFER_CUDA_PREFILL_GEMM=0 keeps tc / tc2. */
+template<int Q6>
+__device__ void pgemm_run(const unsigned char* wb, const float* x, float* out, int n, int d, int T) {
+    const int BM = 64;
+    const int BN = 64;
+    const int BK = 128;
+    const int tid = (int)threadIdx.x;
+    const int warp = tid >> 5;
+    const int wm = warp >> 2;
+    const int wn = warp & 3;
+    const int t0 = (int)blockIdx.y * BM;
+    const int n0 = (int)blockIdx.x * BN;
+    if (t0 >= T || n0 >= d) return;
+
+    int bbytes = Q6 ? 210 : 144;
+    int nb = n >> 8;
+
+    __shared__ __align__(16) unsigned char raw[64 * 128 * 2 + 64 * 128 * 2];
+    unsigned short* Xs = (unsigned short*)raw;
+    unsigned short* Ws = Xs + BM * BK;
+
+    float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f, c4 = 0.f, c5 = 0.f, c6 = 0.f, c7 = 0.f;
+    for (int k0 = 0; k0 < n; k0 += BK) {
+        if (tid < BN * 4) {
+            int row = tid & (BN - 1);
+            int sub = tid >> 6;
+            int part = ((k0 >> 5) & 7) + sub;
+            unsigned short* dst = Ws + row * BK + sub * 32;
+            if (n0 + row < d) {
+                const unsigned char* blk = wb + ((size_t)(n0 + row) * (size_t)nb + (size_t)(k0 >> 8)) * (size_t)bbytes;
+                tc2_dequant_row<Q6>(blk, part, dst);
+            } else {
+#pragma unroll
+                for (int j = 0; j < 32; ++j) dst[j] = 0;
+            }
+        }
+        for (int e = tid; e < (BM * BK) / 4; e += 512) {
+            int elem = e << 2;
+            int tr = elem >> 7;
+            int kk = elem & 127;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            int tt = t0 + tr;
+            int kkabs = k0 + kk;
+            if (tt < T && kkabs + 3 < n) {
+                const float* xp = x + (size_t)tt * (size_t)n + (size_t)kkabs;
+                v = *reinterpret_cast<const float4*>(xp);
+            }
+            unsigned short* dp = Xs + elem;
+            dp[0] = f32_to_f16(v.x);
+            dp[1] = f32_to_f16(v.y);
+            dp[2] = f32_to_f16(v.z);
+            dp[3] = f32_to_f16(v.w);
+        }
+        __syncthreads();
+#pragma unroll 1
+        for (int kk = 0; kk < BK; kk += 16) {
+            unsigned a0, a1, a2, a3, a4, a5, a6, a7;
+            unsigned b0, b1, b2, b3, b4, b5, b6, b7;
+            wmma_load_a(a0, a1, a2, a3, a4, a5, a6, a7, Xs + (wm * 16) * BK + kk, BK);
+            wmma_load_b(b0, b1, b2, b3, b4, b5, b6, b7, Ws + (wn * 16) * BK + kk, BK);
+            wmma_mma(c0, c1, c2, c3, c4, c5, c6, c7, a0, a1, a2, a3, a4, a5, a6, a7, b0, b1, b2, b3, b4, b5, b6, b7);
+        }
+        __syncthreads();
+    }
+    float* tile = (float*)raw;
+    wmma_store(tile + warp * 256, 16, c0, c1, c2, c3, c4, c5, c6, c7);
+    __syncthreads();
+    for (int idx = tid; idx < 16 * 256; idx += 512) {
+        int w = idx >> 8;
+        int e = idx & 255;
+        int i = e >> 4;
+        int j = e & 15;
+        int tw = w >> 2;
+        int nw = w & 3;
+        int t = t0 + tw * 16 + i;
+        int row = n0 + nw * 16 + j;
+        if (t < T && row < d) out[(size_t)t * (size_t)d + row] = tile[idx];
+    }
+}
+
+extern "C" __global__ void pgemm_q4_k(const unsigned char* wb, const float* x, float* out, int n, int d, int T) {
+    pgemm_run<0>(wb, x, out, n, d, T);
+}
+extern "C" __global__ void pgemm_q6_k(const unsigned char* wb, const float* x, float* out, int n, int d, int T) {
+    pgemm_run<1>(wb, x, out, n, d, T);
 }
 
 extern "C" __global__ void gemv2r1_q6_k(const unsigned char* wb, const signed char* xq, const float* xd,
