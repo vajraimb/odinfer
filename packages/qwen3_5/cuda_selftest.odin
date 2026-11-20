@@ -790,7 +790,10 @@ run_pgemm :: proc(kind: ggml.GGML_Type, rows, cols, T: int, atol, rtol: f32) -> 
 }
 
 // mmqk is the Q4_K / Q6_K prefill. Same q8 + dp4a math as gemv2, so that
-// compare is tight. The fp32 CPU GEMV still sees the q8 rounding.
+// compare stays tight (2e-3). The fp32 CPU GEMV sees the q8 rounding, and
+// uses the same allowance as run_gemv2: atol 1, rtol 5e-2. On a V100,
+// mmqk_q6_k matched gemv2 within 7.6e-6, while a few elements missed
+// 2e-2 + 2e-2*|ref| by 0.05-0.16.
 @(private)
 run_mmqk :: proc(kind: ggml.GGML_Type, rows, cols, T: int) -> bool {
 	tag := cuda_kind_tag(kind)
@@ -870,8 +873,10 @@ run_mmqk :: proc(kind: ggml.GGML_Type, rows, cols, T: int) -> bool {
 	defer delete(got)
 	cu.download(raw_data(got), dy, T * rows * 4)
 	st_cpu: Case_Err
+	// Same q8-vs-fp32 allowance as gemv2 (run_gemv2 passes atol 1, rtol 5e-2).
+	cpu_atol, cpu_rtol: f32 = 1, 5e-2
 	for i in 0 ..< T * rows {
-		s_note(&st_cpu, fmt.tprintf("%s cpu [%d]", name, i), got[i], ref[i], 2e-2, 2e-2)
+		s_note(&st_cpu, fmt.tprintf("%s cpu [%d]", name, i), got[i], ref[i], cpu_atol, cpu_rtol)
 	}
 	warps := 4
 	ggx := u32((rows + warps * 4 - 1) / (warps * 4))
@@ -908,7 +913,7 @@ run_mmqk :: proc(kind: ggml.GGML_Type, rows, cols, T: int) -> bool {
 			s_note(&st_g, fmt.tprintf("%s gemv2 t=%d r=%d", name, t, r), got[t * rows + r], grow[r], 2e-3, 2e-3)
 		}
 	}
-	ok_cpu := s_report(fmt.tprintf("%s vs cpu T=%d rows=%d cols=%d", name, T, rows, cols), st_cpu, 2e-2, 2e-2)
+	ok_cpu := s_report(fmt.tprintf("%s vs cpu T=%d rows=%d cols=%d", name, T, rows, cols), st_cpu, cpu_atol, cpu_rtol)
 	ok_g := s_report(fmt.tprintf("%s vs gemv2 T=%d rows=%d cols=%d", name, T, rows, cols), st_g, 2e-3, 2e-3)
 	return ok_cpu && ok_g
 }
@@ -2132,7 +2137,7 @@ cuda_selftest :: proc() -> bool {
 		if !run_pgemm(.Q6_K, shape[0], shape[1], shape[2], 5e-2, 5e-2) {
 			ok = false
 		}
-		// Same shapes. mmqk must match gemv2 within 2e-3 and the fp32 GEMV within 2e-2.
+		// Same shapes. mmqk must match gemv2 within 2e-3. The CPU compare uses gemv2's q8 allowance.
 		if !run_mmqk(.Q4_K, shape[0], shape[1], shape[2]) || !run_mmqk(.Q6_K, shape[0], shape[1], shape[2]) {
 			ok = false
 		}

@@ -2148,7 +2148,7 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	}
 	fmt.eprintfln("cuda: tensor cores %s  WMMA 16x16x16 fp16, fp32 acc", tc_note)
 	if g_prefill_gemm {
-		fmt.eprintln("cuda: prefill gemm on for Q4_K/Q6_K T>1 (mmqk, q8 activations, dp4a, 4 rows x 64 tokens). ODINFER_CUDA_PREFILL_GEMM=0 keeps tc2/tc. Not timed on a V100")
+		fmt.eprintln("cuda: prefill gemm on for Q4_K/Q6_K T>1 (mmqk, q8 activations, dp4a, 4 rows x 64 tokens). ODINFER_CUDA_PREFILL_GEMM=0 keeps tc2/tc")
 	} else {
 		fmt.eprintln("cuda: prefill gemm off (ODINFER_CUDA_PREFILL_GEMM=0)")
 	}
