@@ -3,6 +3,7 @@
 package qwen3_5
 
 import "core:fmt"
+import "core:mem"
 import "core:os"
 import ggml "ggml:ggml"
 
@@ -306,6 +307,29 @@ engine_restore_full_state :: proc(e: ^Engine, kv_k, kv_v, conv, rec: []u8) {
 	cpu_restore_full_state(&e.transformer, kv_k, kv_v, conv, rec)
 }
 
+// Same bytes as the full snapshot, but only the first n_pos KV positions.
+// A cache hit at a short system boundary used to copy the whole max-ctx
+// allocation (about 1.2 GB at 32768 on the 27B). Q8 KV is position-major,
+// so the prefix is a contiguous range per layer. f16 falls back to the
+// full buffers. Restore zeros the tail so a short hit drops a longer one.
+engine_save_prefix_state :: proc(e: ^Engine, n_pos: int) -> (kv_k: []u8, kv_v: []u8, conv: []u8, rec: []u8) {
+	when GPU_METAL {
+		if e.metal_ready { return metal_save_prefix(&e.transformer, n_pos) }
+	} else when GPU_CUDA {
+		if e.metal_ready { return cuda_save_prefix(n_pos) }
+	}
+	return cpu_save_prefix(&e.transformer, n_pos)
+}
+
+engine_restore_prefix_state :: proc(e: ^Engine, n_pos: int, kv_k, kv_v, conv, rec: []u8) {
+	when GPU_METAL {
+		if e.metal_ready { metal_restore_prefix(&e.transformer, n_pos, kv_k, kv_v, conv, rec); return }
+	} else when GPU_CUDA {
+		if e.metal_ready { cuda_restore_prefix(n_pos, kv_k, kv_v, conv, rec); return }
+	}
+	cpu_restore_prefix(&e.transformer, n_pos, kv_k, kv_v, conv, rec)
+}
+
 // CPU full-state snapshot: the Run_State KV stays fp32 (the CPU attention dots
 // read it directly), and the conversion to/from the Metal-native byte layout
 // happens here at the snapshot boundary only. With KV_Q8=1 (default) that is
@@ -426,6 +450,94 @@ cpu_restore_full_state :: proc(t: ^Transformer, kv_k, kv_v, conv, rec: []u8) {
 					}
 				}
 			}
+		}
+	}
+	copy((cast([^]u8)raw_data(s.conv_states))[:len(s.conv_states) * 4], conv)
+	copy((cast([^]u8)raw_data(s.recurrent_states))[:len(s.recurrent_states) * 4], rec)
+}
+
+cpu_save_prefix :: proc(t: ^Transformer, n_pos: int) -> (kv_k: []u8, kv_v: []u8, conv: []u8, rec: []u8) {
+	c := &t.config
+	s := &t.state
+	if !g_kv_q8 || n_pos <= 0 || n_pos > c.seq_len || len(s.key_cache) == 0 {
+		return cpu_save_full_state(t)
+	}
+	kv_dim := c.n_kv_heads * c.head_dim
+	pos_bytes := kv_pos_bytes(kv_dim)
+	v_pos := pos_bytes
+	v_block := Q8_0_BLOCK_BYTES
+	if g_kv_v_mix {
+		v_pos = kv_v_mix_pos_bytes(kv_dim)
+		v_block = Q8_V_MIX_BLOCK_BYTES
+	}
+	k_stride := n_pos * pos_bytes
+	v_stride := n_pos * v_pos
+	kv_k = make([]u8, c.n_full * k_stride)
+	kv_v = make([]u8, c.n_full * v_stride)
+	for l in 0 ..< c.n_full {
+		layer_off := l * c.seq_len * kv_dim
+		for p in 0 ..< n_pos {
+			row_off := layer_off + p * kv_dim
+			dst_off := l * k_stride + p * pos_bytes
+			v_off := l * v_stride + p * v_pos
+			for b in 0 ..< kv_dim / QK8_0 {
+				quantize_q8_block(s.key_cache[row_off + b * QK8_0:row_off + (b + 1) * QK8_0], kv_k[dst_off + b * Q8_0_BLOCK_BYTES:dst_off + (b + 1) * Q8_0_BLOCK_BYTES])
+				if g_kv_v_mix {
+					quantize_q8_v_mix_block(s.value_cache[row_off + b * QK8_0:row_off + (b + 1) * QK8_0], kv_v[v_off + b * v_block:v_off + (b + 1) * v_block])
+				} else {
+					quantize_q8_block(s.value_cache[row_off + b * QK8_0:row_off + (b + 1) * QK8_0], kv_v[v_off + b * v_block:v_off + (b + 1) * v_block])
+				}
+			}
+		}
+	}
+	conv_src := (cast([^]u8)raw_data(s.conv_states))[:len(s.conv_states) * 4]
+	rec_src := (cast([^]u8)raw_data(s.recurrent_states))[:len(s.recurrent_states) * 4]
+	conv = make([]u8, len(conv_src)); copy(conv, conv_src)
+	rec = make([]u8, len(rec_src)); copy(rec, rec_src)
+	return
+}
+
+cpu_restore_prefix :: proc(t: ^Transformer, n_pos: int, kv_k, kv_v, conv, rec: []u8) {
+	c := &t.config
+	s := &t.state
+	if !g_kv_q8 || n_pos <= 0 || n_pos > c.seq_len || len(s.key_cache) == 0 {
+		cpu_restore_full_state(t, kv_k, kv_v, conv, rec)
+		return
+	}
+	kv_dim := c.n_kv_heads * c.head_dim
+	pos_bytes := kv_pos_bytes(kv_dim)
+	v_pos := pos_bytes
+	v_block := Q8_0_BLOCK_BYTES
+	if g_kv_v_mix {
+		v_pos = kv_v_mix_pos_bytes(kv_dim)
+		v_block = Q8_V_MIX_BLOCK_BYTES
+	}
+	if len(kv_k) != c.n_full * n_pos * pos_bytes || len(kv_v) != c.n_full * n_pos * v_pos {
+		cpu_restore_full_state(t, kv_k, kv_v, conv, rec)
+		return
+	}
+	k_stride := n_pos * pos_bytes
+	v_stride := n_pos * v_pos
+	for l in 0 ..< c.n_full {
+		layer_off := l * c.seq_len * kv_dim
+		for p in 0 ..< n_pos {
+			row_off := layer_off + p * kv_dim
+			src_off := l * k_stride + p * pos_bytes
+			v_off := l * v_stride + p * v_pos
+			for b in 0 ..< kv_dim / QK8_0 {
+				dequantize_q8_block(kv_k[src_off + b * Q8_0_BLOCK_BYTES:src_off + (b + 1) * Q8_0_BLOCK_BYTES], s.key_cache[row_off + b * QK8_0:row_off + (b + 1) * QK8_0])
+				if g_kv_v_mix {
+					dequantize_q8_v_mix_block(kv_v[v_off + b * v_block:v_off + (b + 1) * v_block], s.value_cache[row_off + b * QK8_0:row_off + (b + 1) * QK8_0])
+				} else {
+					dequantize_q8_block(kv_v[v_off + b * v_block:v_off + (b + 1) * v_block], s.value_cache[row_off + b * QK8_0:row_off + (b + 1) * QK8_0])
+				}
+			}
+		}
+		if n_pos < c.seq_len {
+			tail := (c.seq_len - n_pos) * kv_dim
+			off := layer_off + n_pos * kv_dim
+			mem.set(raw_data(s.key_cache[off:]), 0, tail * size_of(f32))
+			mem.set(raw_data(s.value_cache[off:]), 0, tail * size_of(f32))
 		}
 	}
 	copy((cast([^]u8)raw_data(s.conv_states))[:len(s.conv_states) * 4], conv)

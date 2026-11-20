@@ -68,22 +68,36 @@ cuda_save_kv :: proc(t: ^Transformer, path: string, n_valid_pos: int) -> bool {
 		return false
 	}
 	defer os.close(f)
+	kv_hash_begin()
 	write_header(f, h)
 
 	kv_dim := c.n_kv_heads * c.head_dim
 	tmp := make([]f32, n_valid_pos * kv_dim)
 	defer delete(tmp)
-	k_layer := make([]u8, g_k_layer)
+	// Q8 KV is position-major, so the live prefix is the first n_valid
+	// positions of each layer. f16 is head-major and still needs the
+	// whole allocation (the live columns are strided by seq_len).
+	k_dl := g_k_layer
+	v_dl := g_v_layer
+	if g_kv_q8 && g_k_pos > 0 && n_valid_pos > 0 && n_valid_pos <= c.seq_len {
+		k_dl = n_valid_pos * g_k_pos
+		v_dl = n_valid_pos * g_v_pos
+	}
+	k_layer := make([]u8, k_dl)
 	defer delete(k_layer)
-	v_layer := make([]u8, g_v_layer)
+	v_layer := make([]u8, v_dl)
 	defer delete(v_layer)
 
 	for l in 0 ..< c.n_full {
-		if !ck(cu.download(raw_data(k_layer), cu.ptr_add(d_kc, l * g_k_layer), g_k_layer), "kv K") {
-			return false
+		if k_dl > 0 {
+			if !ck(cu.download(raw_data(k_layer), cu.ptr_add(d_kc, l * g_k_layer), k_dl), "kv K") {
+				return false
+			}
 		}
-		if !ck(cu.download(raw_data(v_layer), cu.ptr_add(d_vc, l * g_v_layer), g_v_layer), "kv V") {
-			return false
+		if v_dl > 0 {
+			if !ck(cu.download(raw_data(v_layer), cu.ptr_add(d_vc, l * g_v_layer), v_dl), "kv V") {
+				return false
+			}
 		}
 		if g_kv_q8 {
 			pos_bytes := g_k_pos
@@ -163,7 +177,7 @@ cuda_save_kv :: proc(t: ^Transformer, path: string, n_valid_pos: int) -> bool {
 		fmt.eprintln("kv: recurrent_states write failed")
 		return false
 	}
-	if !append_crc32(path) {
+	if !append_crc32(f) {
 		fmt.eprintln("kv: crc append failed")
 		return false
 	}
@@ -315,6 +329,77 @@ cuda_save_full_state :: proc() -> (kv_k: []u8, kv_v: []u8, conv: []u8, rec: []u8
 		return nil, nil, nil, nil
 	}
 	return
+}
+
+// First n_pos positions of each full-attention layer. Q8 KV is
+// position-major, so that prefix is a contiguous byte range. The caller
+// zeros the tail so a short hit does not keep a longer previous context.
+cuda_save_prefix :: proc(n_pos: int) -> (kv_k, kv_v, conv, rec: []u8) {
+	if !g_kv_q8 || g_k_pos <= 0 || g_n_full <= 0 || n_pos <= 0 {
+		return cuda_save_full_state()
+	}
+	k_stride := n_pos * g_k_pos
+	v_stride := n_pos * g_v_pos
+	if k_stride > g_k_layer || v_stride > g_v_layer {
+		return cuda_save_full_state()
+	}
+	k_buf, k_err := make([]u8, g_n_full * k_stride)
+	if k_err != nil {
+		return
+	}
+	v_buf, v_err := make([]u8, g_n_full * v_stride)
+	if v_err != nil {
+		delete(k_buf)
+		return nil, nil, nil, nil
+	}
+	kv_k = k_buf
+	kv_v = v_buf
+	for l in 0 ..< g_n_full {
+		if !ck(cu.download(raw_data(kv_k[l * k_stride:]), cu.ptr_add(d_kc, l * g_k_layer), k_stride), "prefix k") {
+			delete(kv_k)
+			delete(kv_v)
+			return nil, nil, nil, nil
+		}
+		if !ck(cu.download(raw_data(kv_v[l * v_stride:]), cu.ptr_add(d_vc, l * g_v_layer), v_stride), "prefix v") {
+			delete(kv_k)
+			delete(kv_v)
+			return nil, nil, nil, nil
+		}
+	}
+	conv, rec = cuda_save_spec_state()
+	return
+}
+
+cuda_restore_prefix :: proc(n_pos: int, kv_k, kv_v, conv, rec: []u8) {
+	if !g_kv_q8 || g_k_pos <= 0 || g_n_full <= 0 || n_pos <= 0 {
+		cuda_restore_full_state(kv_k, kv_v, conv, rec)
+		return
+	}
+	k_stride := n_pos * g_k_pos
+	v_stride := n_pos * g_v_pos
+	if len(kv_k) != g_n_full * k_stride || len(kv_v) != g_n_full * v_stride {
+		cuda_restore_full_state(kv_k, kv_v, conv, rec)
+		return
+	}
+	for l in 0 ..< g_n_full {
+		if !ck(cu.upload(cu.ptr_add(d_kc, l * g_k_layer), raw_data(kv_k[l * k_stride:]), k_stride), "prefix k up") {
+			return
+		}
+		if !ck(cu.upload(cu.ptr_add(d_vc, l * g_v_layer), raw_data(kv_v[l * v_stride:]), v_stride), "prefix v up") {
+			return
+		}
+		if g_k_layer > k_stride {
+			if !ck(cu.memset(cu.ptr_add(d_kc, l * g_k_layer + k_stride), 0, g_k_layer - k_stride), "prefix k tail") {
+				return
+			}
+		}
+		if g_v_layer > v_stride {
+			if !ck(cu.memset(cu.ptr_add(d_vc, l * g_v_layer + v_stride), 0, g_v_layer - v_stride), "prefix v tail") {
+				return
+			}
+		}
+	}
+	cuda_restore_spec_state(conv, rec)
 }
 
 cuda_restore_full_state :: proc(kv_k, kv_v, conv, rec: []u8) {

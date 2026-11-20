@@ -83,13 +83,19 @@ main :: proc() {
 			head := "<|im_start|>user\n"
 			tail := "\nWhat is 2+2? Answer with one number.<|im_end|>\n<|im_start|>assistant\n"
 			body := "The quick brown fox jumps over the lazy dog. "
-			filled := head
-			filled_owned := false
-			extra := body
-			extra_owned := false
+			// One encode. The sentence is about 8 tokens and 45 bytes; size
+			// the repeat from that and grow once if the estimate is short.
+			reps := need
 			built := false
-			for len(filled) <= need * 32 {
-				prompt = strings.concatenate({filled, tail})
+			for attempt in 0 ..< 3 {
+				parts := make([]string, reps + 2)
+				parts[0] = head
+				for i in 0 ..< reps {
+					parts[1 + i] = body
+				}
+				parts[reps + 1] = tail
+				prompt = strings.concatenate(parts)
+				delete(parts)
 				enc, eerr := tok35.encode(&tok, prompt)
 				delete(prompt)
 				if eerr != nil {
@@ -102,24 +108,7 @@ main :: proc() {
 					break
 				}
 				delete(enc)
-				next := strings.concatenate({filled, extra})
-				if filled_owned {
-					delete(filled)
-				}
-				filled = next
-				filled_owned = true
-				grown := strings.concatenate({extra, extra})
-				if extra_owned {
-					delete(extra)
-				}
-				extra = grown
-				extra_owned = true
-			}
-			if filled_owned {
-				delete(filled)
-			}
-			if extra_owned {
-				delete(extra)
+				reps *= 2
 			}
 			if !built {
 				fmt.eprintfln("cuda_smoke: could not build a %d-token prompt", want_prefill)

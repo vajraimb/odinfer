@@ -4973,6 +4973,7 @@ metal_save_kv :: proc(t: ^Transformer, path: string, n_valid_pos: int) -> bool {
 	}
 	defer os.close(f)
 
+	kv_hash_begin()
 	write_header(f, h)
 
 	kv_dim := c.n_kv_heads * c.head_dim
@@ -5081,7 +5082,7 @@ metal_save_kv :: proc(t: ^Transformer, path: string, n_valid_pos: int) -> bool {
 		fmt.eprintln("kv: recurrent_states write failed"); return false
 	}
 
-	if !append_crc32(path) {
+	if !append_crc32(f) {
 		fmt.eprintln("kv: crc append failed"); return false
 	}
 	fmt.eprintfln("kv: saved (Metal) %s (%d valid pos, %d full L, kv_dim=%d)",
@@ -7951,6 +7952,73 @@ metal_save_full_state :: proc() -> (kv_k: []u8, kv_v: []u8, conv: []u8, rec: []u
 	copy(kv_v, vc)
 	conv, rec = metal_save_spec_state()
 	return
+}
+
+metal_save_prefix :: proc(t: ^Transformer, n_pos: int) -> (kv_k: []u8, kv_v: []u8, conv: []u8, rec: []u8) {
+	if !metal_enabled || !g_kv_q8 || n_pos <= 0 || n_pos > t.config.seq_len {
+		return metal_save_full_state()
+	}
+	c := &t.config
+	kv_dim := c.n_kv_heads * c.head_dim
+	k_pos := kv_pos_bytes(kv_dim)
+	k_layer := kv_layer_bytes_q8(c.seq_len, kv_dim)
+	v_pos := k_pos
+	v_layer := k_layer
+	if g_kv_v_mix {
+		v_pos = kv_v_mix_pos_bytes(kv_dim)
+		v_layer = kv_v_mix_layer_bytes(c.seq_len, kv_dim)
+	}
+	k_stride := n_pos * k_pos
+	v_stride := n_pos * v_pos
+	kc := m_b_kc->contentsAsSlice([]u8)
+	vc := m_b_vc->contentsAsSlice([]u8)
+	if len(kc) < c.n_full * k_layer || len(vc) < c.n_full * v_layer {
+		return metal_save_full_state()
+	}
+	kv_k = make([]u8, c.n_full * k_stride)
+	kv_v = make([]u8, c.n_full * v_stride)
+	for l in 0 ..< c.n_full {
+		copy(kv_k[l * k_stride:(l + 1) * k_stride], kc[l * k_layer:l * k_layer + k_stride])
+		copy(kv_v[l * v_stride:(l + 1) * v_stride], vc[l * v_layer:l * v_layer + v_stride])
+	}
+	conv, rec = metal_save_spec_state()
+	return
+}
+
+metal_restore_prefix :: proc(t: ^Transformer, n_pos: int, kv_k, kv_v, conv, rec: []u8) {
+	if !metal_enabled || !g_kv_q8 || n_pos <= 0 || n_pos > t.config.seq_len {
+		metal_restore_full_state(kv_k, kv_v, conv, rec)
+		return
+	}
+	c := &t.config
+	kv_dim := c.n_kv_heads * c.head_dim
+	k_pos := kv_pos_bytes(kv_dim)
+	k_layer := kv_layer_bytes_q8(c.seq_len, kv_dim)
+	v_pos := k_pos
+	v_layer := k_layer
+	if g_kv_v_mix {
+		v_pos = kv_v_mix_pos_bytes(kv_dim)
+		v_layer = kv_v_mix_layer_bytes(c.seq_len, kv_dim)
+	}
+	k_stride := n_pos * k_pos
+	v_stride := n_pos * v_pos
+	if len(kv_k) != c.n_full * k_stride || len(kv_v) != c.n_full * v_stride {
+		metal_restore_full_state(kv_k, kv_v, conv, rec)
+		return
+	}
+	kc := m_b_kc->contentsAsSlice([]u8)
+	vc := m_b_vc->contentsAsSlice([]u8)
+	for l in 0 ..< c.n_full {
+		copy(kc[l * k_layer:l * k_layer + k_stride], kv_k[l * k_stride:(l + 1) * k_stride])
+		copy(vc[l * v_layer:l * v_layer + v_stride], kv_v[l * v_stride:(l + 1) * v_stride])
+		if k_layer > k_stride {
+			mem.set(raw_data(kc[l * k_layer + k_stride:]), 0, k_layer - k_stride)
+		}
+		if v_layer > v_stride {
+			mem.set(raw_data(vc[l * v_layer + v_stride:]), 0, v_layer - v_stride)
+		}
+	}
+	metal_restore_spec_state(conv, rec)
 }
 
 // Restore full engine state from memory snapshot.

@@ -141,14 +141,36 @@ rec_bytes :: proc(h: ^KV_Header) -> u64 {
 
 // ---------- little-endian file IO ----------
 
+// Running CRC of the bytes written by the current save. The trailing CRC
+// word is written with hashing off, so it is not part of itself. This
+// replaces re-reading the whole file after the write.
+@(private)
+g_kv_hashing: bool
+@(private)
+g_kv_crc: u32
+
+kv_hash_begin :: proc() {
+	g_kv_hashing = true
+	g_kv_crc = 0
+}
+
+@(private)
+kv_note :: proc(b: []u8) {
+	if g_kv_hashing && len(b) > 0 {
+		g_kv_crc = hash.crc32(b, g_kv_crc)
+	}
+}
+
 write_u32 :: proc(f: ^os.File, v: u32) {
 	buf := [4]u8{u8(v & 0xff), u8((v >> 8) & 0xff), u8((v >> 16) & 0xff), u8((v >> 24) & 0xff)}
+	kv_note(buf[:])
 	_, _ = os.write(f, buf[:])
 }
 
 write_u64 :: proc(f: ^os.File, v: u64) {
 	buf: [8]u8
 	for i in 0..<8 { buf[i] = u8((v >> cast(u64)(i * 8)) & 0xff) }
+	kv_note(buf[:])
 	_, _ = os.write(f, buf[:])
 }
 
@@ -172,6 +194,7 @@ write_header :: proc(f: ^os.File, h: KV_Header) {
 write_f32_slice :: proc(f: ^os.File, s: []f32) -> bool {
 	if len(s) == 0 { return true }
 	bytes := (cast([^]u8)raw_data(s))[:len(s) * 4]
+	kv_note(bytes)
 	n, err := os.write(f, bytes)
 	return err == os.ERROR_NONE && n == len(bytes)
 }
@@ -243,6 +266,7 @@ cpu_save_kv :: proc(t: ^Transformer, path: string, n_valid_pos: int) -> bool {
 	}
 	defer os.close(f)
 
+	kv_hash_begin()
 	write_header(f, h)
 
 	// K/V — per-layer slice [n_valid_pos * kv_dim]
@@ -266,10 +290,7 @@ cpu_save_kv :: proc(t: ^Transformer, path: string, n_valid_pos: int) -> bool {
 		fmt.eprintln("kv: recurrent_states write failed"); return false
 	}
 
-	// CRC32 over header + body. We re-read the file because we wrote header
-	// field-by-field and can't easily hash in-process.
-	// (Alternative: compute incrementally — left for v2.)
-	if !append_crc32(path) {
+	if !append_crc32(f) {
 		fmt.eprintln("kv: crc append failed"); return false
 	}
 	fmt.eprintfln("kv: saved %s (%d valid pos, %d full L, kv_dim=%d)",
@@ -355,31 +376,37 @@ cpu_load_kv :: proc(t: ^Transformer, path: string) -> (int, bool) {
 
 // ---------- CRC32 over file contents (excluding the trailing 4 CRC bytes) ----------
 
-append_crc32 :: proc(path: string) -> bool {
-	// Heap (not temp): the buffer is file-sized (50-200MB) and the server's
-	// temp arena is never reset — temp would leak the file size per save.
-	data, err := os.read_entire_file_from_path(path, context.allocator)
-	if err != os.ERROR_NONE { return false }
-	defer delete(data)
-	c := hash.crc32(data)
-	f, oerr := os.open(path, os.O_APPEND | os.O_WRONLY)
-	if oerr != os.ERROR_NONE { return false }
-	defer os.close(f)
+append_crc32 :: proc(f: ^os.File) -> bool {
+	if !g_kv_hashing { return false }
+	c := g_kv_crc
+	g_kv_hashing = false
 	write_u32(f, c)
 	return true
 }
 
 verify_crc32 :: proc(path: string) -> bool {
-	data, err := os.read_entire_file_from_path(path, context.allocator)
+	info, serr := os.stat(path, context.temp_allocator)
+	if serr != os.ERROR_NONE || info.size < 4 { return false }
+	f, err := os.open(path, os.O_RDONLY)
 	if err != os.ERROR_NONE { return false }
-	defer delete(data)
-	if len(data) < 4 { return false }
-	body := data[:len(data) - 4]
-	stored_crc := u32(data[len(data) - 4]) |
-		(u32(data[len(data) - 3]) << 8) |
-		(u32(data[len(data) - 2]) << 16) |
-		(u32(data[len(data) - 1]) << 24)
-	return hash.crc32(body) == stored_crc
+	defer os.close(f)
+	left := int(info.size) - 4
+	chunk := make([]u8, 1 << 20)
+	defer delete(chunk)
+	crc: u32 = 0
+	for left > 0 {
+		n := left
+		if n > len(chunk) { n = len(chunk) }
+		got, rerr := os.read(f, chunk[:n])
+		if rerr != os.ERROR_NONE || got != n { return false }
+		crc = hash.crc32(chunk[:n], crc)
+		left -= n
+	}
+	tail: [4]u8
+	got, rerr := os.read(f, tail[:])
+	if rerr != os.ERROR_NONE || got != 4 { return false }
+	stored := u32(tail[0]) | (u32(tail[1]) << 8) | (u32(tail[2]) << 16) | (u32(tail[3]) << 24)
+	return crc == stored
 }
 
 // ---------- public dispatch ----------
