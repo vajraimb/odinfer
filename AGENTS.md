@@ -161,8 +161,11 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
   V100 and slower than the scalar tile (9B 16000 tokens 154 vs 183 tok/s).
   The fp16 store of 32 rows at one K is a 32-way smem bank conflict, and a
   64-token N tile dequants every weight twice per 128-token chunk. It is not
-  launched. `mmqk` (q8 + dp4a) is the default and was faster on that V100
-  (9B 16000 tokens 246 vs 213 tok/s, 27B 8000 tokens 93 vs 80).
+  launched. `mmqk` (q8 + dp4a) is the default. The global-X tile was faster
+  on that V100 (9B 16000 tokens 246 vs 213 tok/s, 27B 8000 tokens 93 vs 80).
+  The tile that ships stages one q8 superblock in 22528 bytes of shared
+  memory (32 rows by 64 tokens). sm_70 ptxas: 128 registers, no spills.
+  That tile has not been timed.
 - GEMV kernel shape: on this M3 the optimum is 256 threads / 32 rows / 8 lanes;
   every multi-row/multi-thread/fusion variant measured as a regression (data in
   packages/qwen3_5/README.md and gemm_harness).

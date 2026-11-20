@@ -3392,22 +3392,21 @@ extern "C" __global__ void pgemm_q6_k(const unsigned char* wb, const float* x, f
     pgemm_run<1>(wb, x, out, n, d, T);
 }
 
-/* pgemm (fp16 dequant + WMMA) was slower than the scalar tile on a V100:
-   9B prefill at 905/16000 was 174/154 vs 222/183 tok/s, and a T=128 chunk's
-   linear time went 450 -> 584 ms. A warp of that kernel writes 32 rows at
-   the same K, and the fp16 stride is an exact multiple of the shared-memory
-   bank width, so the dequant store is a 32-way conflict. The 64-token tile
-   also expands every weight twice per 128-token chunk, with no second
-   accumulator and no overlap of the next load. It is not launched.
+/* pgemm (fp16 dequant + WMMA) was slower than the scalar tile on a V100
+   and is not launched. mmqk quantizes activations to q8 once per GEMM and
+   dots the stored nibbles with dp4a.
 
-   This is the llama.cpp MMQ shape for Volta: activations are quantized to
-   q8 (block 32) once per GEMM, then int8 dp4a against the Q4_K / Q6_K
-   nibbles. X is stored K-major so a warp's 32 tokens load one coalesced
-   uint32. Every lane reads the same weight (a broadcast) and keeps several
-   row accumulators, so each nibble is reused across the token tile instead
-   of being expanded to fp16. The min term uses the original 32-wide sum, the
-   same contract as gemv2_q4_k. No shared memory, so the block is not capped
-   by the 32 KB tile that dropped pgemm's occupancy. */
+   The first mmqk tile kept X in global memory and reused each byte across
+   only 4 rows. On the 27B that reload is most of the linear time (about
+   61 s of an 8000-token prefill, ~10 TFLOP/s). This tile stages one
+   superblock of q8 (64 K-words x 64 tokens, plus the 8 scales and sums)
+   in shared memory and reuses it across 32 rows. A block is 8 warps of
+   4 rows; each lane owns two tokens (lane and lane+32). Weights stay in
+   registers for those four rows and are loaded 128 bits at a time.
+   sm_70 ptxas: 128 registers, no spills, two blocks per SM. Eight rows
+   per warp was 165 registers and one block, so that tile is not used.
+   Shared memory is 22528 bytes, under the 48 KiB dynamic default.
+   ODINFER_CUDA_PREFILL_GEMM=0 still selects tc2 / the scalar tile. */
 
 extern "C" __global__ void quant_q8_batch(const float* x, unsigned* xpack, float* scale, float2* sum16, int n, int T) {
     int idx = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
@@ -3449,6 +3448,63 @@ extern "C" __global__ void quant_q8_batch(const float* x, unsigned* xpack, float
     }
 }
 
+
+/* Stage superblock b of the K-major q8 tile. xs is [64 k4][64 tok]. */
+__device__ void mmqk_stage_x(unsigned* xs, float* scs, float2* sus,
+                             const unsigned* xpack, const float* scale, const float2* sum16,
+                             int b, int t0, int T) {
+    const int BN = 64;
+    const int tid = (int)threadIdx.x;
+    const int nt = (int)blockDim.x;
+    const int nxs = 64 * BN;
+    if ((T & 3) == 0) {
+        const int nvec = nxs >> 2;
+        for (int i = tid; i < nvec; i += nt) {
+            int elem = i << 2;
+            int k4 = elem >> 6;
+            int tok = elem & 63;
+            int gt = t0 + tok;
+            unsigned gk = (unsigned)(b * 64 + k4);
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (gt + 3 < T) {
+                v = *(const uint4*)(xpack + (size_t)gk * (size_t)T + (size_t)gt);
+            } else {
+                unsigned s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+                if (gt < T) s0 = xpack[(size_t)gk * (size_t)T + (size_t)gt];
+                if (gt + 1 < T) s1 = xpack[(size_t)gk * (size_t)T + (size_t)(gt + 1)];
+                if (gt + 2 < T) s2 = xpack[(size_t)gk * (size_t)T + (size_t)(gt + 2)];
+                if (gt + 3 < T) s3 = xpack[(size_t)gk * (size_t)T + (size_t)(gt + 3)];
+                v = make_uint4(s0, s1, s2, s3);
+            }
+            *(uint4*)(xs + elem) = v;
+        }
+    } else {
+        for (int i = tid; i < nxs; i += nt) {
+            int k4 = i >> 6;
+            int tok = i & 63;
+            int gt = t0 + tok;
+            unsigned v = 0;
+            if (gt < T) v = xpack[(size_t)(b * 64 + k4) * (size_t)T + (size_t)gt];
+            xs[i] = v;
+        }
+    }
+    const int nsc = 8 * BN;
+    for (int i = tid; i < nsc; i += nt) {
+        int g = i >> 6;
+        int tok = i & 63;
+        int gt = t0 + tok;
+        float s = 0.f;
+        float2 u = make_float2(0.f, 0.f);
+        if (gt < T) {
+            int gg = b * 8 + g;
+            s = scale[(size_t)gg * (size_t)T + (size_t)gt];
+            u = sum16[(size_t)gg * (size_t)T + (size_t)gt];
+        }
+        scs[i] = s;
+        sus[i] = u;
+    }
+}
+
 __device__ __forceinline__ unsigned u4_word(uint4 a, int i) {
     if (i == 0) return a.x;
     if (i == 1) return a.y;
@@ -3456,219 +3512,219 @@ __device__ __forceinline__ unsigned u4_word(uint4 a, int i) {
     return a.w;
 }
 
-__device__ __forceinline__ void mmqk_fold(float* a0, float* a1, float* a2, float* a3, int r, float v) {
-    if (r == 0) *a0 += v;
-    else if (r == 1) *a1 += v;
-    else if (r == 2) *a2 += v;
-    else *a3 += v;
+__device__ __forceinline__ unsigned mmqk_xs(const unsigned* xs, int k4, int tok) {
+    return xs[k4 * 64 + tok];
 }
 
-/* One warp, 4 rows x 64 tokens (lane and lane+32). Grid x is rows/32, y is T/64.
-   A block is 8 warps (256 threads) and uses no shared memory. X for one K step
-   is loaded once and reused for every row the warp owns. Weights of one
-   32-element slice stay in registers for that step only, so a nibble is not
-   expanded to fp16 and is not dequantized again for the other 63 tokens. */
+/* 32 rows x 64 tokens (4 rows per warp). 8 rows per warp compiled to 165
+   registers on sm_70 and only one block fit. Dynamic smem is 22528 bytes. */
 template<int Q6>
 __device__ void mmqk_warp(const unsigned char* wb, const unsigned* xpack, const float* scale, const float2* sum16,
                           float* out, int n, int d, int T) {
     const int ROWS = 4;
+    const int BN = 64;
     const int lane = (int)threadIdx.x & 31;
     const int warp = (int)threadIdx.x >> 5;
     const int nwarps = (int)blockDim.x >> 5;
-    const int row0 = ((int)blockIdx.x * nwarps + warp) * ROWS;
-    const int t0 = (int)blockIdx.y * 64;
-    if (t0 >= T || row0 >= d) return;
+    const int BM = nwarps * ROWS;
+    const int row_block = (int)blockIdx.x * BM;
+    const int t0 = (int)blockIdx.y * BN;
+    if (t0 >= T || row_block >= d) return;
+    const int row0 = row_block + warp * ROWS;
     const int tok0 = t0 + lane;
     const int tok1 = t0 + 32 + lane;
     const int live0 = tok0 < T;
     const int live1 = tok1 < T;
     const int nb = n >> 8;
-    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
-    float b0 = 0.f, b1 = 0.f, b2 = 0.f, b3 = 0.f;
-    for (int b = 0; b < nb; ++b) {
-        if (Q6 == 0) {
+    extern __shared__ __align__(16) unsigned char mmqk_sm[];
+    unsigned* xs = (unsigned*)mmqk_sm;
+    float* scs = (float*)(xs + 64 * BN);
+    float2* sus = (float2*)(scs + 8 * BN);
+    float a[ROWS], b[ROWS];
+#pragma unroll
+    for (int r = 0; r < ROWS; ++r) {
+        a[r] = 0.f;
+        b[r] = 0.f;
+    }
+    for (int sb = 0; sb < nb; ++sb) {
+        mmqk_stage_x(xs, scs, sus, xpack, scale, sum16, sb, t0, T);
+        __syncthreads();
+        if (row0 < d) {
+            if (Q6 == 0) {
 #pragma unroll 1
-            for (int p = 0; p < 4; ++p) {
-                uint4 hdr[ROWS], q0[ROWS], q1[ROWS];
-#pragma unroll
-                for (int r = 0; r < ROWS; ++r) {
-                    hdr[r] = make_uint4(0, 0, 0, 0);
-                    q0[r] = make_uint4(0, 0, 0, 0);
-                    q1[r] = make_uint4(0, 0, 0, 0);
-                    int rr = row0 + r;
-                    if (rr < d) {
-                        const unsigned char* blk = wb + ((size_t)rr * (size_t)nb + (size_t)b) * 144;
-                        hdr[r] = *(const uint4*)blk;
-                        q0[r] = *(const uint4*)(blk + 16 + p * 32);
-                        q1[r] = *(const uint4*)(blk + 32 + p * 32);
-                    }
-                }
-                int dlo0[ROWS], dlo1[ROWS], dhi0[ROWS], dhi1[ROWS];
-#pragma unroll
-                for (int r = 0; r < ROWS; ++r) {
-                    dlo0[r] = 0; dlo1[r] = 0; dhi0[r] = 0; dhi1[r] = 0;
-                }
-#pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    int k_lo = (b * 256 + p * 64 + i * 4) >> 2;
-                    int k_hi = (b * 256 + p * 64 + 32 + i * 4) >> 2;
-                    unsigned xlo0 = 0, xlo1 = 0, xhi0 = 0, xhi1 = 0;
+                for (int p = 0; p < 4; ++p) {
+                    float s00 = 0.f, s10 = 0.f, s01 = 0.f, s11 = 0.f;
+                    float2 u00, u10, u01, u11;
+                    u00 = u10 = u01 = u11 = make_float2(0.f, 0.f);
+                    int lg0 = p * 2;
+                    int lg1 = lg0 + 1;
                     if (live0) {
-                        xlo0 = xpack[(size_t)k_lo * (size_t)T + tok0];
-                        xhi0 = xpack[(size_t)k_hi * (size_t)T + tok0];
+                        s00 = scs[lg0 * BN + lane];
+                        s10 = scs[lg1 * BN + lane];
+                        u00 = sus[lg0 * BN + lane];
+                        u10 = sus[lg1 * BN + lane];
                     }
                     if (live1) {
-                        xlo1 = xpack[(size_t)k_lo * (size_t)T + tok1];
-                        xhi1 = xpack[(size_t)k_hi * (size_t)T + tok1];
+                        s01 = scs[lg0 * BN + 32 + lane];
+                        s11 = scs[lg1 * BN + 32 + lane];
+                        u01 = sus[lg0 * BN + 32 + lane];
+                        u11 = sus[lg1 * BN + 32 + lane];
                     }
 #pragma unroll
-                    for (int r = 0; r < ROWS; ++r) {
-                        if (row0 + r >= d) continue;
-                        unsigned qw = (i < 4) ? u4_word(q0[r], i) : u4_word(q1[r], i - 4);
-                        int lo = pack_lo_nib(qw);
-                        int hi = pack_hi_nib(qw);
-                        dlo0[r] = dp4a_s32(lo, (int)xlo0, dlo0[r]);
-                        dlo1[r] = dp4a_s32(lo, (int)xlo1, dlo1[r]);
-                        dhi0[r] = dp4a_s32(hi, (int)xhi0, dhi0[r]);
-                        dhi1[r] = dp4a_s32(hi, (int)xhi1, dhi1[r]);
-                    }
-                }
-                int g0 = b * 8 + p * 2;
-                int g1 = g0 + 1;
-                float2 u00, u10, u01, u11;
-                float s00 = 0.f, s10 = 0.f, s01 = 0.f, s11 = 0.f;
-                u00 = u10 = u01 = u11 = make_float2(0.f, 0.f);
-                if (live0) {
-                    u00 = sum16[(size_t)g0 * (size_t)T + tok0];
-                    u10 = sum16[(size_t)g1 * (size_t)T + tok0];
-                    s00 = scale[(size_t)g0 * (size_t)T + tok0];
-                    s10 = scale[(size_t)g1 * (size_t)T + tok0];
-                }
-                if (live1) {
-                    u01 = sum16[(size_t)g0 * (size_t)T + tok1];
-                    u11 = sum16[(size_t)g1 * (size_t)T + tok1];
-                    s01 = scale[(size_t)g0 * (size_t)T + tok1];
-                    s11 = scale[(size_t)g1 * (size_t)T + tok1];
-                }
+                    for (int rg = 0; rg < ROWS; rg += 4) {
+                        uint4 hdr[4], q0[4], q1[4];
 #pragma unroll
-                for (int r = 0; r < ROWS; ++r) {
-                    if (row0 + r >= d) continue;
-                    int sc0, m0, sc1, m1;
-                    scale_min_hdr(p * 2, hdr[r], &sc0, &m0);
-                    scale_min_hdr(p * 2 + 1, hdr[r], &sc1, &m1);
-                    float dW = f16_bits(hdr[r].x & 0xffff);
-                    float dmin = f16_bits(hdr[r].x >> 16);
-                    float acc0 = 0.f, acc1 = 0.f;
-                    if (live0) {
-                        acc0 += (dW * (float)sc0) * s00 * (float)dlo0[r] - (dmin * (float)m0) * (u00.x + u00.y);
-                        acc0 += (dW * (float)sc1) * s10 * (float)dhi0[r] - (dmin * (float)m1) * (u10.x + u10.y);
+                        for (int r = 0; r < 4; ++r) {
+                            hdr[r] = make_uint4(0, 0, 0, 0);
+                            q0[r] = make_uint4(0, 0, 0, 0);
+                            q1[r] = make_uint4(0, 0, 0, 0);
+                            int rr = row0 + rg + r;
+                            if (rr < d) {
+                                const unsigned char* blk = wb + ((size_t)rr * (size_t)nb + (size_t)sb) * 144;
+                                hdr[r] = *(const uint4*)blk;
+                                q0[r] = *(const uint4*)(blk + 16 + p * 32);
+                                q1[r] = *(const uint4*)(blk + 32 + p * 32);
+                            }
+                        }
+                        int dlo0[4], dlo1[4], dhi0[4], dhi1[4];
+#pragma unroll
+                        for (int r = 0; r < 4; ++r) {
+                            dlo0[r] = 0; dlo1[r] = 0; dhi0[r] = 0; dhi1[r] = 0;
+                        }
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            int klo = p * 16 + i;
+                            int khi = klo + 8;
+                            unsigned xlo0 = mmqk_xs(xs, klo, lane);
+                            unsigned xlo1 = mmqk_xs(xs, klo, 32 + lane);
+                            unsigned xhi0 = mmqk_xs(xs, khi, lane);
+                            unsigned xhi1 = mmqk_xs(xs, khi, 32 + lane);
+#pragma unroll
+                            for (int r = 0; r < 4; ++r) {
+                                unsigned qw = (i < 4) ? u4_word(q0[r], i) : u4_word(q1[r], i - 4);
+                                int lo = pack_lo_nib(qw);
+                                int hi = pack_hi_nib(qw);
+                                dlo0[r] = dp4a_s32(lo, (int)xlo0, dlo0[r]);
+                                dlo1[r] = dp4a_s32(lo, (int)xlo1, dlo1[r]);
+                                dhi0[r] = dp4a_s32(hi, (int)xhi0, dhi0[r]);
+                                dhi1[r] = dp4a_s32(hi, (int)xhi1, dhi1[r]);
+                            }
+                        }
+#pragma unroll
+                        for (int r = 0; r < 4; ++r) {
+                            if (row0 + rg + r >= d) continue;
+                            int sc0, m0, sc1, m1;
+                            scale_min_hdr(p * 2, hdr[r], &sc0, &m0);
+                            scale_min_hdr(p * 2 + 1, hdr[r], &sc1, &m1);
+                            float dW = f16_bits(hdr[r].x & 0xffff);
+                            float dmin = f16_bits(hdr[r].x >> 16);
+                            if (live0) {
+                                a[rg + r] += (dW * (float)sc0) * s00 * (float)dlo0[r] - (dmin * (float)m0) * (u00.x + u00.y);
+                                a[rg + r] += (dW * (float)sc1) * s10 * (float)dhi0[r] - (dmin * (float)m1) * (u10.x + u10.y);
+                            }
+                            if (live1) {
+                                b[rg + r] += (dW * (float)sc0) * s01 * (float)dlo1[r] - (dmin * (float)m0) * (u01.x + u01.y);
+                                b[rg + r] += (dW * (float)sc1) * s11 * (float)dhi1[r] - (dmin * (float)m1) * (u11.x + u11.y);
+                            }
+                        }
                     }
-                    if (live1) {
-                        acc1 += (dW * (float)sc0) * s01 * (float)dlo1[r] - (dmin * (float)m0) * (u01.x + u01.y);
-                        acc1 += (dW * (float)sc1) * s11 * (float)dhi1[r] - (dmin * (float)m1) * (u11.x + u11.y);
-                    }
-                    mmqk_fold(&a0, &a1, &a2, &a3, r, acc0);
-                    mmqk_fold(&b0, &b1, &b2, &b3, r, acc1);
                 }
-            }
-        } else {
+            } else {
 #pragma unroll 1
-            for (int slot = 0; slot < 8; ++slot) {
-                int half = slot >> 2;
-                int piece = slot & 3;
-                int l0 = (piece & 1) * 16;
-                int hi_pair = piece >> 1;
-                int scoff = half * 8;
-                int is = l0 >> 4;
-                int s_a = scoff + is + (hi_pair ? 2 : 0);
-                int s_b = scoff + is + (hi_pair ? 6 : 4);
-                int g0 = b * 8 + half * 4 + (hi_pair ? 1 : 0);
-                int g2 = g0 + 2;
-                uint4 ql[ROWS], qh[ROWS];
-                int sca[ROWS], scb[ROWS];
-                float dW[ROWS];
-#pragma unroll
-                for (int r = 0; r < ROWS; ++r) {
-                    ql[r] = make_uint4(0, 0, 0, 0);
-                    qh[r] = make_uint4(0, 0, 0, 0);
-                    sca[r] = 0;
-                    scb[r] = 0;
-                    dW[r] = 0.f;
-                    int rr = row0 + r;
-                    if (rr < d) {
-                        const unsigned char* blk = wb + ((size_t)rr * (size_t)nb + (size_t)b) * 210;
-                        ql[r] = ld_u4_aligned(blk + slot * 16);
-                        qh[r] = ld_u4_aligned(blk + 128 + half * 32 + l0);
-                        sca[r] = (int)(signed char)blk[192 + s_a];
-                        scb[r] = (int)(signed char)blk[192 + s_b];
-                        dW[r] = ld_f16(blk + 208);
-                    }
-                }
-                int da0[ROWS], da1[ROWS], db0[ROWS], db1[ROWS];
-#pragma unroll
-                for (int r = 0; r < ROWS; ++r) {
-                    da0[r] = 0; da1[r] = 0; db0[r] = 0; db1[r] = 0;
-                }
-#pragma unroll
-                for (int i = 0; i < 4; ++i) {
-                    int k0 = (g0 * 32 + l0 + i * 4) >> 2;
-                    int k2 = (g2 * 32 + l0 + i * 4) >> 2;
-                    unsigned xa0 = 0, xa1 = 0, xb0 = 0, xb1 = 0;
+                for (int slot = 0; slot < 8; ++slot) {
+                    int half = slot >> 2;
+                    int piece = slot & 3;
+                    int l0 = (piece & 1) * 16;
+                    int hi_pair = piece >> 1;
+                    int scoff = half * 8;
+                    int is = l0 >> 4;
+                    int s_a = scoff + is + (hi_pair ? 2 : 0);
+                    int s_b = scoff + is + (hi_pair ? 6 : 4);
+                    int lg0 = half * 4 + (hi_pair ? 1 : 0);
+                    int lg2 = lg0 + 2;
+                    float sa0 = 0.f, sb0 = 0.f, sa1 = 0.f, sb1 = 0.f;
                     if (live0) {
-                        xa0 = xpack[(size_t)k0 * (size_t)T + tok0];
-                        xb0 = xpack[(size_t)k2 * (size_t)T + tok0];
+                        sa0 = scs[lg0 * BN + lane];
+                        sb0 = scs[lg2 * BN + lane];
                     }
                     if (live1) {
-                        xa1 = xpack[(size_t)k0 * (size_t)T + tok1];
-                        xb1 = xpack[(size_t)k2 * (size_t)T + tok1];
+                        sa1 = scs[lg0 * BN + 32 + lane];
+                        sb1 = scs[lg2 * BN + 32 + lane];
                     }
 #pragma unroll
-                    for (int r = 0; r < ROWS; ++r) {
-                        if (row0 + r >= d) continue;
-                        int qa, qb;
-                        q6_pack(u4_word(ql[r], i), u4_word(qh[r], i), hi_pair, &qa, &qb);
-                        da0[r] = dp4a_s32(qa, (int)xa0, da0[r]);
-                        da1[r] = dp4a_s32(qa, (int)xa1, da1[r]);
-                        db0[r] = dp4a_s32(qb, (int)xb0, db0[r]);
-                        db1[r] = dp4a_s32(qb, (int)xb1, db1[r]);
-                    }
-                }
-                float sa0 = 0.f, sb0 = 0.f, sa1 = 0.f, sb1 = 0.f;
-                if (live0) {
-                    sa0 = scale[(size_t)g0 * (size_t)T + tok0];
-                    sb0 = scale[(size_t)g2 * (size_t)T + tok0];
-                }
-                if (live1) {
-                    sa1 = scale[(size_t)g0 * (size_t)T + tok1];
-                    sb1 = scale[(size_t)g2 * (size_t)T + tok1];
-                }
+                    for (int rg = 0; rg < ROWS; rg += 4) {
+                        uint4 ql[4], qh[4];
+                        int sca[4], scb[4];
+                        float dW[4];
 #pragma unroll
-                for (int r = 0; r < ROWS; ++r) {
-                    if (row0 + r >= d) continue;
-                    float acc0 = 0.f, acc1 = 0.f;
-                    if (live0) {
-                        acc0 = dW[r] * (float)sca[r] * sa0 * (float)da0[r] + dW[r] * (float)scb[r] * sb0 * (float)db0[r];
+                        for (int r = 0; r < 4; ++r) {
+                            ql[r] = make_uint4(0, 0, 0, 0);
+                            qh[r] = make_uint4(0, 0, 0, 0);
+                            sca[r] = 0;
+                            scb[r] = 0;
+                            dW[r] = 0.f;
+                            int rr = row0 + rg + r;
+                            if (rr < d) {
+                                const unsigned char* blk = wb + ((size_t)rr * (size_t)nb + (size_t)sb) * 210;
+                                ql[r] = ld_u4_aligned(blk + slot * 16);
+                                qh[r] = ld_u4_aligned(blk + 128 + half * 32 + l0);
+                                sca[r] = (int)(signed char)blk[192 + s_a];
+                                scb[r] = (int)(signed char)blk[192 + s_b];
+                                dW[r] = ld_f16(blk + 208);
+                            }
+                        }
+                        int da0[4], da1[4], db0[4], db1[4];
+#pragma unroll
+                        for (int r = 0; r < 4; ++r) {
+                            da0[r] = 0; da1[r] = 0; db0[r] = 0; db1[r] = 0;
+                        }
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            int k0 = (lg0 * 32 + l0 + i * 4) >> 2;
+                            int k2 = (lg2 * 32 + l0 + i * 4) >> 2;
+                            unsigned xa0 = mmqk_xs(xs, k0, lane);
+                            unsigned xa1 = mmqk_xs(xs, k0, 32 + lane);
+                            unsigned xb0 = mmqk_xs(xs, k2, lane);
+                            unsigned xb1 = mmqk_xs(xs, k2, 32 + lane);
+#pragma unroll
+                            for (int r = 0; r < 4; ++r) {
+                                int qa, qb;
+                                q6_pack(u4_word(ql[r], i), u4_word(qh[r], i), hi_pair, &qa, &qb);
+                                da0[r] = dp4a_s32(qa, (int)xa0, da0[r]);
+                                da1[r] = dp4a_s32(qa, (int)xa1, da1[r]);
+                                db0[r] = dp4a_s32(qb, (int)xb0, db0[r]);
+                                db1[r] = dp4a_s32(qb, (int)xb1, db1[r]);
+                            }
+                        }
+#pragma unroll
+                        for (int r = 0; r < 4; ++r) {
+                            if (row0 + rg + r >= d) continue;
+                            if (live0) {
+                                a[rg + r] += dW[r] * (float)sca[r] * sa0 * (float)da0[r] + dW[r] * (float)scb[r] * sb0 * (float)db0[r];
+                            }
+                            if (live1) {
+                                b[rg + r] += dW[r] * (float)sca[r] * sa1 * (float)da1[r] + dW[r] * (float)scb[r] * sb1 * (float)db1[r];
+                            }
+                        }
                     }
-                    if (live1) {
-                        acc1 = dW[r] * (float)sca[r] * sa1 * (float)da1[r] + dW[r] * (float)scb[r] * sb1 * (float)db1[r];
-                    }
-                    mmqk_fold(&a0, &a1, &a2, &a3, r, acc0);
-                    mmqk_fold(&b0, &b1, &b2, &b3, r, acc1);
                 }
             }
         }
+        __syncthreads();
     }
     if (live0) {
-        if (row0 < d) out[(size_t)tok0 * (size_t)d + row0] = a0;
-        if (row0 + 1 < d) out[(size_t)tok0 * (size_t)d + row0 + 1] = a1;
-        if (row0 + 2 < d) out[(size_t)tok0 * (size_t)d + row0 + 2] = a2;
-        if (row0 + 3 < d) out[(size_t)tok0 * (size_t)d + row0 + 3] = a3;
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            int rr = row0 + r;
+            if (rr < d) out[(size_t)tok0 * (size_t)d + rr] = a[r];
+        }
     }
     if (live1) {
-        if (row0 < d) out[(size_t)tok1 * (size_t)d + row0] = b0;
-        if (row0 + 1 < d) out[(size_t)tok1 * (size_t)d + row0 + 1] = b1;
-        if (row0 + 2 < d) out[(size_t)tok1 * (size_t)d + row0 + 2] = b2;
-        if (row0 + 3 < d) out[(size_t)tok1 * (size_t)d + row0 + 3] = b3;
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            int rr = row0 + r;
+            if (rr < d) out[(size_t)tok1 * (size_t)d + rr] = b[r];
+        }
     }
 }
 
