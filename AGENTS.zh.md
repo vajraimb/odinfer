@@ -179,7 +179,7 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
 
 ## 已验证的坑（不要再踩）
 
-- CUDA 预填充的 `pgemm`（fp16 反量化进共享内存再 WMMA）在 V100 上结果正确但比标量块慢（9B 16000 token 154 对 183 tok/s）。同一个 K 上写 32 行 fp16 是 32 路 bank 冲突，64 token 的 N 块在 128 token 的 chunk 里把每个权重反量化两遍。不再启动。`mmqk`（q8 + dp4a）是默认。全局 X 的块在那台 V100 上更快（9B 16000 token 246 对 213 tok/s，27B 8000 token 93 对 80）。32 行的块更快（9B 16000 token 290 对 246 tok/s，27B 8000 token 113 对 93）。Q4 现在每个 warp 8 行（launch_bounds 下 128 个寄存器，没有 spill）。Q6 在 8 行时会 spill，所以仍是每个 warp 4 行。gate+up 和 K+V 共用一份 q8。这个内核还没有计时。
+- CUDA 预填充的 `pgemm`（fp16 反量化进共享内存再 WMMA）在 V100 上结果正确但比标量块慢（9B 16000 token 154 对 183 tok/s）。同一个 K 上写 32 行 fp16 是 32 路 bank 冲突，64 token 的 N 块在 128 token 的 chunk 里把每个权重反量化两遍。不再启动。`mmqk`（q8 + dp4a）是默认。全局 X 的块在那台 V100 上更快（9B 16000 token 246 对 213 tok/s，27B 8000 token 93 对 80）。32 行的块更快（9B 16000 token 290 对 246 tok/s，27B 8000 token 113 对 93）。后来的 64 行 Q4 块更慢（9B 8000 token 333 对 337），只在 `ODINFER_CUDA_MMQK_ROWS=8` 时启用。Q6 在 8 行时会 spill，所以仍是每个 warp 4 行。gate+up 和 K+V 融合差不多持平，只在 `ODINFER_CUDA_PREFILL_FUSE=1` 时启用。预填充注意力里向量化的 KV 反量化留下了（9B 8000 的 attn 3872 对 4161 ms）。
 - GEMV 内核形状：本机（M3）最优 = 256 线程/32 行/8 lanes；其余多行/多线程/
   融合变体实测回归（数据在 packages/qwen3_5/README.md 与 gemm_harness）。
 - 内核计时必须**墙钟 + 正确性验证**：GPU 计时器（GPUEndTime）对短 dispatch

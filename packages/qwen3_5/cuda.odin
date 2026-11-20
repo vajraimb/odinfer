@@ -49,6 +49,10 @@ CUDA_MAX_BATCH :: 128
 // for the whole model, and it stays bit-identical to the previous decode.
 ATTN_PART :: 32
 ATTN_PART_MIN :: 128
+// Long decode uses 128 positions per block so the partial buffer and the
+// reduce shrink by 4x, and K/V are dequantized once per position.
+ATTN_LONG_PART :: 128
+ATTN_LONG_MIN :: 2048
 // cuLaunchKernel grid.y maximum. Split attention uses one block per part.
 CUDA_GRID_Y_MAX :: 65535
 // Q5_0 / Q8_0 below this stay on the old GEMV. The new kernel lost at 2048x2048.
@@ -182,9 +186,13 @@ g_tc2: bool // Q4_K / Q6_K prefill uses the block-dequant WMMA kernel
 @(private)
 g_prefill_gemm: bool // Q4_K / Q6_K T>1 uses mmqk dp4a; ODINFER_CUDA_PREFILL_GEMM=0 keeps tc/tc2
 @(private)
-g_prefill_fuse: bool // gate+up and K+V share one q8 stage; ODINFER_CUDA_PREFILL_FUSE=0 launches them apart
+g_prefill_fuse: bool // gate+up and K+V share one q8 stage; ODINFER_CUDA_PREFILL_FUSE=1 opts in
 @(private)
-g_mmqk_wide: bool // Q4 tile is 64 rows; ODINFER_CUDA_MMQK_ROWS=4 keeps the timed 32-row tile
+g_mmqk_wide: bool // Q4 tile is 64 rows only when ODINFER_CUDA_MMQK_ROWS=8; default is the timed 32-row tile
+@(private)
+g_attn_long: bool // decode npos>=2048 uses 128-wide parts; ODINFER_CUDA_ATTN_LONG=0 keeps 32
+@(private)
+g_delta_wmma: bool // chunked gated-delta WMMA; ODINFER_CUDA_DELTA_WMMA=1, default off
 @(private)
 g_mmq_ok: bool
 @(private)
@@ -254,9 +262,9 @@ k_gemv2r1_q4, k_gemv2r1_q6: cu.Function
 @(private)
 k_rmsnorm, k_qnorm, k_rope, k_gate, k_gate_q, k_swiglu, k_swiglu_q, k_residual, k_axpy: cu.Function
 @(private)
-k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v, k_attn_part, k_attn_red, k_attn_flash, k_attn_wmma, k_attn_wred: cu.Function
+k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v, k_attn_part, k_attn_red, k_attn_long4, k_attn_long6, k_attn_flash, k_attn_wmma, k_attn_wred: cu.Function
 @(private)
-k_conv, k_l2, k_delta, k_delta_chunk, k_delta_sm, k_rmsgate, k_rmsgate_q, k_moe_topk: cu.Function
+k_conv, k_l2, k_delta, k_delta_chunk, k_delta_sm, k_delta_wmma, k_rmsgate, k_rmsgate_q, k_moe_topk: cu.Function
 @(private)
 k_tc2_q4, k_tc2_q6, k_tc2s_q4, k_tc2s_q6, k_tc2m_q4, k_tc2m_q6, k_tc2r_q4, k_tc2r_q6: cu.Function
 @(private)
@@ -842,7 +850,7 @@ launch_mmqk :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d, tcount: 
 	wb, yy := w, y
 	dd := i32(d)
 	args := [?]rawptr{&wb, &qp, &sc, &sm, &yy, &nn, &dd, &tt}
-	// Q4 default is 8 rows/warp (64 rows). Q6, and Q4 with MMQK_ROWS=4, are 32.
+	// Q4 default is 4 rows/warp (32 rows). ODINFER_CUDA_MMQK_ROWS=8 is the 64-row tile.
 	bm := 32
 	if wide {
 		bm = 64
@@ -1404,9 +1412,46 @@ attn_q8v_part_launch :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos: int) -> bool {
 }
 
 @(private)
+attn_long_smem :: proc(mul: int) -> u32 {
+	// sq, scores, (max, sum) per head, and one dequantized V vector.
+	return u32((mul * g_head + mul * ATTN_LONG_PART + mul * 2 + g_head) * 4)
+}
+
+@(private)
+attn_q8v_long_launch :: proc(fn: cu.Function, mul: int, q, kc, vc, xb3: cu.Device_Ptr, pos: int) -> bool {
+	npos := pos + 1
+	nsplit := (npos + ATTN_LONG_PART - 1) / ATTN_LONG_PART
+	a, b, c := q, kc, vc
+	pm, pl, po := d_part_m, d_part_l, d_part_o
+	hd := i32(g_head)
+	kb, vb := i32(g_k_pos), i32(g_v_pos)
+	km, nh := i32(mul), i32(g_heads)
+	ps, part := i32(pos), i32(ATTN_LONG_PART)
+	slot: cu.Device_Ptr
+	args := [?]rawptr{&a, &b, &c, &pm, &pl, &po, &hd, &kb, &vb, &km, &nh, &ps, &part, &slot}
+	if !klaunch(fn, u32(g_kv_heads), u32(nsplit), 1, 128, 1, 1, args[:], "attn_long", attn_long_smem(mul)) {
+		return false
+	}
+	out := xb3
+	ns := i32(nsplit)
+	rargs := [?]rawptr{&out, &pm, &pl, &po, &hd, &nh, &ns}
+	return klaunch(k_attn_red, u32(g_heads), 1, 1, 128, 1, 1, rargs[:], "attn_red")
+}
+
+@(private)
 attn_q8v_dispatch :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos: int) -> bool {
 	if pos < 0 || !attn_part_ok(pos + 1) {
 		return attn_q8v_call(q, kc, vc, xb3, pos)
+	}
+	npos := pos + 1
+	if g_attn_long && npos >= ATTN_LONG_MIN && g_head == 256 {
+		mul := g_heads / g_kv_heads
+		if mul == 4 && k_attn_long4 != nil {
+			return attn_q8v_long_launch(k_attn_long4, 4, q, kc, vc, xb3, pos)
+		}
+		if mul == 6 && k_attn_long6 != nil {
+			return attn_q8v_long_launch(k_attn_long6, 6, q, kc, vc, xb3, pos)
+		}
 	}
 	return attn_q8v_part_launch(q, kc, vc, xb3, pos)
 }
@@ -1448,6 +1493,11 @@ launch_delta_chunk :: proc(outp, state, q, k, v, b, a, decay, dt: cu.Device_Ptr,
 	// 128x128 is 64 KiB, past the 48 KiB default, so this needs the attribute
 	// set at bind time. A larger head stays on the global kernel.
 	bytes := hkd * hvd * 4
+	// Chunked WY + WMMA. Default off: fp16 operands drift, and the recurrent
+	// kernel is the text-matched path. 128x128 only; other heads stay here.
+	if g_delta_wmma && k_delta_wmma != nil && hkd == 128 && hvd == 128 {
+		return klaunch(k_delta_wmma, u32(nvh), 1, 1, 256, 1, 1, args[:], "delta_wmma", 49152)
+	}
 	if g_delta_sm && k_delta_sm != nil && bytes > 0 && bytes <= 65536 {
 		return klaunch(k_delta_sm, u32(nvh), 1, 1, 128, 1, 1, args[:], "delta_sm", u32(bytes))
 	}
@@ -1520,6 +1570,8 @@ bind_kernels :: proc() -> bool {
 	k_attn_q8v = get_fn("attention_q8v")
 	k_attn_part = get_fn("attention_q8v_part")
 	k_attn_red = get_fn("attention_q8v_reduce")
+	k_attn_long4 = get_fn("attention_q8v_long4")
+	k_attn_long6 = get_fn("attention_q8v_long6")
 	k_attn_flash = get_fn("attention_q8v_flash")
 	k_attn_wmma = get_fn("attention_q8v_wmma")
 	k_attn_wred = get_fn("attention_q8v_wmma_reduce")
@@ -1528,6 +1580,7 @@ bind_kernels :: proc() -> bool {
 	k_delta = get_fn("delta_recurrent")
 	k_delta_chunk = get_fn("delta_recurrent_chunk")
 	k_delta_sm = get_fn("delta_recurrent_chunk_sm")
+	k_delta_wmma = get_fn("delta_chunk_wmma")
 	k_pgemm_q4 = get_fn("pgemm_q4_k")
 	k_pgemm_q6 = get_fn("pgemm_q6_k")
 	k_quant_batch = get_fn("quant_q8_batch")
@@ -1562,8 +1615,8 @@ bind_kernels :: proc() -> bool {
 	k_gemv2r1_q6 = get_fn("gemv2r1_q6_k")
 	handles := [?]cu.Function{
 		k_rmsnorm, k_qnorm, k_rope, k_gate, k_swiglu, k_residual, k_axpy,
-		k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v, k_attn_part, k_attn_red, k_attn_flash, k_attn_wmma, k_attn_wred,
-		k_conv, k_l2, k_delta, k_delta_chunk, k_delta_sm, k_rmsgate, k_rmsgate_q, k_moe_topk,
+		k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v, k_attn_part, k_attn_red, k_attn_long4, k_attn_long6, k_attn_flash, k_attn_wmma, k_attn_wred,
+		k_conv, k_l2, k_delta, k_delta_chunk, k_delta_sm, k_delta_wmma, k_rmsgate, k_rmsgate_q, k_moe_topk,
 		k_gate_q, k_swiglu_q,
 		k_tc2_q4, k_tc2_q6, k_tc2s_q4, k_tc2s_q6, k_tc2m_q4, k_tc2m_q6, k_tc2r_q4, k_tc2r_q6,
 		k_quant, k_rmsnorm_q8, k_res_norm, k_gemv2_q4, k_gemv2_q4nc, k_gemv2_q4x, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50,
@@ -1939,8 +1992,12 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	g_tc2 = os.get_env("ODINFER_CUDA_TC2", context.temp_allocator) != "0"
 	// Default on. =0 keeps tc2 for T<=64 and the scalar tile for T>64.
 	g_prefill_gemm = os.get_env("ODINFER_CUDA_PREFILL_GEMM", context.temp_allocator) != "0"
-	g_prefill_fuse = os.get_env("ODINFER_CUDA_PREFILL_FUSE", context.temp_allocator) != "0"
-	g_mmqk_wide = os.get_env("ODINFER_CUDA_MMQK_ROWS", context.temp_allocator) != "4"
+	// Fusion was neutral on the V100 and the linear bucket got slower, so it
+	// stays available and off. The 64-row Q4 tile was slower than 32.
+	g_prefill_fuse = os.get_env("ODINFER_CUDA_PREFILL_FUSE", context.temp_allocator) == "1"
+	g_mmqk_wide = os.get_env("ODINFER_CUDA_MMQK_ROWS", context.temp_allocator) == "8"
+	g_attn_long = os.get_env("ODINFER_CUDA_ATTN_LONG", context.temp_allocator) != "0"
+	g_delta_wmma = os.get_env("ODINFER_CUDA_DELTA_WMMA", context.temp_allocator) == "1"
 	g_chunk_req = 512
 	if s := os.get_env("ODINFER_CUDA_PREFILL_CHUNK", context.temp_allocator); s != "" {
 		if v, ok := strconv.parse_int(s); ok && v >= 16 && v <= 512 && v % 16 == 0 {
@@ -2235,21 +2292,24 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	}
 	fmt.eprintfln("cuda: tensor cores %s  WMMA 16x16x16 fp16, fp32 acc", tc_note)
 	if g_prefill_gemm {
-		fmt.eprintln("cuda: prefill gemm on for Q4_K/Q6_K T>1 (mmqk, q8 in smem, dp4a, Q4 64 rows x 64 tokens, Q6 32 rows). ODINFER_CUDA_PREFILL_GEMM=0 keeps tc2/tc. Not timed on a V100")
+		fmt.eprintln("cuda: prefill gemm on for Q4_K/Q6_K T>1 (mmqk, q8 in smem, dp4a, 32 rows x 64 tokens). ODINFER_CUDA_PREFILL_GEMM=0 keeps tc2/tc")
 		if g_prefill_fuse {
-			fmt.eprintln("cuda: prefill fuse on (gate+up and K+V share one q8 stage). ODINFER_CUDA_PREFILL_FUSE=0 launches them apart")
+			fmt.eprintln("cuda: prefill fuse on (gate+up and K+V share one q8 stage). It was neutral on a V100")
 		} else {
-			fmt.eprintln("cuda: prefill fuse off (ODINFER_CUDA_PREFILL_FUSE=0)")
+			fmt.eprintln("cuda: prefill fuse off. ODINFER_CUDA_PREFILL_FUSE=1 shares one q8 stage for gate+up and K+V")
 		}
 		if g_mmqk_wide {
-			fmt.eprintln("cuda: Q4 mmqk tile is 64 rows. ODINFER_CUDA_MMQK_ROWS=4 keeps the timed 32-row tile")
+			fmt.eprintln("cuda: Q4 mmqk tile is 64 rows (ODINFER_CUDA_MMQK_ROWS=8). Slower than 32 on a V100")
 		} else {
-			fmt.eprintln("cuda: Q4 mmqk tile is 32 rows (ODINFER_CUDA_MMQK_ROWS=4)")
+			fmt.eprintln("cuda: Q4 mmqk tile is 32 rows. ODINFER_CUDA_MMQK_ROWS=8 selects the slower 64-row tile")
 		}
 	} else {
 		fmt.eprintln("cuda: prefill gemm off (ODINFER_CUDA_PREFILL_GEMM=0)")
 	}
 	fmt.eprintfln("cuda: prefill chunk {} (ODINFER_CUDA_PREFILL_CHUNK, default 512)", chosen)
+	if g_delta_wmma {
+		fmt.eprintln("cuda: delta wmma on for 128x128 prefill chunks (WY, fp16 tensor cores). Not the text-matched path. ODINFER_CUDA_DELTA_WMMA=0 is the recurrent kernel")
+	}
 	if g_delta_sm {
 		fmt.eprintln("cuda: delta prefill keeps a head state of at most 64 KiB in shared memory")
 	}
@@ -2336,6 +2396,9 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	split_live := g_attn_split && d_part_m != 0 && g_head >= 32 && g_head <= 256 && g_head % 32 == 0 && g_kv_heads > 0 && g_heads / g_kv_heads >= 1 && g_heads / g_kv_heads <= 16 && (g_heads / g_kv_heads) * g_kv_heads == g_heads
 	if split_live {
 		fmt.eprintln("cuda: attn split on for mixed-V decode when npos>=128 (32-token parts + reduce). ODINFER_CUDA_ATTN_SPLIT=0 is the one-block kernel for decode")
+		if g_attn_long && g_head == 256 {
+			fmt.eprintln("cuda: attn long on for npos>=2048 (128 positions, K dequant once per query group, V dequant once). ODINFER_CUDA_ATTN_LONG=0 keeps 32-token parts")
+		}
 	} else if !g_attn_split {
 		fmt.eprintln("cuda: attn split off (ODINFER_CUDA_ATTN_SPLIT=0)")
 	} else {

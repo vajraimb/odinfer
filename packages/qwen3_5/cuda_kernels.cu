@@ -1041,6 +1041,137 @@ extern "C" __global__ void attention_q8v_reduce(float* xb3, const float* part_m,
     if (has1) xb3[(size_t)h * (size_t)head_dim + i1] = acc1 * inv;
 }
 
+/* Long-context decode attention. One block owns one KV head and 128
+   positions (one thread, one position). K is dequantized once per position
+   and dotted with every query head in the GQA group. V is dequantized once
+   per position into smem and reused across those heads. The block softmax
+   is one partial; attention_q8v_reduce merges partials. head_dim is 256.
+   MUL is 4 (9B) or 6 (27B). Shorter contexts stay on attention_q8v_part
+   (32 positions, one per lane). ODINFER_CUDA_ATTN_LONG=0 keeps that path
+   at every length. blockDim is 128. */
+template<int MUL>
+__device__ void attention_q8v_long_run(const float* q, const unsigned char* kc, const unsigned char* vc,
+                                       float* part_m, float* part_l, float* part_o,
+                                       int head_dim, int k_pos_bytes, int v_pos_bytes, int n_heads,
+                                       int pos, int part, const int* pos_slot) {
+    int kvh = (int)blockIdx.x;
+    int tid = (int)threadIdx.x;
+    int npos = live_pos(pos, pos_slot) + 1;
+    int begin = (int)blockIdx.y * 128;
+    extern __shared__ __align__(16) unsigned char long_smem[];
+    float* sq = (float*)long_smem;
+    float* scores = sq + MUL * 256;
+    float* meta = scores + MUL * 128;
+    float* sv = meta + MUL * 2;
+    if (head_dim != 256 || part != 128) return;
+    if (begin >= npos) {
+        if (tid < MUL) {
+            int h = kvh * MUL + tid;
+            size_t si = (size_t)blockIdx.y * (size_t)n_heads + (size_t)h;
+            part_m[si] = -1e30f;
+            part_l[si] = 0.f;
+        }
+        for (int qi = 0; qi < MUL; ++qi) {
+            int h = kvh * MUL + qi;
+            size_t si = (size_t)blockIdx.y * (size_t)n_heads + (size_t)h;
+            for (int i = tid; i < 256; i += 128) part_o[si * 256 + i] = 0.f;
+        }
+        return;
+    }
+    int nlocal = npos - begin;
+    if (nlocal > 128) nlocal = 128;
+    const float* qg = q + (size_t)kvh * (size_t)MUL * 256;
+    for (int i = tid; i < MUL * 256; i += 128) sq[i] = qg[i];
+    __syncthreads();
+    float dots[MUL];
+#pragma unroll
+    for (int qi = 0; qi < MUL; ++qi) dots[qi] = 0.f;
+    if (tid < nlocal) {
+        const unsigned char* krow = kc + ((size_t)(begin + tid) * (size_t)k_pos_bytes + (size_t)kvh * 272);
+#pragma unroll
+        for (int b = 0; b < 8; ++b) {
+            const unsigned char* bb = krow + b * 34;
+            float d = ld_f16(bb);
+#pragma unroll
+            for (int j = 0; j < 32; ++j) {
+                float kv = d * (float)(signed char)bb[2 + j];
+                int col = b * 32 + j;
+#pragma unroll
+                for (int qi = 0; qi < MUL; ++qi) dots[qi] += sq[qi * 256 + col] * kv;
+            }
+        }
+    }
+    float scale = rsqrtf(256.f);
+#pragma unroll
+    for (int qi = 0; qi < MUL; ++qi) {
+        float s = (tid < nlocal) ? dots[qi] * scale : -1e30f;
+        float m = block_max_128(s);
+        float e = (tid < nlocal) ? expf(s - m) : 0.f;
+        float lsum = block_sum_128(e);
+        scores[qi * 128 + tid] = e;
+        if (tid == 0) {
+            meta[qi * 2] = m;
+            meta[qi * 2 + 1] = lsum;
+        }
+    }
+    __syncthreads();
+    float a0[MUL], a1[MUL];
+#pragma unroll
+    for (int qi = 0; qi < MUL; ++qi) {
+        a0[qi] = 0.f;
+        a1[qi] = 0.f;
+    }
+    for (int t = 0; t < nlocal; ++t) {
+        const unsigned char* vrow = vc + ((size_t)(begin + t) * (size_t)v_pos_bytes + (size_t)kvh * 320);
+#pragma unroll
+        for (int rep = 0; rep < 2; ++rep) {
+            int i = tid + rep * 128;
+            int b = i >> 5;
+            int j = i & 31;
+            const unsigned char* vb = vrow + b * 40;
+            float d = ld_f16(vb);
+            int idx = (int)vb[2];
+            float ov = ld_f16(vb + 4);
+            sv[i] = (j == idx) ? ov : d * (float)(signed char)vb[6 + j];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int qi = 0; qi < MUL; ++qi) {
+            float w = scores[qi * 128 + t];
+            a0[qi] += w * sv[tid];
+            a1[qi] += w * sv[tid + 128];
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int qi = 0; qi < MUL; ++qi) {
+        int h = kvh * MUL + qi;
+        size_t si = (size_t)blockIdx.y * (size_t)n_heads + (size_t)h;
+        part_o[si * 256 + tid] = a0[qi];
+        part_o[si * 256 + tid + 128] = a1[qi];
+        if (tid == 0) {
+            part_m[si] = meta[qi * 2];
+            part_l[si] = meta[qi * 2 + 1];
+        }
+    }
+}
+
+extern "C" __global__ void attention_q8v_long4(const float* q, const unsigned char* kc, const unsigned char* vc,
+                                               float* part_m, float* part_l, float* part_o,
+                                               int head_dim, int k_pos_bytes, int v_pos_bytes, int kv_mul, int n_heads,
+                                               int pos, int part, const int* pos_slot) {
+    (void)kv_mul;
+    attention_q8v_long_run<4>(q, kc, vc, part_m, part_l, part_o, head_dim, k_pos_bytes, v_pos_bytes, n_heads, pos, part, pos_slot);
+}
+
+extern "C" __global__ void attention_q8v_long6(const float* q, const unsigned char* kc, const unsigned char* vc,
+                                               float* part_m, float* part_l, float* part_o,
+                                               int head_dim, int k_pos_bytes, int v_pos_bytes, int kv_mul, int n_heads,
+                                               int pos, int part, const int* pos_slot) {
+    (void)kv_mul;
+    attention_q8v_long_run<6>(q, kc, vc, part_m, part_l, part_o, head_dim, k_pos_bytes, v_pos_bytes, n_heads, pos, part, pos_slot);
+}
+
 /* Prefill flash attention for the mixed-V cache. One block owns one KV
    head and `br` query tokens (the last tile of the chunk may be shorter).
    It stages 32-token K and V tiles once and reuses them across every query
@@ -1762,6 +1893,246 @@ __device__ __forceinline__ void wmma_mma_rr(float& c0, float& c1, float& c2, flo
         : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3), "+f"(c4), "+f"(c5), "+f"(c6), "+f"(c7)
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a6), "r"(a7),
           "r"(b0), "r"(b1), "r"(b2), "r"(b3), "r"(b4), "r"(b5), "r"(b6), "r"(b7));
+}
+
+/* Chunked gated delta rule for a 128x128 state. One block per value head,
+   256 threads. A chunk of 16 tokens is the WY form used by the flash-linear-
+   attention reference (strictly-lower key system, solved in fp32, then the
+   state products). Those products are WMMA 16x16x16: fp16 operands, fp32
+   accumulate. The same recurrence in fp32 is the default; this kernel is
+   ODINFER_CUDA_DELTA_WMMA=1. It is not bit-exact. cuda_selftest allows
+   2e-3 against delta_recurrent_step on 128x128, including a partial chunk.
+   Head dims other than 128 stay on delta_recurrent_chunk_sm. */
+extern "C" __global__ void delta_chunk_wmma(float* out, float* state_all, const float* q_lin, const float* k_lin,
+                                            const float* v_vec, const float* b_vec, const float* a_vec,
+                                            const float* a_decay, const float* dt_bias,
+                                            int head_k_dim, int head_v_dim, int n_k_heads, int n_v_heads, int T,
+                                            int q_stride, int v_stride) {
+    if (head_k_dim != 128 || head_v_dim != 128) return;
+    const int tid = (int)threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int vh = (int)blockIdx.x;
+    const int kh = vh % n_k_heads;
+    float* state = state_all + (size_t)vh * 128 * 128;
+    extern __shared__ __align__(16) unsigned char delta_wmma_sm[];
+    float* kbuf = (float*)delta_wmma_sm;
+    float* vbuf = kbuf + 2048;
+    float* qbuf = vbuf + 2048;
+    float* cdbuf = qbuf + 2048;
+    float* att = cdbuf + 2048;
+    float* attq = att + 256;
+    float* decay = attq + 256;
+    float* beta = decay + 16;
+    float* row = beta + 16;
+    unsigned short* As = (unsigned short*)(delta_wmma_sm + 35456);
+    unsigned short* Bs = As + 512;
+    float* store = (float*)(delta_wmma_sm + 40576);
+
+    for (int base = 0; base < T; base += 16) {
+        int nloc = T - base;
+        if (nloc > 16) nloc = 16;
+        for (int e = tid; e < 2048; e += 256) {
+            kbuf[e] = 0.f;
+            qbuf[e] = 0.f;
+            vbuf[e] = 0.f;
+        }
+        if (tid < 16) {
+            beta[tid] = 0.f;
+            decay[tid] = 1.f;
+            if (tid < nloc) {
+                int t = base + tid;
+                beta[tid] = sigmoid_stable(b_vec[(size_t)t * (size_t)n_v_heads + vh]);
+                float gd = expf(a_decay[vh] * softplus_stable(a_vec[(size_t)t * (size_t)n_v_heads + vh] + dt_bias[vh]));
+                if (gd < 1e-20f) gd = 1e-20f;
+                if (gd > 1.f) gd = 1.f;
+                decay[tid] = gd;
+            }
+        }
+        for (int e = tid; e < nloc * 128; e += 256) {
+            int tok = e >> 7;
+            int d = e & 127;
+            int t = base + tok;
+            kbuf[e] = k_lin[(size_t)t * (size_t)q_stride + (size_t)kh * 128 + d];
+            qbuf[e] = q_lin[(size_t)t * (size_t)q_stride + (size_t)kh * 128 + d];
+            vbuf[e] = v_vec[(size_t)t * (size_t)v_stride + (size_t)vh * 128 + d];
+        }
+        __syncthreads();
+        {
+            int i = tid >> 4;
+            int j = tid & 15;
+            float dk = 0.f, dq = 0.f;
+            for (int d = 0; d < 128; ++d) {
+                float kd = kbuf[j * 128 + d];
+                dk += kbuf[i * 128 + d] * kd;
+                dq += qbuf[i * 128 + d] * kd;
+            }
+            att[i * 16 + j] = dk;
+            attq[i * 16 + j] = dq;
+        }
+        __syncthreads();
+        if (tid == 0) {
+            float dec[16];
+            float sum = 0.f;
+            for (int i = 0; i < 16; ++i) {
+                sum += logf(decay[i]);
+                dec[i] = sum;
+            }
+            float L[256], M[256];
+            for (int i = 0; i < 16; ++i) {
+                for (int j = 0; j < 16; ++j) {
+                    float ell = (i >= j) ? expf(dec[i] - dec[j]) : 0.f;
+                    L[i * 16 + j] = ell;
+                    float kk = att[i * 16 + j];
+                    M[i * 16 + j] = (j < i) ? -beta[i] * kk * ell : 0.f;
+                }
+            }
+            for (int i = 1; i < 16; ++i) {
+                float old[16];
+                for (int p = 0; p < i; ++p) old[p] = M[i * 16 + p];
+                for (int j = 0; j < i; ++j) {
+                    float s = old[j];
+                    for (int p = 0; p < i; ++p) s += old[p] * M[p * 16 + j];
+                    M[i * 16 + j] = s;
+                }
+            }
+            for (int i = 0; i < 16; ++i) {
+                for (int j = 0; j < 16; ++j) {
+                    float a = M[i * 16 + j];
+                    if (i == j) a += 1.f;
+                    att[i * 16 + j] = a;
+                    float qk = attq[i * 16 + j];
+                    attq[i * 16 + j] = (j <= i) ? qk * L[i * 16 + j] : 0.f;
+                }
+            }
+            for (int i = 0; i < 16; ++i) decay[i] = dec[i];
+        }
+        __syncthreads();
+        for (int i = 0; i < 16; ++i) {
+            for (int d = tid; d < 128; d += 256) {
+                float s = 0.f;
+                float qe = qbuf[i * 128 + d] * expf(decay[i]);
+                for (int p = 0; p < 16; ++p) {
+                    float w = kbuf[p * 128 + d] * beta[p] * expf(decay[p]);
+                    s += att[i * 16 + p] * w;
+                }
+                row[d] = s;
+                qbuf[i * 128 + d] = qe;
+            }
+            __syncthreads();
+            for (int d = tid; d < 128; d += 256) cdbuf[i * 128 + d] = row[d];
+            __syncthreads();
+        }
+        for (int i = 0; i < 16; ++i) {
+            for (int d = tid; d < 128; d += 256) {
+                float s = 0.f;
+                for (int p = 0; p < 16; ++p) s += att[i * 16 + p] * vbuf[p * 128 + d] * beta[p];
+                row[d] = s;
+            }
+            __syncthreads();
+            for (int d = tid; d < 128; d += 256) kbuf[i * 128 + d] = row[d];
+            __syncthreads();
+        }
+        float vp0 = 0.f, vp1 = 0.f, vp2 = 0.f, vp3 = 0.f, vp4 = 0.f, vp5 = 0.f, vp6 = 0.f, vp7 = 0.f;
+        float oi0 = 0.f, oi1 = 0.f, oi2 = 0.f, oi3 = 0.f, oi4 = 0.f, oi5 = 0.f, oi6 = 0.f, oi7 = 0.f;
+        int v0 = warp * 16;
+        for (int kk = 0; kk < 8; ++kk) {
+            int k0 = kk * 16;
+            if (warp == 0) {
+                for (int e = lane; e < 256; e += 32) {
+                    int r = e >> 4;
+                    int c = e & 15;
+                    As[r * 16 + c] = f32_to_f16(cdbuf[r * 128 + k0 + c]);
+                    As[256 + r * 16 + c] = f32_to_f16(qbuf[r * 128 + k0 + c]);
+                }
+            }
+            unsigned short* Bt = Bs + warp * 256;
+            for (int e = lane; e < 256; e += 32) {
+                int r = e >> 4;
+                int c = e & 15;
+                Bt[r * 16 + c] = f32_to_f16(state[((size_t)k0 + r) * 128 + v0 + c]);
+            }
+            __syncthreads();
+            unsigned a0, a1, a2, a3, a4, a5, a6, a7;
+            unsigned b0, b1, b2, b3, b4, b5, b6, b7;
+            unsigned aq0, aq1, aq2, aq3, aq4, aq5, aq6, aq7;
+            wmma_load_a(a0, a1, a2, a3, a4, a5, a6, a7, As, 16);
+            wmma_load_a(aq0, aq1, aq2, aq3, aq4, aq5, aq6, aq7, As + 256, 16);
+            wmma_load_b_row(b0, b1, b2, b3, b4, b5, b6, b7, Bt, 16);
+            wmma_mma_rr(vp0, vp1, vp2, vp3, vp4, vp5, vp6, vp7, a0, a1, a2, a3, a4, a5, a6, a7, b0, b1, b2, b3, b4, b5, b6, b7);
+            wmma_mma_rr(oi0, oi1, oi2, oi3, oi4, oi5, oi6, oi7, aq0, aq1, aq2, aq3, aq4, aq5, aq6, aq7, b0, b1, b2, b3, b4, b5, b6, b7);
+            __syncthreads();
+        }
+        float* mine = store + warp * 256;
+        wmma_store(mine, 16, vp0, vp1, vp2, vp3, vp4, vp5, vp6, vp7);
+        for (int e = lane; e < 256; e += 32) {
+            int r = e >> 4;
+            int c = e & 15;
+            vbuf[r * 128 + v0 + c] = mine[r * 16 + c];
+        }
+        wmma_store(mine, 16, oi0, oi1, oi2, oi3, oi4, oi5, oi6, oi7);
+        for (int e = lane; e < 256; e += 32) {
+            int r = e >> 4;
+            int c = e & 15;
+            cdbuf[r * 128 + v0 + c] = mine[r * 16 + c];
+        }
+        __syncthreads();
+        for (int e = tid; e < 2048; e += 256) vbuf[e] = kbuf[e] - vbuf[e];
+        __syncthreads();
+        for (int i = 0; i < 16; ++i) {
+            for (int d = tid; d < 128; d += 256) {
+                float s = cdbuf[i * 128 + d];
+                for (int p = 0; p < 16; ++p) s += attq[i * 16 + p] * vbuf[p * 128 + d];
+                row[d] = s;
+            }
+            __syncthreads();
+            for (int d = tid; d < 128; d += 256) cdbuf[i * 128 + d] = row[d];
+            __syncthreads();
+            if (i < nloc) {
+                float* oout = out + ((size_t)(base + i) * (size_t)n_v_heads + (size_t)vh) * 128;
+                for (int d = tid; d < 128; d += 256) oout[d] = cdbuf[i * 128 + d];
+            }
+            __syncthreads();
+        }
+        float last = expf(decay[15]);
+        for (int nt = 0; nt < 8; ++nt) {
+            int col = nt * 16;
+            int k0 = warp * 16;
+            unsigned short* tile = Bs + warp * 256;
+            for (int e = lane; e < 256; e += 32) {
+                int r = e >> 4;
+                int c = e & 15;
+                float ks = 0.f;
+                if (c < nloc) {
+                    int t = base + c;
+                    float kd = k_lin[(size_t)t * (size_t)q_stride + (size_t)kh * 128 + (k0 + r)];
+                    ks = kd * expf(decay[15] - decay[c]);
+                }
+                tile[r * 16 + c] = f32_to_f16(ks);
+            }
+            __syncwarp();
+            unsigned a0, a1, a2, a3, a4, a5, a6, a7;
+            unsigned b0, b1, b2, b3, b4, b5, b6, b7;
+            float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f, c4 = 0.f, c5 = 0.f, c6 = 0.f, c7 = 0.f;
+            wmma_load_a(a0, a1, a2, a3, a4, a5, a6, a7, tile, 16);
+            for (int e = lane; e < 256; e += 32) {
+                int r = e >> 4;
+                int c = e & 15;
+                tile[r * 16 + c] = f32_to_f16(vbuf[r * 128 + col + c]);
+            }
+            __syncwarp();
+            wmma_load_b_row(b0, b1, b2, b3, b4, b5, b6, b7, tile, 16);
+            wmma_mma_rr(c0, c1, c2, c3, c4, c5, c6, c7, a0, a1, a2, a3, a4, a5, a6, a7, b0, b1, b2, b3, b4, b5, b6, b7);
+            wmma_store(mine, 16, c0, c1, c2, c3, c4, c5, c6, c7);
+            for (int e = lane; e < 256; e += 32) {
+                int r = e >> 4;
+                int c = e & 15;
+                float* sp = state + ((size_t)k0 + r) * 128 + col + c;
+                *sp = *sp * last + mine[r * 16 + c];
+            }
+            __syncthreads();
+        }
+    }
 }
 
 __device__ float w_f32(const unsigned char* wb, int row, int k, int n) {
@@ -3399,16 +3770,17 @@ extern "C" __global__ void pgemm_q6_k(const unsigned char* wb, const float* x, f
    and is not launched. mmqk quantizes activations to q8 once per GEMM and
    dots the stored nibbles with dp4a.
 
-   The timed tile staged one q8 superblock and reused it across 32 rows
-   (4 per warp). Q4 now uses 8 rows per warp (64 rows per block). sm_70
-   ptxas with launch_bounds(256, 2) is 128 registers and no spills, so two
-   blocks still fit. Q6 at 8 rows spilled (36 bytes stored, 68 loaded), so
-   Q6 stays at 4 rows per warp. A pair kernel dots a second same-shaped
-   matrix (gate+up, K and V) before the next superblock replaces X.
-   Shared memory is 22528 bytes. Weights are broadcast inside the warp, so
-   staging them does not cut device traffic. ODINFER_CUDA_PREFILL_GEMM=0
-   still selects tc2 / the scalar tile. ODINFER_CUDA_PREFILL_FUSE=0
-   launches the two matrices separately. */
+   The timed tile stages one q8 superblock and reuses it across 32 rows
+   (4 per warp). That is the default. An 8-row Q4 tile (64 rows) compiled
+   to 128 registers with no spills and was slower on a V100 (9B at 8000
+   tokens, 333 vs 337 tok/s); ODINFER_CUDA_MMQK_ROWS=8 still selects it.
+   Q6 at 8 rows spilled, so Q6 stays at 4 rows per warp. A pair kernel
+   dots a second same-shaped matrix (gate+up, K and V) before the next
+   superblock replaces X. Shared memory is 22528 bytes. Weights are
+   broadcast inside the warp, so staging them does not cut device traffic.
+   ODINFER_CUDA_PREFILL_GEMM=0 still selects tc2 / the scalar tile.
+   ODINFER_CUDA_PREFILL_FUSE=1 launches the pair kernel. It was neutral
+   on that V100, so the two matrices launch separately unless it is set. */
 
 extern "C" __global__ void quant_q8_batch(const float* x, unsigned* xpack, float* scale, float2* sum16, int n, int T) {
     int idx = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;

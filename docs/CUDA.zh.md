@@ -168,9 +168,11 @@ warp 槽。
 | `ODINFER_CUDA_PHASE` | 关 | `=1` 每次 forward 打一行 `linear attn kv norm delta other` 毫秒，整段预填充再打一行 `cuda: phase prefill` 合计。和 `PROFILE` 共用 event。这一进程的 tok/s 不是生产数字。不改内核 |
 | `ODINFER_CUDA_ATTN_SPLIT` | 开 | 只用于 mixed-V 解码（`T==1` 且 `npos>=128`）。32 token 一块，每个 KV head 一块，组内 query head 共用 K/V，再合并 softmax。不决定预填充内核。`=0` 解码走单 block 内核。相对 `attention_q8v` 允许 `2e-2 + 1e-3*|ref|`，含 npos 300、1800、8192、32768。会关掉 CUDA graph |
 | `ODINFER_CUDA_PREFILL_FLASH` | WMMA | mixed-V 预填充（`T>1`）。sm_70 及以上且 head_dim 256 时，不设置就是 `attention_q8v_wmma`。`=0` 是 `attention_q8v`。`=1` 是 `attention_q8v_flash`（fp32 在线 softmax，`br` 个 query token，KV 32 token 一块）。9B V100S 上它更慢（16000 token 80.7 对 114.2 tok/s）。`=2` 强制 `attention_q8v_wmma`：16 个 query token，32 token 的 fp16 K/V，WMMA 16×16×16 fp16、fp32 累加，fp32 在线 softmax，每个 query tile 只读一次 KV，按块切开 KV 让 80 个 SM 都有活。head_dim 256。不是逐位相同。fp32 flash 允许 `2e-2 + 1e-3*|ref|`。WMMA 允许 `1e-1 + 5e-2*|ref|`（fp16 乘积），kv_mul 4 的 npos 为 128、300、1800、8192、32768，kv_mul 6 为 128 和 1800。冒烟 prompt 的贪心文本是验收。解码仍走切分内核 |
-| `ODINFER_CUDA_PREFILL_GEMM` | 开 | Q4_K / Q6_K 预填充（`T>1`，K 是 256 的倍数）走 `mmqk`。计过时的 32 行块、chunk 512：9B 在 905/1805/8000/16000 是 371.70/376.91/337.20/290.49 tok/s，27B 在 905/8000/16000 是 124.00/112.97/97.43。这棵树里的内核还没有计时：Q4 一块 64 行，Q6 仍是 32 行。`=0` 仍是 `tc2` / 逐元素 `tc`。相对 `gemv2` 允许 `2e-3 + 2e-3*|ref|`。相对 fp32 CPU GEMV 是 atol 1、rtol 5e-2 |
-| `ODINFER_CUDA_PREFILL_FUSE` | 开 | gate+up 和 K+V 共用一份 q8。`=0` 把两个矩阵分开启动。还没有计时 |
-| `ODINFER_CUDA_MMQK_ROWS` | `8` | `=4` 保持计过时的 Q4 块（一块 32 行）。不设置是 64 行。Q6 两种都是 32 行 |
+| `ODINFER_CUDA_PREFILL_GEMM` | 开 | Q4_K / Q6_K 预填充（`T>1`，K 是 256 的倍数）走 `mmqk`。默认 32 行块、chunk 512：9B 在 905/1805/8000/16000 是 371.70/376.91/337.20/290.49 tok/s，27B 在 905/8000/16000 是 124.00/112.97/97.43。64 行 Q4 更慢（9B 364.44/367.80/333.11/290.06），不是默认。`=0` 仍是 `tc2` / 逐元素 `tc`。相对 `gemv2` 允许 `2e-3 + 2e-3*|ref|`。相对 fp32 CPU GEMV 是 atol 1、rtol 5e-2 |
+| `ODINFER_CUDA_PREFILL_FUSE` | 关 | `=1` 让 gate+up 和 K+V 共用一份 q8。在 V100 上差不多持平（9B 8000 token，关掉 332，打开 333），线性层还更慢，所以默认关 |
+| `ODINFER_CUDA_MMQK_ROWS` | `4` | 默认 Q4 一块 32 行。`=8` 选 64 行，在 V100 上更慢。Q6 两种都是 32 行 |
+| `ODINFER_CUDA_ATTN_LONG` | 开 | 混合 V 解码，`npos>=2048`，head_dim 256，每个 KV 头 4 或 6 个 query 头。一块 128 个位置，K 对这一组只反量化一次，V 每个位置一次，然后走和 32 宽拆分一样的 reduce。`=0` 在任何长度都用 32 token 的块 |
+| `ODINFER_CUDA_DELTA_WMMA` | 关 | `=1` 对 128×128 的预填充状态走 16 token 的门控 delta 分块（WY 用 fp32，块内状态乘用 WMMA fp16）。默认仍是和文本对齐的递推内核。`cuda_selftest` 相对递推允许 2e-3 |
 | `ODINFER_CUDA_PREFILL_CHUNK` | `512` | 每次预填充 forward 的 token 数。16 的倍数，16 到 512。标量路径上 9B 16000 token、块 128/256/512 是 183/207/213 tok/s。放不下就按 256、128、32、8、1 退，不会比请求的更大 |
 | `ODINFER_PHASE` | 关 | `=1` 每次采样打印 JSON grammar 和 tool-call grammar 的 CPU 毫秒。没装 grammar 时为 0 |
 | `ODINFER_CUDA_FUSE_NORM` | 关 | `=1` 才把投影加进 `residual_rmsnorm_q8`。V100S 上比累加 GEMV 慢 |
