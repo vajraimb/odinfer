@@ -3775,6 +3775,278 @@ extern "C" __global__ void pgemm_q6_k(const unsigned char* wb, const float* x, f
     pgemm_run<1>(wb, x, out, n, d, T);
 }
 
+/* wgemm: 128 tokens by 128 rows, BK=64, fp16 operands, fp32 accumulate.
+   Each weight K-tile is dequantized once (pgemm's 64-token tile dequantized
+   a 128-token chunk twice). The fp16 tile is row-major with stride 80.
+   80*2 = 160 bytes, a multiple of 16 so wmma.load stays aligned, and
+   consecutive rows land 8 banks apart instead of the 32-way conflict from
+   pgemm's 256-byte stride. Eight warps, each holding 4x2 WMMA fragments
+   (64 rows by 32 tokens). Activations are narrowed to fp16, not q8.
+   The next K-tile's bytes sit in registers across the current MMA, then
+   land in the other shared buffer. Shared memory is 81920 bytes, so the
+   host raises the dynamic cap. Not timed. ODINFER_CUDA_PREFILL_LINEAR=mmqk
+   keeps mmqk. pgemm is still not launched. */
+
+__device__ __forceinline__ unsigned char wg_byte(uint4 v, int i) {
+    unsigned w = i < 4 ? v.x : i < 8 ? v.y : i < 12 ? v.z : v.w;
+    return (unsigned char)(w >> ((i & 3) * 8));
+}
+
+__device__ __forceinline__ uint4 wg_ld_u4(const unsigned char* p) {
+    uint4 v;
+    v.x = (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
+    v.y = (unsigned)p[4] | ((unsigned)p[5] << 8) | ((unsigned)p[6] << 16) | ((unsigned)p[7] << 24);
+    v.z = (unsigned)p[8] | ((unsigned)p[9] << 8) | ((unsigned)p[10] << 16) | ((unsigned)p[11] << 24);
+    v.w = (unsigned)p[12] | ((unsigned)p[13] << 8) | ((unsigned)p[14] << 16) | ((unsigned)p[15] << 24);
+    return v;
+}
+
+__device__ __forceinline__ void wg_dequant_q4(uint4 hdr, uint4 qs0, uint4 qs1, int part, unsigned short* dst) {
+    unsigned char hb[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) hb[i] = wg_byte(hdr, i);
+    int sc, m;
+    scale_min_k4(part, hb + 4, &sc, &m);
+    float ds = ld_f16(hb) * (float)sc;
+    float dm = ld_f16(hb + 2) * (float)m;
+    int hi = part & 1;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        unsigned char q = j < 16 ? wg_byte(qs0, j) : wg_byte(qs1, j - 16);
+        int qv = hi ? (int)(q >> 4) : (int)(q & 0xF);
+        dst[j] = f32_to_f16((float)qv * ds - dm);
+    }
+}
+
+__device__ __forceinline__ void wg_dequant_q6(uint4 ql0, uint4 ql1, uint4 qh0, uint4 qh1,
+                                              unsigned sc_lo, unsigned sc_hi, unsigned d_bits,
+                                              int part, unsigned short* dst) {
+    int group = part & 3;
+    float d = f16_bits(d_bits);
+#pragma unroll
+    for (int l = 0; l < 32; ++l) {
+        unsigned char qh = l < 16 ? wg_byte(qh0, l) : wg_byte(qh1, l - 16);
+        unsigned char ql = l < 16 ? wg_byte(ql0, l) : wg_byte(ql1, l - 16);
+        int is = l >> 4;
+        int qv, sc_i;
+        if (group == 0) {
+            qv = (int)((ql & 0xF) | (((qh >> 0) & 3) << 4)) - 32;
+            sc_i = is;
+        } else if (group == 1) {
+            qv = (int)((ql & 0xF) | (((qh >> 2) & 3) << 4)) - 32;
+            sc_i = is + 2;
+        } else if (group == 2) {
+            qv = (int)((ql >> 4) | (((qh >> 4) & 3) << 4)) - 32;
+            sc_i = is + 4;
+        } else {
+            qv = (int)((ql >> 4) | (((qh >> 6) & 3) << 4)) - 32;
+            sc_i = is + 6;
+        }
+        unsigned scb = sc_i < 4 ? (sc_lo >> (sc_i * 8)) : (sc_hi >> ((sc_i - 4) * 8));
+        dst[l] = f32_to_f16(d * (float)(signed char)(scb & 0xff) * (float)qv);
+    }
+}
+
+template<int Q6>
+__device__ __forceinline__ void wg_prefetch(const unsigned char* wb, const float* x, int n, int d, int T,
+                                            int n0, int t0, int k0, int tid,
+                                            float4& x0, float4& x1, float4& x2, float4& x3,
+                                            float4& x4, float4& x5, float4& x6, float4& x7,
+                                            uint4& h, uint4& q0, uint4& q1, uint4& q2, uint4& q3,
+                                            unsigned& sc_lo, unsigned& sc_hi, unsigned& d_bits, int& row_ok) {
+    float4 z = make_float4(0.f, 0.f, 0.f, 0.f);
+    float4 got[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        int e = tid + i * 256;
+        int elem = e << 2;
+        int token = elem >> 6;
+        int kk = elem & 63;
+        int tt = t0 + token;
+        int kkabs = k0 + kk;
+        if (tt < T && kkabs + 3 < n) {
+            const float* p = x + ((size_t)tt * (size_t)n + (size_t)kkabs);
+            got[i] = *reinterpret_cast<const float4*>(p);
+        } else {
+            got[i] = z;
+        }
+    }
+    x0 = got[0]; x1 = got[1]; x2 = got[2]; x3 = got[3];
+    x4 = got[4]; x5 = got[5]; x6 = got[6]; x7 = got[7];
+
+    int row = tid & 127;
+    int sub = tid >> 7;
+    int part = ((k0 & 255) >> 5) + sub;
+    row_ok = (n0 + row < d) ? 1 : 0;
+    h = q0 = q1 = q2 = q3 = make_uint4(0, 0, 0, 0);
+    sc_lo = sc_hi = d_bits = 0;
+    if (!row_ok) return;
+    int bbytes = Q6 ? 210 : 144;
+    int nb = n >> 8;
+    const unsigned char* blk = wb + ((size_t)(n0 + row) * (size_t)nb + (size_t)(k0 >> 8)) * (size_t)bbytes;
+    if (Q6 == 0) {
+        h = ld_global_v4(blk);
+        const unsigned char* qs = blk + 16 + (part >> 1) * 32;
+        q0 = ld_global_v4(qs);
+        q1 = ld_global_v4(qs + 16);
+        return;
+    }
+    int half = part >> 2;
+    int group = part & 3;
+    int ql_off = (group == 1 || group == 3) ? 32 : 0;
+    const unsigned char* ql = blk + half * 64 + ql_off;
+    const unsigned char* qh = blk + 128 + half * 32;
+    const unsigned char* scb = blk + 192 + half * 8;
+    q0 = wg_ld_u4(ql);
+    q1 = wg_ld_u4(ql + 16);
+    q2 = wg_ld_u4(qh);
+    q3 = wg_ld_u4(qh + 16);
+    sc_lo = (unsigned)scb[0] | ((unsigned)scb[1] << 8) | ((unsigned)scb[2] << 16) | ((unsigned)scb[3] << 24);
+    sc_hi = (unsigned)scb[4] | ((unsigned)scb[5] << 8) | ((unsigned)scb[6] << 16) | ((unsigned)scb[7] << 24);
+    d_bits = (unsigned)blk[208] | ((unsigned)blk[209] << 8);
+}
+
+template<int Q6>
+__device__ __forceinline__ void wg_commit(int n, int T, int n0, int t0, int k0, int tid,
+                                          float4 x0, float4 x1, float4 x2, float4 x3,
+                                          float4 x4, float4 x5, float4 x6, float4 x7,
+                                          uint4 h, uint4 q0, uint4 q1, uint4 q2, uint4 q3,
+                                          unsigned sc_lo, unsigned sc_hi, unsigned d_bits, int row_ok,
+                                          unsigned short* Xs, unsigned short* Ws) {
+    float4 xv[8] = {x0, x1, x2, x3, x4, x5, x6, x7};
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        int e = tid + i * 256;
+        int elem = e << 2;
+        int token = elem >> 6;
+        int kk = elem & 63;
+        unsigned short* dst = Xs + token * 80 + kk;
+        int tt = t0 + token;
+        int kkabs = k0 + kk;
+        float4 v = xv[i];
+        dst[0] = (tt < T && kkabs < n) ? f32_to_f16(v.x) : 0;
+        dst[1] = (tt < T && kkabs + 1 < n) ? f32_to_f16(v.y) : 0;
+        dst[2] = (tt < T && kkabs + 2 < n) ? f32_to_f16(v.z) : 0;
+        dst[3] = (tt < T && kkabs + 3 < n) ? f32_to_f16(v.w) : 0;
+    }
+    int row = tid & 127;
+    int sub = tid >> 7;
+    int part = ((k0 & 255) >> 5) + sub;
+    unsigned short* wdst = Ws + row * 80 + sub * 32;
+    if (row_ok) {
+        if (Q6 == 0) wg_dequant_q4(h, q0, q1, part, wdst);
+        else wg_dequant_q6(q0, q1, q2, q3, sc_lo, sc_hi, d_bits, part, wdst);
+    } else {
+#pragma unroll
+        for (int j = 0; j < 32; ++j) wdst[j] = 0;
+    }
+}
+
+template<int Q6>
+__device__ void wgemm_run(const unsigned char* wb, const float* x, float* out, int n, int d, int T) {
+    const int tid = (int)threadIdx.x;
+    const int warp = tid >> 5;
+    const int t0 = (int)blockIdx.y * 128;
+    const int n0 = (int)blockIdx.x * 128;
+    if (t0 >= T || n0 >= d || n <= 0) return;
+
+    extern __shared__ __align__(16) unsigned char wgemm_sm[];
+    const int tw = warp & 3;
+    const int rw = warp >> 2;
+
+    float acc[8][8];
+#pragma unroll
+    for (int f = 0; f < 8; ++f) {
+#pragma unroll
+        for (int r = 0; r < 8; ++r) acc[f][r] = 0.f;
+    }
+
+    float4 x0, x1, x2, x3, x4, x5, x6, x7;
+    uint4 h, q0, q1, q2, q3;
+    unsigned sc_lo, sc_hi, d_bits;
+    int row_ok;
+    wg_prefetch<Q6>(wb, x, n, d, T, n0, t0, 0, tid, x0, x1, x2, x3, x4, x5, x6, x7, h, q0, q1, q2, q3, sc_lo, sc_hi, d_bits, row_ok);
+    {
+        unsigned short* base = (unsigned short*)wgemm_sm;
+        wg_commit<Q6>(n, T, n0, t0, 0, tid, x0, x1, x2, x3, x4, x5, x6, x7, h, q0, q1, q2, q3, sc_lo, sc_hi, d_bits, row_ok, base, base + 128 * 80);
+    }
+    __syncthreads();
+
+    int phase = 0;
+    for (int k0 = 0; k0 < n; k0 += 64) {
+        int nxt = k0 + 64;
+        float4 nx0, nx1, nx2, nx3, nx4, nx5, nx6, nx7;
+        uint4 nh, nq0, nq1, nq2, nq3;
+        unsigned nsc_lo, nsc_hi, nd_bits;
+        int nrow_ok = 0;
+        if (nxt < n) {
+            wg_prefetch<Q6>(wb, x, n, d, T, n0, t0, nxt, tid, nx0, nx1, nx2, nx3, nx4, nx5, nx6, nx7, nh, nq0, nq1, nq2, nq3, nsc_lo, nsc_hi, nd_bits, nrow_ok);
+        }
+        unsigned short* cur = (unsigned short*)(wgemm_sm + phase * 40960);
+        unsigned short* Xs = cur;
+        unsigned short* Ws = cur + 128 * 80;
+#pragma unroll
+        for (int kk = 0; kk < 64; kk += 16) {
+            unsigned a00, a01, a02, a03, a04, a05, a06, a07;
+            unsigned a10, a11, a12, a13, a14, a15, a16, a17;
+            unsigned b00, b01, b02, b03, b04, b05, b06, b07;
+            unsigned b10, b11, b12, b13, b14, b15, b16, b17;
+            unsigned b20, b21, b22, b23, b24, b25, b26, b27;
+            unsigned b30, b31, b32, b33, b34, b35, b36, b37;
+            wmma_load_a(a00, a01, a02, a03, a04, a05, a06, a07, Xs + (tw * 32) * 80 + kk, 80);
+            wmma_load_a(a10, a11, a12, a13, a14, a15, a16, a17, Xs + (tw * 32 + 16) * 80 + kk, 80);
+            wmma_load_b(b00, b01, b02, b03, b04, b05, b06, b07, Ws + (rw * 64) * 80 + kk, 80);
+            wmma_load_b(b10, b11, b12, b13, b14, b15, b16, b17, Ws + (rw * 64 + 16) * 80 + kk, 80);
+            wmma_load_b(b20, b21, b22, b23, b24, b25, b26, b27, Ws + (rw * 64 + 32) * 80 + kk, 80);
+            wmma_load_b(b30, b31, b32, b33, b34, b35, b36, b37, Ws + (rw * 64 + 48) * 80 + kk, 80);
+            wmma_mma(acc[0][0], acc[0][1], acc[0][2], acc[0][3], acc[0][4], acc[0][5], acc[0][6], acc[0][7], a00, a01, a02, a03, a04, a05, a06, a07, b00, b01, b02, b03, b04, b05, b06, b07);
+            wmma_mma(acc[1][0], acc[1][1], acc[1][2], acc[1][3], acc[1][4], acc[1][5], acc[1][6], acc[1][7], a10, a11, a12, a13, a14, a15, a16, a17, b00, b01, b02, b03, b04, b05, b06, b07);
+            wmma_mma(acc[2][0], acc[2][1], acc[2][2], acc[2][3], acc[2][4], acc[2][5], acc[2][6], acc[2][7], a00, a01, a02, a03, a04, a05, a06, a07, b10, b11, b12, b13, b14, b15, b16, b17);
+            wmma_mma(acc[3][0], acc[3][1], acc[3][2], acc[3][3], acc[3][4], acc[3][5], acc[3][6], acc[3][7], a10, a11, a12, a13, a14, a15, a16, a17, b10, b11, b12, b13, b14, b15, b16, b17);
+            wmma_mma(acc[4][0], acc[4][1], acc[4][2], acc[4][3], acc[4][4], acc[4][5], acc[4][6], acc[4][7], a00, a01, a02, a03, a04, a05, a06, a07, b20, b21, b22, b23, b24, b25, b26, b27);
+            wmma_mma(acc[5][0], acc[5][1], acc[5][2], acc[5][3], acc[5][4], acc[5][5], acc[5][6], acc[5][7], a10, a11, a12, a13, a14, a15, a16, a17, b20, b21, b22, b23, b24, b25, b26, b27);
+            wmma_mma(acc[6][0], acc[6][1], acc[6][2], acc[6][3], acc[6][4], acc[6][5], acc[6][6], acc[6][7], a00, a01, a02, a03, a04, a05, a06, a07, b30, b31, b32, b33, b34, b35, b36, b37);
+            wmma_mma(acc[7][0], acc[7][1], acc[7][2], acc[7][3], acc[7][4], acc[7][5], acc[7][6], acc[7][7], a10, a11, a12, a13, a14, a15, a16, a17, b30, b31, b32, b33, b34, b35, b36, b37);
+        }
+        if (nxt < n) {
+            int np = phase ^ 1;
+            unsigned short* nb = (unsigned short*)(wgemm_sm + np * 40960);
+            wg_commit<Q6>(n, T, n0, t0, nxt, tid, nx0, nx1, nx2, nx3, nx4, nx5, nx6, nx7, nh, nq0, nq1, nq2, nq3, nsc_lo, nsc_hi, nd_bits, nrow_ok, nb, nb + 128 * 80);
+            __syncthreads();
+            phase = np;
+        }
+    }
+    __syncthreads();
+
+    float* tile = (float*)wgemm_sm;
+#pragma unroll
+    for (int f = 0; f < 8; ++f) {
+        wmma_store(tile + (warp * 8 + f) * 256, 16,
+                   acc[f][0], acc[f][1], acc[f][2], acc[f][3], acc[f][4], acc[f][5], acc[f][6], acc[f][7]);
+    }
+    __syncthreads();
+    for (int idx = tid; idx < 8 * 8 * 256; idx += 256) {
+        int frag = idx >> 8;
+        int e = idx & 255;
+        int w = frag >> 3;
+        int fi = frag & 7;
+        int ri = fi >> 1;
+        int ci = fi & 1;
+        int i = e >> 4;
+        int j = e & 15;
+        int t = t0 + (w & 3) * 32 + ci * 16 + i;
+        int orow = n0 + (w >> 2) * 64 + ri * 16 + j;
+        if (t < T && orow < d) out[(size_t)t * (size_t)d + orow] = tile[idx];
+    }
+}
+
+extern "C" __global__ void wgemm_q4_k(const unsigned char* wb, const float* x, float* out, int n, int d, int T) {
+    wgemm_run<0>(wb, x, out, n, d, T);
+}
+extern "C" __global__ void wgemm_q6_k(const unsigned char* wb, const float* x, float* out, int n, int d, int T) {
+    wgemm_run<1>(wb, x, out, n, d, T);
+}
+
 /* pgemm (fp16 dequant + WMMA) was slower than the scalar tile on a V100
    and is not launched. mmqk quantizes activations to q8 once per GEMM and
    dots the stored nibbles with dp4a.

@@ -12,6 +12,9 @@
    ODINFER_CUDA_SMOKE_PREFILL=N builds a deterministic prompt and prefills
    N tokens (the short 2+2 prompt is the default). max_ctx must cover
    N plus the decoded tokens.
+   ODINFER_CUDA_LOGITS=1 prints the top-5 logits at the first decode
+   position and, after that token is fed back, at the second. EOS is
+   248046. Compare a default run with ODINFER_CUDA_PREFILL_GEMM=0.
 */
 
 package main
@@ -27,6 +30,41 @@ import "core:strings"
 import "core:time"
 
 EOS_QWEN3_5 :: 248046
+
+logits_dump :: proc(logits: []f32, tag: string) {
+	if os.get_env("ODINFER_CUDA_LOGITS", context.temp_allocator) != "1" || len(logits) == 0 {
+		return
+	}
+	top_i: [5]int
+	top_v: [5]f32
+	for i in 0 ..< 5 {
+		top_i[i] = -1
+		top_v[i] = -1e30
+	}
+	for i in 0 ..< len(logits) {
+		v := logits[i]
+		if v <= top_v[4] {
+			continue
+		}
+		slot := 4
+		for slot > 0 && v > top_v[slot - 1] {
+			top_v[slot] = top_v[slot - 1]
+			top_i[slot] = top_i[slot - 1]
+			slot -= 1
+		}
+		top_v[slot] = v
+		top_i[slot] = i
+	}
+	eos_v: f32 = -1e30
+	if EOS_QWEN3_5 < len(logits) {
+		eos_v = logits[EOS_QWEN3_5]
+	}
+	fmt.eprintf("cuda_smoke: logits %s top5", tag)
+	for i in 0 ..< 5 {
+		fmt.eprintf(" %d:%.5f", top_i[i], top_v[i])
+	}
+	fmt.eprintfln(" eos %d:%.5f margin %.5f", EOS_QWEN3_5, eos_v, top_v[0] - eos_v)
+}
 
 main :: proc() {
 	when !q35.GPU_CUDA {
@@ -141,6 +179,7 @@ main :: proc() {
 		defer strings.builder_destroy(&text)
 
 		pos := prefill_n
+		logits_dump(logits, "pos0")
 		next := sampler.sample(&samp, logits)
 		t1 := time.now()
 		produced := 0
@@ -157,6 +196,9 @@ main :: proc() {
 			}
 			logits = q35.engine_forward(&engine, next, pos)
 			pos += 1
+			if produced == 1 {
+				logits_dump(logits, "pos1")
+			}
 			next = sampler.sample(&samp, logits)
 			_ = step
 		}

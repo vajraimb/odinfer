@@ -789,6 +789,66 @@ run_pgemm :: proc(kind: ggml.GGML_Type, rows, cols, T: int, atol, rtol: f32) -> 
 	return s_report(fmt.tprintf("%s T=%d rows=%d cols=%d", name, T, rows, cols), st, atol, rtol)
 }
 
+// wgemm dequants to fp16 and accumulates with WMMA. Same allowance as pgemm:
+// atol 5e-2, rtol 5e-2 against the fp32 CPU GEMV. Not bit-exact.
+@(private)
+run_wgemm :: proc(kind: ggml.GGML_Type, rows, cols, T: int, atol, rtol: f32) -> bool {
+	name := "wgemm_q4_k"
+	if kind == .Q6_K {
+		name = "wgemm_q6_k"
+	}
+	fn := s_fn(name)
+	if fn == nil {
+		fmt.eprintf("cuda_selftest: missing %s\n", name)
+		return false
+	}
+	if cu.func_set_max_dynamic_shared(fn, int(WG_SMEM)) != cu.OK {
+		fmt.eprintf("cuda_selftest: %s cuFuncSetAttribute failed\n", name)
+		return false
+	}
+	raw := fill_weight(kind, rows, cols)
+	defer delete(raw)
+	x := make([]f32, T * cols)
+	defer delete(x)
+	for t in 0 ..< T {
+		for j in 0 ..< cols {
+			x[t * cols + j] = (f32((t + 1) * (j + 3) % 9) - 4) * 0.03
+		}
+	}
+	ref := make([]f32, T * rows)
+	defer delete(ref)
+	for t in 0 ..< T {
+		row := cpu_gemv(kind, raw, x[t * cols:][:cols], rows, cols)
+		copy(ref[t * rows:][:rows], row)
+		delete(row)
+	}
+	dw, _ := cu.alloc(len(raw))
+	dx, _ := cu.alloc(T * cols * 4)
+	dy, _ := cu.alloc(T * rows * 4)
+	defer cu.free(dw)
+	defer cu.free(dx)
+	defer cu.free(dy)
+	cu.upload(dw, raw_data(raw), len(raw))
+	cu.upload(dx, raw_data(x), T * cols * 4)
+	wb, xx, yy := dw, dx, dy
+	nn, dd, tt := i32(cols), i32(rows), i32(T)
+	args := [?]rawptr{&wb, &xx, &yy, &nn, &dd, &tt}
+	gx := u32((rows + 127) / 128)
+	gy := u32((T + 127) / 128)
+	if cu.launch(fn, gx, gy, 1, 256, 1, 1, WG_SMEM, args[:]) != cu.OK || cu.sync() != cu.OK {
+		fmt.eprintf("cuda_selftest: %s launch failed\n", name)
+		return false
+	}
+	got := make([]f32, T * rows)
+	defer delete(got)
+	cu.download(raw_data(got), dy, T * rows * 4)
+	st: Case_Err
+	for i in 0 ..< T * rows {
+		s_note(&st, fmt.tprintf("%s [%d]", name, i), got[i], ref[i], atol, rtol)
+	}
+	return s_report(fmt.tprintf("%s T=%d rows=%d cols=%d", name, T, rows, cols), st, atol, rtol)
+}
+
 // mmqk is the Q4_K / Q6_K prefill. Same q8 + dp4a math as gemv2, so that
 // compare stays tight (2e-3). The fp32 CPU GEMV sees the q8 rounding, and
 // uses the same allowance as run_gemv2: atol 1, rtol 5e-2. On a V100,
@@ -2386,6 +2446,17 @@ cuda_selftest :: proc() -> bool {
 			ok = false
 		}
 		if !run_mmqk_pair(.Q4_K, shape[0], shape[1], shape[2]) || !run_mmqk_pair(.Q6_K, shape[0], shape[1], shape[2]) {
+			ok = false
+		}
+	}
+	// 128x128 tile, a partial row and token tile, K across two superblocks,
+	// and a token count that is not a multiple of 128. fp16 WMMA vs fp32 CPU.
+	wgemm_shapes := [?][3]int{{128, 256, 128}, {96, 256, 20}, {130, 512, 160}, {40, 256, 7}, {256, 1024, 200}, {48, 768, 96}}
+	for shape in wgemm_shapes {
+		if !run_wgemm(.Q4_K, shape[0], shape[1], shape[2], 5e-2, 5e-2) {
+			ok = false
+		}
+		if !run_wgemm(.Q6_K, shape[0], shape[1], shape[2], 5e-2, 5e-2) {
 			ok = false
 		}
 	}
