@@ -130,7 +130,7 @@ Q4_K 和 Q6_K 默认都是四行一个 warp。一行一个 warp 在 V100S 上每
 `atomicAdd` 汇总）。`ODINFER_CUDA_GEMV_SPLIT=0` 关掉。K 是 256 倍数的
 Q4_K / Q6_K 预填充只在测得更快的长度上走 tensor core。`T<=64` 用 32-token 的块（profile 名 `tc2`）：V100S 上 T=19 是 176 ms，128-token 的块是 323 ms。`T>64` 默认用逐元素反量化（profile 名 `tc`）。128-token 的块（`tc2w`）在长 prompt 上更慢：9B 581 token 124.5 对 138.9 tok/s，2000 token 71.9 对 76.7；27B 581 token 50.9 对 53.1。`ODINFER_CUDA_TC2_WIDE=1` 才选它。`ODINFER_CUDA_TC2_BLOCK=1` 的 `tc2m` 在 V100S 上更慢（9B 581 token 151 对 208 tok/s），而且采样 token 和标量块不一致，保持关闭。`ODINFER_CUDA_TC2_REUSE=1` 在 `T>64` 用 `tc2r`：还是标量块那套反量化和 WMMA，一个权重块服务 128 个 token 的两半。`T<=64` 仍是 32-token 块。还没有 V100 计时。`cuda_kernel_test` 要求它和 `tc` 逐位一致，这不是采样文本一致的结论。`ODINFER_CUDA_TC2=0` 在任何 T 都用标量块。
 
-完整注意力的预填充是 prompt 长度的平方。第 t 个 query 要扫过 t+1 个 key，以前每个 token 启动一次，一个 head 一个 block，16 个 head 只占 V100 80 个 SM 里的 16 个。现在先把这一块的 KV 都写完，再按 head × token 启动一次（`ODINFER_CUDA_ATTN_BATCH=0` 恢复逐 token）。计算量仍是 O(N^2)。`delta_recurrent_chunk` 对 T 是线性的：token t 依赖 t-1 的状态，循环留在 block 里面，每个 value head 一个 block，不是平方。解码 `T==1` 仍是单 token 内核。
+完整注意力的预填充是 prompt 长度的平方。第 t 个 query 要扫过 t+1 个 key。旧内核每个 query head 一个 block，V 的累加在每个线程里按位置串行，所以长上下文的解码时间几乎全在这里（`9448e51` 上 27B 大约每个上下文 token、每个解码 token 21.6 µs，linear/kv/norm/delta/other 是平的）。默认 mixed-V 的解码（`T==1` 且 `npos>=128`）改用 `attention_q8v_part` 加 `attention_q8v_reduce`：32 个 token 一块，每个 KV head 一块，组内 query head 共用 K/V。预填充仍走旧内核：切分套进 T=128 的块在 V100S 上大约慢 10%（27B 905 token 63.6 对 71.7 tok/s）。短解码、f16、对称 Q8 也是旧内核。`ODINFER_CUDA_ATTN_SPLIT=0` 强制旧内核。短块仍是先写完 KV，再按 head × token 启动一次（`ODINFER_CUDA_ATTN_BATCH=0` 恢复逐 token）。计算量仍是 O(N^2)。`delta_recurrent_chunk` 对 T 是线性的：token t 依赖 t-1 的状态，循环留在 block 里面，每个 value head 一个 block，不是平方。解码 `T==1` 仍是单 token 内核。
 
 稠密解码默认把注意力输出、线性层输出和 FFN down 直接累加进残差，下一次 RMSNorm 仍是单独的 `rmsnorm_q8`（9B 1.41 ms，27B 3.53 ms）。`ODINFER_CUDA_FUSE_NORM=1` 才写到旁路缓冲再跑 `residual_rmsnorm_q8`。V100S 上这条更慢（9B 1.99 ms，27B 4.96 ms），解码从 68.4 / 26.05 掉到 63.6 / 23.4 tok/s，所以默认关闭。9B 的 Q4 GEMV 大约读 3.0 GB 权重，6.01 ms 约 500 GB/s，是 1134 GB/s 峰值的 44%。默认 Q4 加载是普通 `ld.global`（与 8975985 相同）。`ld.global.nc` 更慢（9B 6.01 → 6.50 ms，27B 19.57 → 22.4），只在 `ODINFER_CUDA_Q4_NC=1` 时启用。`ODINFER_CUDA_Q4_ILP=1` 选择 `gemv2_q4x`：每 warp 8 行、普通 128 位加载、每次迭代两个 super-block。`--bench-gemv` 把它印成 `r8`。它不是解码默认。Q6 只在 K≥16384 或行数>8192 时把量化块经对齐加载放进共享内存（27B 的 down 和 logits）；9B 的 down（4096×12288）仍直接加载。`ODINFER_CUDA_Q6_STAGE=0` 关掉，`=1` 全开。
 
@@ -162,6 +162,7 @@ warp 槽。
 | `ODINFER_CUDA_GRAPH` | 关 | `=1` 把稠密 `T==1` 收成一张 CUDA graph。位置用图所在 stream 上的异步拷贝。MoE 和预填充仍即时。`ODINFER_CUDA_PROFILE=1` 会关掉 graph |
 | `ODINFER_CUDA_PROFILE` | 关 | `=1` 打印这次 forward 每个内核的 GPU 时间，最慢的在前。8192 个 event 的环在写满时按内核名汇总，长 prompt 不会被截断 |
 | `ODINFER_CUDA_PHASE` | 关 | `=1` 每次 forward 打一行 `linear attn kv norm delta other` 毫秒。和 `PROFILE` 共用 event。这一进程的 tok/s 不是生产数字。不改内核 |
+| `ODINFER_CUDA_ATTN_SPLIT` | 开 | 只用于 mixed-V 解码（`T==1` 且 `npos>=128`）。32 token 一块，每个 KV head 一块，组内 query head 共用 K/V，再合并 softmax。预填充仍是 `attention_q8v`（切分套进 T=128 的块在 V100S 上更慢）。`=0` 解码也走旧内核。相对旧内核允许 `2e-2 + 1e-3*|ref|`，含 npos 300 和 1800。会关掉 CUDA graph |
 | `ODINFER_PHASE` | 关 | `=1` 每次采样打印 JSON grammar 和 tool-call grammar 的 CPU 毫秒。没装 grammar 时为 0 |
 | `ODINFER_CUDA_FUSE_NORM` | 关 | `=1` 才把投影加进 `residual_rmsnorm_q8`。V100S 上比累加 GEMV 慢 |
 | `ODINFER_CUDA_Q4_NC` | 关 | `=1` 用 `ld.global.nc` 加载 Q4。V100S 上比普通 `ld.global` 慢 |

@@ -888,6 +888,157 @@ extern "C" __global__ void attention_q8v(const float* q, const unsigned char* kc
     }
 }
 
+/* Split decode attention for the mixed-V cache. Prefill stays on
+   attention_q8v: running the parts once per token of a T=128 chunk was
+   slower on the V100S (about 10% on 905 and 1805 token prefills).
+   attention_q8v is one block per query head. Its V loop walks every
+   position on each thread, so a long context uses a handful of SMs and
+   the time grows linearly with npos even though the KV row is a few
+   kilobytes. These two kernels split the sequence into 32-token parts.
+   One block owns one KV head and one part, and the query heads in that
+   GQA group share the staged K/V. Each lane owns one position and dots
+   it in the same j-then-block order as attention_q8v. A second kernel
+   merges the partial softmaxes (max, sum, unnormalized weighted V).
+   In exact arithmetic that merge is the global softmax. In fp32 it is
+   not bit-exact: exp(s - m_part) * exp(m_part - m_global) rounds once
+   more than exp(s - m_global). cuda_selftest allows 2e-2 + 1e-3*|ref|
+   against attention_q8v on the same cache. block is 128 threads and
+   `part` is 32, so one lane owns one position. head_dim is a multiple
+   of 32 and at most 256. kv_mul is at most 16. */
+__device__ float attn_k_dot(const float* qh, const unsigned char* krow, int nb) {
+    float s = 0.f;
+    for (int b = 0; b < nb; ++b) {
+        const unsigned char* bb = krow + (size_t)b * 34;
+        float d = ld_f16(bb);
+        int base = b * 32;
+        for (int j = 0; j < 32; ++j) s += qh[base + j] * (d * (float)(signed char)bb[2 + j]);
+    }
+    return s;
+}
+
+__device__ float attn_v_at(const unsigned char* vbase, int nb, int t, int i) {
+    int b = i >> 5;
+    int j = i & 31;
+    const unsigned char* vb = vbase + ((size_t)t * (size_t)nb + (size_t)b) * 40;
+    float d = ld_f16(vb);
+    int idx = (int)vb[2];
+    float ov = ld_f16(vb + 4);
+    return (j == idx) ? ov : d * (float)(signed char)vb[6 + j];
+}
+
+__device__ float warp_max_all(float v) {
+    for (int off = 16; off > 0; off >>= 1)
+        v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, off));
+    return v;
+}
+
+__device__ float warp_sum_all(float v) {
+    for (int off = 16; off > 0; off >>= 1)
+        v += __shfl_xor_sync(0xffffffff, v, off);
+    return v;
+}
+
+extern "C" __global__ void attention_q8v_part(const float* q, const unsigned char* kc, const unsigned char* vc,
+                                              float* part_m, float* part_l, float* part_o,
+                                              int head_dim, int k_pos_bytes, int v_pos_bytes, int kv_mul, int n_heads,
+                                              int pos, int part, const int* pos_slot) {
+    int kvh = (int)blockIdx.x;
+    int tid = (int)threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int nb = head_dim >> 5;
+    int npos = live_pos(pos, pos_slot) + 1;
+    int begin = (int)blockIdx.y * part;
+    extern __shared__ __align__(16) unsigned char smem[];
+    float* sq = (float*)smem;
+    unsigned char* sk = smem + (size_t)kv_mul * (size_t)head_dim * 4;
+    unsigned char* sv = sk + (size_t)part * (size_t)nb * 34;
+    if (begin >= npos || part != 32 || head_dim > 256 || nb <= 0 || kv_mul > 16) {
+        if (begin < npos && warp < kv_mul) {
+            for (int qi = warp; qi < kv_mul; qi += 4) {
+                int h = kvh * kv_mul + qi;
+                size_t si = (size_t)blockIdx.y * (size_t)n_heads + (size_t)h;
+                if (lane == 0) {
+                    part_m[si] = -1e30f;
+                    part_l[si] = 0.f;
+                }
+                for (int i = lane; i < head_dim; i += 32) part_o[si * (size_t)head_dim + i] = 0.f;
+            }
+        }
+        return;
+    }
+    int nlocal = npos - begin;
+    if (nlocal > part) nlocal = part;
+    int qn = kv_mul * head_dim;
+    const float* qg = q + (size_t)kvh * (size_t)kv_mul * (size_t)head_dim;
+    for (int i = tid; i < qn; i += 128) sq[i] = qg[i];
+    int kbytes = nb * 34;
+    int vbytes = nb * 40;
+    for (int t = 0; t < nlocal; ++t) {
+        const unsigned char* ks = kc + ((size_t)(begin + t) * (size_t)k_pos_bytes + (size_t)kvh * (size_t)kbytes);
+        const unsigned char* vs = vc + ((size_t)(begin + t) * (size_t)v_pos_bytes + (size_t)kvh * (size_t)vbytes);
+        unsigned char* kd = sk + (size_t)t * (size_t)kbytes;
+        unsigned char* vd = sv + (size_t)t * (size_t)vbytes;
+        for (int i = tid; i < kbytes; i += 128) kd[i] = ks[i];
+        for (int i = tid; i < vbytes; i += 128) vd[i] = vs[i];
+    }
+    __syncthreads();
+    float scale = rsqrtf((float)head_dim);
+    for (int qi = warp; qi < kv_mul; qi += 4) {
+        const float* qh = sq + (size_t)qi * (size_t)head_dim;
+        float s = -1e30f;
+        if (lane < nlocal) s = attn_k_dot(qh, sk + (size_t)lane * (size_t)kbytes, nb) * scale;
+        float m = warp_max_all(s);
+        float e = expf(s - m);
+        float lsum = warp_sum_all(e);
+        int h = kvh * kv_mul + qi;
+        size_t si = (size_t)blockIdx.y * (size_t)n_heads + (size_t)h;
+        float* po = part_o + si * (size_t)head_dim;
+        for (int i = lane; i < head_dim; i += 32) {
+            float acc = 0.f;
+            for (int src = 0; src < nlocal; ++src) {
+                float wt = __shfl_sync(0xffffffff, e, src);
+                acc += wt * attn_v_at(sv, nb, src, i);
+            }
+            po[i] = acc;
+        }
+        if (lane == 0) {
+            part_m[si] = m;
+            part_l[si] = lsum;
+        }
+    }
+}
+
+extern "C" __global__ void attention_q8v_reduce(float* xb3, const float* part_m, const float* part_l, const float* part_o,
+                                                int head_dim, int n_heads, int n_splits) {
+    int h = (int)blockIdx.x;
+    int tid = (int)threadIdx.x;
+    if (h >= n_heads || head_dim > 256) return;
+    int i0 = tid;
+    int i1 = tid + 128;
+    bool has0 = i0 < head_dim;
+    bool has1 = i1 < head_dim;
+    float acc0 = 0.f, acc1 = 0.f;
+    float m = -1e30f;
+    float l = 0.f;
+    for (int s = 0; s < n_splits; ++s) {
+        size_t si = (size_t)s * (size_t)n_heads + (size_t)h;
+        float ms = part_m[si];
+        float ls = part_l[si];
+        float m2 = fmaxf(m, ms);
+        float e0 = expf(m - m2);
+        float e1 = expf(ms - m2);
+        const float* po = part_o + si * (size_t)head_dim;
+        if (has0) acc0 = acc0 * e0 + po[i0] * e1;
+        if (has1) acc1 = acc1 * e0 + po[i1] * e1;
+        l = l * e0 + ls * e1;
+        m = m2;
+    }
+    float inv = l > 0.f ? 1.f / l : 0.f;
+    if (has0) xb3[(size_t)h * (size_t)head_dim + i0] = acc0 * inv;
+    if (has1) xb3[(size_t)h * (size_t)head_dim + i1] = acc1 * inv;
+}
+
 extern "C" __global__ void conv1d_step(float* qkv_out, const float* qkv_in, float* conv_state, const float* weight,
                                        int conv_dim, int kernel) {
     int c = (int)(blockIdx.x * blockDim.x + threadIdx.x);

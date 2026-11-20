@@ -55,6 +55,7 @@ you isolate per-stage GPU time. Never enable in production.
 | `ODINFER_CUDA_TC2_BLOCK` | off | `=1` uses `tc2m`. Measured slower on the V100S and it changed a sampled token. Leave off. |
 | `ODINFER_CUDA_TC2_REUSE` | off | `=1` uses `tc2r` for `T>64` (profile name `tc2r`). The scalar tile's weight dequant is reused across 128 tokens. Unmeasured. If several `TC2_*` flags are set, this one is used. |
 | `ODINFER_CUDA_ATTN_BATCH` | on | Prefill full attention launches once per chunk (heads by tokens). `=0` launches once per token. |
+| `ODINFER_CUDA_ATTN_SPLIT` | on | Mixed-V decode (`T==1`, `npos>=128`) uses 32-token parts and a reduce (`attn_part`, `attn_red`). Prefill stays on `attention_q8v`. `=0` is the one-block kernel. fp32 merge tolerance versus that kernel is `2e-2 + 1e-3*|ref|`. Disables the CUDA graph. |
 | `ODINFER_CUDA_FUSE_NORM` | off | `=1` writes the projection to a side buffer and fuses the add with the next RMSNorm and its q8 store. Slower than the accum GEMV plus `rmsnorm_q8` on the V100S. |
 | `ODINFER_CUDA_Q4_NC` | off | `=1` uses `ld.global.nc` for the Q4 GEMV. Slower than plain `ld.global` on the V100S. |
 | `ODINFER_CUDA_Q4_ILP` | off | `=1` uses `gemv2_q4x` (8 rows/warp, coherent 128-bit loads, two super-blocks per iteration). `--bench-gemv` prints it as `r8`. Not the decode default. |

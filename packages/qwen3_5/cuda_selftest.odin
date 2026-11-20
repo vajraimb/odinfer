@@ -1156,6 +1156,138 @@ run_kv_attn :: proc() -> bool {
 	return s_report("attention_q8v", st_attn, 2e-2, 1e-3)
 }
 
+// Split attention against attention_q8v on one cache. head_dim 256, two KV
+// heads, four query heads per KV head, so every warp in the part kernel is
+// live. Lengths cover one position, a full part, a partial tail, and the
+// long decode sizes (300, 1800). Allowance is the same band as attention_q8v
+// vs the CPU reference. The fp32 softmax merge is not bit-exact.
+@(private)
+run_attn_split :: proc() -> bool {
+	hd := 256
+	n_kv := 2
+	kv_mul := 4
+	n_heads := n_kv * kv_mul
+	npos_max := 1800
+	nb_head := hd / 32
+	kv_dim := n_kv * hd
+	nb := kv_dim / 32
+	k_pos := nb * Q8_0_BLOCK_BYTES
+	v_pos := nb * Q8_V_MIX_BLOCK_BYTES
+	kc := make([]u8, npos_max * k_pos)
+	vc := make([]u8, npos_max * v_pos)
+	q := make([]f32, n_heads * hd)
+	blk := make([]f32, 32)
+	defer delete(kc)
+	defer delete(vc)
+	defer delete(q)
+	defer delete(blk)
+	for t in 0 ..< npos_max {
+		for kvh in 0 ..< n_kv {
+			for b in 0 ..< nb_head {
+				gid := kvh * nb_head + b
+				for j in 0 ..< 32 {
+					i := b * 32 + j
+					blk[j] = (f32((i * 3 + t * 5 + kvh * 7) % 11) - 5) * 0.15
+				}
+				quantize_q8_block(blk, kc[t * k_pos + gid * Q8_0_BLOCK_BYTES:][:Q8_0_BLOCK_BYTES])
+				for j in 0 ..< 32 {
+					i := b * 32 + j
+					blk[j] = (f32((i * 2 + t + kvh) % 9) - 4) * 0.2
+					if j == 3 {
+						blk[j] = 3.5 + f32(t) * 0.01
+					}
+				}
+				quantize_q8_v_mix_block(blk, vc[t * v_pos + gid * Q8_V_MIX_BLOCK_BYTES:][:Q8_V_MIX_BLOCK_BYTES])
+			}
+		}
+	}
+	for h in 0 ..< n_heads {
+		for i in 0 ..< hd {
+			q[h * hd + i] = (f32((i + h * 3) % 13) - 6) * 0.1
+		}
+	}
+	dq, _ := cu.alloc(len(q) * 4)
+	dkc, _ := cu.alloc(len(kc))
+	dvc, _ := cu.alloc(len(vc))
+	dxb, _ := cu.alloc(len(q) * 4)
+	dsc, _ := cu.alloc(n_heads * npos_max * 4)
+	nsplit_max := (npos_max + 31) / 32
+	dpm, _ := cu.alloc(nsplit_max * n_heads * 4)
+	dpl, _ := cu.alloc(nsplit_max * n_heads * 4)
+	dpo, _ := cu.alloc(nsplit_max * n_heads * hd * 4)
+	defer cu.free(dq)
+	defer cu.free(dkc)
+	defer cu.free(dvc)
+	defer cu.free(dxb)
+	defer cu.free(dsc)
+	defer cu.free(dpm)
+	defer cu.free(dpl)
+	defer cu.free(dpo)
+	if cu.upload(dq, raw_data(q), len(q) * 4) != cu.OK || cu.upload(dkc, raw_data(kc), len(kc)) != cu.OK || cu.upload(dvc, raw_data(vc), len(vc)) != cu.OK {
+		fmt.eprintln("cuda_selftest: attn split upload failed")
+		return false
+	}
+	old_fn := s_fn("attention_q8v")
+	part_fn := s_fn("attention_q8v_part")
+	red_fn := s_fn("attention_q8v_reduce")
+	if old_fn == nil || part_fn == nil || red_fn == nil {
+		fmt.eprintln("cuda_selftest: attn split kernels missing")
+		return false
+	}
+	smem := u32(kv_mul * hd * 4 + 32 * nb_head * 34 + 32 * nb_head * 40)
+	got_old := make([]f32, n_heads * hd)
+	got_new := make([]f32, n_heads * hd)
+	defer delete(got_old)
+	defer delete(got_new)
+	lengths := [?]int{1, 32, 33, 70, 128, 300, 1800}
+	ok := true
+	for npos in lengths {
+		qa, kca, vca, xb, sc := dq, dkc, dvc, dxb, dsc
+		ihd := i32(hd)
+		ikb := i32(k_pos)
+		ivb := i32(v_pos)
+		mul := i32(kv_mul)
+		ps := i32(npos - 1)
+		sl := i32(npos_max)
+		slot: cu.Device_Ptr
+		stride := i32(0)
+		oargs := [?]rawptr{&qa, &kca, &vca, &xb, &sc, &ihd, &ikb, &ivb, &mul, &ps, &sl, &slot, &stride}
+		if cu.launch(old_fn, u32(n_heads), 1, 1, 128, 1, 1, 0, oargs[:]) != cu.OK || cu.sync() != cu.OK {
+			fmt.eprintfln("cuda_selftest: attention_q8v launch failed at npos {}", npos)
+			return false
+		}
+		if cu.download(raw_data(got_old), dxb, len(got_old) * 4) != cu.OK {
+			return false
+		}
+		pm, pl, po := dpm, dpl, dpo
+		nh := i32(n_heads)
+		part := i32(32)
+		pargs := [?]rawptr{&qa, &kca, &vca, &pm, &pl, &po, &ihd, &ikb, &ivb, &mul, &nh, &ps, &part, &slot}
+		nsplit := (npos + 31) / 32
+		if cu.launch(part_fn, u32(n_kv), u32(nsplit), 1, 128, 1, 1, smem, pargs[:]) != cu.OK || cu.sync() != cu.OK {
+			fmt.eprintfln("cuda_selftest: attention_q8v_part launch failed at npos {}", npos)
+			return false
+		}
+		ns := i32(nsplit)
+		rargs := [?]rawptr{&xb, &pm, &pl, &po, &ihd, &nh, &ns}
+		if cu.launch(red_fn, u32(n_heads), 1, 1, 128, 1, 1, 0, rargs[:]) != cu.OK || cu.sync() != cu.OK {
+			fmt.eprintfln("cuda_selftest: attention_q8v_reduce launch failed at npos {}", npos)
+			return false
+		}
+		if cu.download(raw_data(got_new), dxb, len(got_new) * 4) != cu.OK {
+			return false
+		}
+		st: Case_Err
+		for i in 0 ..< len(got_new) {
+			s_note(&st, fmt.tprintf("split[%d] npos %d", i, npos), got_new[i], got_old[i], 2e-2, 1e-3)
+		}
+		if !s_report(fmt.tprintf("attn_split npos={}", npos), st, 2e-2, 1e-3) {
+			ok = false
+		}
+	}
+	return ok
+}
+
 @(private)
 run_delta :: proc() -> bool {
 	hkd, hvd := 4, 4
@@ -1487,6 +1619,9 @@ cuda_selftest :: proc() -> bool {
 		ok = false
 	}
 	if !run_kv_attn() {
+		ok = false
+	}
+	if !run_attn_split() {
 		ok = false
 	}
 	if !run_delta() {
