@@ -1124,6 +1124,8 @@ extern "C" __global__ void attention_q8v_reduce(float* xb3, const float* part_m,
     if (has1) xb3[(size_t)h * (size_t)head_dim + i1] = acc1 * inv;
 }
 
+__device__ __forceinline__ uint4 ld_u4_aligned(const unsigned char* p);
+
 /* Long-context decode attention. One block owns one KV head and 128
    positions (one thread, one position). K is dequantized once per position
    and dotted with every query head in the GQA group. V is dequantized once
@@ -1145,7 +1147,6 @@ __device__ void attention_q8v_long_run(const float* q, const unsigned char* kc, 
     float* sq = (float*)long_smem;
     float* scores = sq + MUL * 256;
     float* meta = scores + MUL * 128;
-    float* sv = meta + MUL * 2;
     if (head_dim != 256 || part != 128) return;
     if (begin >= npos) {
         if (tid < MUL) {
@@ -1175,12 +1176,23 @@ __device__ void attention_q8v_long_run(const float* q, const unsigned char* kc, 
         for (int b = 0; b < 8; ++b) {
             const unsigned char* bb = krow + b * 34;
             float d = ld_f16(bb);
+            /* 32 q bytes, two aligned 128-bit windows. The FMA order stays
+               j = 0..31 so the partial matches the scalar load. */
+            uint4 q0 = ld_u4_aligned(bb + 2);
+            uint4 q1 = ld_u4_aligned(bb + 18);
+            unsigned qw[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
+            int col = b * 32;
 #pragma unroll
-            for (int j = 0; j < 32; ++j) {
-                float kv = d * (float)(signed char)bb[2 + j];
-                int col = b * 32 + j;
+            for (int w = 0; w < 8; ++w) {
+                unsigned v = qw[w];
 #pragma unroll
-                for (int qi = 0; qi < MUL; ++qi) dots[qi] += sq[qi * 256 + col] * kv;
+                for (int s = 0; s < 4; ++s) {
+                    float kv = d * (float)(signed char)(unsigned char)(v & 0xffu);
+                    v >>= 8;
+#pragma unroll
+                    for (int qi = 0; qi < MUL; ++qi) dots[qi] += sq[qi * 256 + col] * kv;
+                    col += 1;
+                }
             }
         }
     }
@@ -1204,8 +1216,12 @@ __device__ void attention_q8v_long_run(const float* q, const unsigned char* kc, 
         a0[qi] = 0.f;
         a1[qi] = 0.f;
     }
+    /* Each thread writes sv[tid] and sv[tid+128] and reads only those.
+       The scores were published before this loop. No cross-thread read,
+       so the old per-position barriers are not required. */
     for (int t = 0; t < nlocal; ++t) {
         const unsigned char* vrow = vc + ((size_t)(begin + t) * (size_t)v_pos_bytes + (size_t)kvh * 320);
+        float v0, v1;
 #pragma unroll
         for (int rep = 0; rep < 2; ++rep) {
             int i = tid + rep * 128;
@@ -1215,16 +1231,16 @@ __device__ void attention_q8v_long_run(const float* q, const unsigned char* kc, 
             float d = ld_f16(vb);
             int idx = (int)vb[2];
             float ov = ld_f16(vb + 4);
-            sv[i] = (j == idx) ? ov : d * (float)(signed char)vb[6 + j];
+            float vv = (j == idx) ? ov : d * (float)(signed char)vb[6 + j];
+            if (rep == 0) v0 = vv;
+            else v1 = vv;
         }
-        __syncthreads();
 #pragma unroll
         for (int qi = 0; qi < MUL; ++qi) {
             float w = scores[qi * 128 + t];
-            a0[qi] += w * sv[tid];
-            a1[qi] += w * sv[tid + 128];
+            a0[qi] += w * v0;
+            a1[qi] += w * v1;
         }
-        __syncthreads();
     }
 #pragma unroll
     for (int qi = 0; qi < MUL; ++qi) {
@@ -3432,16 +3448,23 @@ __device__ __forceinline__ float q4_pair(uint4 hdr, uint4 qv, const signed char*
         }                                                                                 \
         int src = lane & ~7;                                                              \
         hdr = shfl_u4(hdr, src);                                                          \
+        int group = b * 8 + p * 2;                                                        \
+        int off = half * 16;                                                              \
+        /* Four rows share x. Lane t loads it; the shuffle is uniform. */                 \
+        uint4 xlo = make_uint4(0, 0, 0, 0);                                               \
+        uint4 xhi = make_uint4(0, 0, 0, 0);                                               \
+        if (sub == 0) {                                                                   \
+            xlo = LD(xq + (size_t)group * 32 + off);                                      \
+            xhi = LD(xq + (size_t)(group + 1) * 32 + off);                                \
+        }                                                                                 \
+        xlo = shfl_u4(xlo, t);                                                            \
+        xhi = shfl_u4(xhi, t);                                                            \
         if (row < d) {                                                                    \
             float dW = f16_bits(hdr.x & 0xffff);                                          \
             float dmin = f16_bits(hdr.x >> 16);                                           \
             int sc0, m0, sc1, m1;                                                         \
             scale_min_hdr(p * 2, hdr, &sc0, &m0);                                         \
             scale_min_hdr(p * 2 + 1, hdr, &sc1, &m1);                                     \
-            int group = b * 8 + p * 2;                                                    \
-            int off = half * 16;                                                          \
-            uint4 xlo = LD(xq + (size_t)group * 32 + off);                                \
-            uint4 xhi = LD(xq + (size_t)(group + 1) * 32 + off);                          \
             int dot_lo = dot_nib(qv, xlo, 0);                                             \
             int dot_hi = dot_nib(qv, xhi, 1);                                             \
             float2 slo = sum16[group];                                                    \
@@ -3519,13 +3542,19 @@ extern "C" __global__ void gemv2_q4_pair_k(const unsigned char* w0, const unsign
         int src = lane & ~7;
         h0 = shfl_u4(h0, src);
         h1 = shfl_u4(h1, src);
+        int p = t >> 1;
+        int half = t & 1;
+        int group = b * 8 + p * 2;
+        int off = half * 16;
+        uint4 xlo = make_uint4(0, 0, 0, 0);
+        uint4 xhi = make_uint4(0, 0, 0, 0);
+        if (sub == 0) {
+            xlo = ld_global_v4(xq + (size_t)group * 32 + off);
+            xhi = ld_global_v4(xq + (size_t)(group + 1) * 32 + off);
+        }
+        xlo = shfl_u4(xlo, t);
+        xhi = shfl_u4(xhi, t);
         if (row < d) {
-            int p = t >> 1;
-            int half = t & 1;
-            int group = b * 8 + p * 2;
-            int off = half * 16;
-            uint4 xlo = ld_global_v4(xq + (size_t)group * 32 + off);
-            uint4 xhi = ld_global_v4(xq + (size_t)(group + 1) * 32 + off);
             float2 slo = sum16[group];
             float2 shi = sum16[group + 1];
             acc0 += q4_acc(h0, q0, xlo, xhi, slo, shi, xd, b, t);
@@ -3665,6 +3694,16 @@ __device__ void gemv2_q6_run(const unsigned char* wb, const signed char* xq, con
         int src = lane & ~7;
         scv = shfl_u4(scv, src);
         dW = __shfl_sync(0xffffffff, dW, src);
+        int group0 = b * 8 + half * 4 + (hi_pair ? 1 : 0);
+        int off = l0;
+        uint4 xa = make_uint4(0, 0, 0, 0);
+        uint4 xb = make_uint4(0, 0, 0, 0);
+        if (sub == 0) {
+            xa = *(const uint4*)(xq + (size_t)group0 * 32 + off);
+            xb = *(const uint4*)(xq + (size_t)(group0 + 2) * 32 + off);
+        }
+        xa = shfl_u4(xa, t);
+        xb = shfl_u4(xb, t);
         if (row < d) {
             int scoff = half * 8;
             int is = l0 >> 4;
@@ -3672,10 +3711,6 @@ __device__ void gemv2_q6_run(const unsigned char* wb, const signed char* xq, con
             int s_b = scoff + is + (hi_pair ? 6 : 4);
             float sa = dW * (float)scv_i8(scv, s_a);
             float sb = dW * (float)scv_i8(scv, s_b);
-            int group0 = b * 8 + half * 4 + (hi_pair ? 1 : 0);
-            int off = l0;
-            uint4 xa = *(const uint4*)(xq + (size_t)group0 * 32 + off);
-            uint4 xb = *(const uint4*)(xq + (size_t)(group0 + 2) * 32 + off);
             unsigned qw[4] = {ql.x, ql.y, ql.z, ql.w};
             unsigned hw[4] = {qh.x, qh.y, qh.z, qh.w};
             unsigned aw[4] = {xa.x, xa.y, xa.z, xa.w};
@@ -4047,8 +4082,8 @@ __device__ __forceinline__ void wg_dequant_q6(uint4 ql0, uint4 ql1, uint4 qh0, u
     }
 }
 
-template<int Q6>
-__device__ __forceinline__ void wg_prefetch(const unsigned char* wb, const float* x, int n, int d, int T,
+template<int Q6, int X16>
+__device__ __forceinline__ void wg_prefetch(const unsigned char* wb, const void* x, int n, int d, int T,
                                             int n0, int t0, int k0, int tid,
                                             float4& x0, float4& x1, float4& x2, float4& x3,
                                             float4& x4, float4& x5, float4& x6, float4& x7,
@@ -4065,8 +4100,19 @@ __device__ __forceinline__ void wg_prefetch(const unsigned char* wb, const float
         int tt = t0 + token;
         int kkabs = k0 + kk;
         if (tt < T && kkabs + 3 < n) {
-            const float* p = x + ((size_t)tt * (size_t)n + (size_t)kkabs);
-            got[i] = *reinterpret_cast<const float4*>(p);
+            if (X16) {
+                /* Four fp16 values packed once per chunk. The bits ride in
+                   the float4 channels and wg_commit writes them back out. */
+                const unsigned short* hp = (const unsigned short*)x + ((size_t)tt * (size_t)n + (size_t)kkabs);
+                uint2 h = *reinterpret_cast<const uint2*>(hp);
+                got[i].x = __uint_as_float(h.x & 0xffffu);
+                got[i].y = __uint_as_float(h.x >> 16);
+                got[i].z = __uint_as_float(h.y & 0xffffu);
+                got[i].w = __uint_as_float(h.y >> 16);
+            } else {
+                const float* p = (const float*)x + ((size_t)tt * (size_t)n + (size_t)kkabs);
+                got[i] = *reinterpret_cast<const float4*>(p);
+            }
         } else {
             got[i] = z;
         }
@@ -4106,7 +4152,7 @@ __device__ __forceinline__ void wg_prefetch(const unsigned char* wb, const float
     d_bits = (unsigned)blk[208] | ((unsigned)blk[209] << 8);
 }
 
-template<int Q6>
+template<int Q6, int X16>
 __device__ __forceinline__ void wg_commit(int n, int T, int n0, int t0, int k0, int tid,
                                           float4 x0, float4 x1, float4 x2, float4 x3,
                                           float4 x4, float4 x5, float4 x6, float4 x7,
@@ -4124,10 +4170,17 @@ __device__ __forceinline__ void wg_commit(int n, int T, int n0, int t0, int k0, 
         int tt = t0 + token;
         int kkabs = k0 + kk;
         float4 v = xv[i];
-        dst[0] = (tt < T && kkabs < n) ? f32_to_f16(v.x) : 0;
-        dst[1] = (tt < T && kkabs + 1 < n) ? f32_to_f16(v.y) : 0;
-        dst[2] = (tt < T && kkabs + 2 < n) ? f32_to_f16(v.z) : 0;
-        dst[3] = (tt < T && kkabs + 3 < n) ? f32_to_f16(v.w) : 0;
+        if (X16) {
+            dst[0] = (tt < T && kkabs < n) ? (unsigned short)__float_as_uint(v.x) : 0;
+            dst[1] = (tt < T && kkabs + 1 < n) ? (unsigned short)__float_as_uint(v.y) : 0;
+            dst[2] = (tt < T && kkabs + 2 < n) ? (unsigned short)__float_as_uint(v.z) : 0;
+            dst[3] = (tt < T && kkabs + 3 < n) ? (unsigned short)__float_as_uint(v.w) : 0;
+        } else {
+            dst[0] = (tt < T && kkabs < n) ? f32_to_f16(v.x) : 0;
+            dst[1] = (tt < T && kkabs + 1 < n) ? f32_to_f16(v.y) : 0;
+            dst[2] = (tt < T && kkabs + 2 < n) ? f32_to_f16(v.z) : 0;
+            dst[3] = (tt < T && kkabs + 3 < n) ? f32_to_f16(v.w) : 0;
+        }
     }
     int row = tid & 127;
     int sub = tid >> 7;
@@ -4154,8 +4207,8 @@ __device__ __forceinline__ void wg_commit(int n, int T, int n0, int t0, int k0, 
    buffer, or a 256-row tile, does not fit in 96 KB either (two weight
    panels + the current double buffer is 122880). A second accumulator
    set spills. The launched kernel is unchanged. */
-template<int Q6>
-__device__ void wgemm_run(const unsigned char* wb, const float* x, float* out, int n, int d, int T) {
+template<int Q6, int X16>
+__device__ void wgemm_run(const unsigned char* wb, const void* x, float* out, int n, int d, int T) {
     const int tid = (int)threadIdx.x;
     const int warp = tid >> 5;
     const int t0 = (int)blockIdx.y * 128;
@@ -4177,10 +4230,10 @@ __device__ void wgemm_run(const unsigned char* wb, const float* x, float* out, i
     uint4 h, q0, q1, q2, q3;
     unsigned sc_lo, sc_hi, d_bits;
     int row_ok;
-    wg_prefetch<Q6>(wb, x, n, d, T, n0, t0, 0, tid, x0, x1, x2, x3, x4, x5, x6, x7, h, q0, q1, q2, q3, sc_lo, sc_hi, d_bits, row_ok);
+    wg_prefetch<Q6, X16>(wb, x, n, d, T, n0, t0, 0, tid, x0, x1, x2, x3, x4, x5, x6, x7, h, q0, q1, q2, q3, sc_lo, sc_hi, d_bits, row_ok);
     {
         unsigned short* base = (unsigned short*)wgemm_sm;
-        wg_commit<Q6>(n, T, n0, t0, 0, tid, x0, x1, x2, x3, x4, x5, x6, x7, h, q0, q1, q2, q3, sc_lo, sc_hi, d_bits, row_ok, base, base + 128 * 80);
+        wg_commit<Q6, X16>(n, T, n0, t0, 0, tid, x0, x1, x2, x3, x4, x5, x6, x7, h, q0, q1, q2, q3, sc_lo, sc_hi, d_bits, row_ok, base, base + 128 * 80);
     }
     __syncthreads();
 
@@ -4192,7 +4245,7 @@ __device__ void wgemm_run(const unsigned char* wb, const float* x, float* out, i
         unsigned nsc_lo, nsc_hi, nd_bits;
         int nrow_ok = 0;
         if (nxt < n) {
-            wg_prefetch<Q6>(wb, x, n, d, T, n0, t0, nxt, tid, nx0, nx1, nx2, nx3, nx4, nx5, nx6, nx7, nh, nq0, nq1, nq2, nq3, nsc_lo, nsc_hi, nd_bits, nrow_ok);
+            wg_prefetch<Q6, X16>(wb, x, n, d, T, n0, t0, nxt, tid, nx0, nx1, nx2, nx3, nx4, nx5, nx6, nx7, nh, nq0, nq1, nq2, nq3, nsc_lo, nsc_hi, nd_bits, nrow_ok);
         }
         unsigned short* cur = (unsigned short*)(wgemm_sm + phase * 40960);
         unsigned short* Xs = cur;
@@ -4260,7 +4313,7 @@ __device__ void wgemm_run(const unsigned char* wb, const float* x, float* out, i
         if (nxt < n) {
             int np = phase ^ 1;
             unsigned short* nb = (unsigned short*)(wgemm_sm + np * 40960);
-            wg_commit<Q6>(n, T, n0, t0, nxt, tid, nx0, nx1, nx2, nx3, nx4, nx5, nx6, nx7, nh, nq0, nq1, nq2, nq3, nsc_lo, nsc_hi, nd_bits, nrow_ok, nb, nb + 128 * 80);
+            wg_commit<Q6, X16>(n, T, n0, t0, nxt, tid, nx0, nx1, nx2, nx3, nx4, nx5, nx6, nx7, nh, nq0, nq1, nq2, nq3, nsc_lo, nsc_hi, nd_bits, nrow_ok, nb, nb + 128 * 80);
             __syncthreads();
             phase = np;
         }
@@ -4290,10 +4343,25 @@ __device__ void wgemm_run(const unsigned char* wb, const float* x, float* out, i
 }
 
 extern "C" __global__ void wgemm_q4_k(const unsigned char* wb, const float* x, float* out, int n, int d, int T) {
-    wgemm_run<0>(wb, x, out, n, d, T);
+    wgemm_run<0, 0>(wb, x, out, n, d, T);
 }
 extern "C" __global__ void wgemm_q6_k(const unsigned char* wb, const float* x, float* out, int n, int d, int T) {
-    wgemm_run<1>(wb, x, out, n, d, T);
+    wgemm_run<1, 0>(wb, x, out, n, d, T);
+}
+
+/* Same tile. x is fp16, packed once per activation by pack_f16, so every
+   row-tile reloads half the bytes and skips the in-kernel convert.
+   ODINFER_CUDA_WGEMM_X=0 keeps wgemm_q4_k / wgemm_q6_k. */
+extern "C" __global__ void wgemm_q4_x16(const unsigned char* wb, const unsigned short* x, float* out, int n, int d, int T) {
+    wgemm_run<0, 1>(wb, x, out, n, d, T);
+}
+extern "C" __global__ void wgemm_q6_x16(const unsigned char* wb, const unsigned short* x, float* out, int n, int d, int T) {
+    wgemm_run<1, 1>(wb, x, out, n, d, T);
+}
+
+extern "C" __global__ void pack_f16(const float* x, unsigned short* y, int n) {
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) y[i] = f32_to_f16(x[i]);
 }
 
 /* pgemm (fp16 dequant + WMMA) was slower than the scalar tile on a V100

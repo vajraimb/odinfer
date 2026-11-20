@@ -903,7 +903,48 @@ run_wgemm :: proc(kind: ggml.GGML_Type, rows, cols, T: int, atol, rtol: f32) -> 
 	for i in 0 ..< T * rows {
 		s_note(&st, fmt.tprintf("%s [%d]", name, i), got[i], ref[i], atol, rtol)
 	}
-	return s_report(fmt.tprintf("%s T=%d rows=%d cols=%d", name, T, rows, cols), st, atol, rtol)
+	if !s_report(fmt.tprintf("%s T=%d rows=%d cols=%d", name, T, rows, cols), st, atol, rtol) {
+		return false
+	}
+	xname := "wgemm_q4_x16"
+	if kind == .Q6_K {
+		xname = "wgemm_q6_x16"
+	}
+	xfn := s_fn(xname)
+	pfn := s_fn("pack_f16")
+	if xfn == nil || pfn == nil {
+		fmt.eprintf("cuda_selftest: missing %s or pack_f16\n", xname)
+		return false
+	}
+	if cu.func_set_max_dynamic_shared(xfn, int(WG_SMEM)) != cu.OK {
+		fmt.eprintf("cuda_selftest: %s cuFuncSetAttribute failed\n", xname)
+		return false
+	}
+	dxh, _ := cu.alloc(T * cols * 2)
+	dy2, _ := cu.alloc(T * rows * 4)
+	defer cu.free(dxh)
+	defer cu.free(dy2)
+	nel := i32(T * cols)
+	pargs := [?]rawptr{&xx, &dxh, &nel}
+	blocks := u32((T * cols + 255) / 256)
+	if cu.launch(pfn, blocks, 1, 1, 256, 1, 1, 0, pargs[:]) != cu.OK {
+		fmt.eprintln("cuda_selftest: pack_f16 launch failed")
+		return false
+	}
+	yy2 := dy2
+	xargs := [?]rawptr{&wb, &dxh, &yy2, &nn, &dd, &tt}
+	if cu.launch(xfn, gx, gy, 1, 256, 1, 1, WG_SMEM, xargs[:]) != cu.OK || cu.sync() != cu.OK {
+		fmt.eprintf("cuda_selftest: %s launch failed\n", xname)
+		return false
+	}
+	got2 := make([]f32, T * rows)
+	defer delete(got2)
+	cu.download(raw_data(got2), dy2, T * rows * 4)
+	st2: Case_Err
+	for i in 0 ..< T * rows {
+		s_note(&st2, fmt.tprintf("%s [%d]", xname, i), got2[i], got[i], 0, 0)
+	}
+	return s_report(fmt.tprintf("%s matches %s", xname, name), st2, 0, 0)
 }
 
 // mmqk is the Q4_K / Q6_K prefill. Same q8 + dp4a math as gemv2, so that
