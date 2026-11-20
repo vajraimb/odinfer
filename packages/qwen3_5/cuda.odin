@@ -226,7 +226,7 @@ g_delta_sm: bool // delta chunk keeps the state matrix in shared memory
 @(private)
 g_gemv_warps: int
 @(private)
-g_gemv_mmvq: bool // ODINFER_CUDA_GEMV_MMVQ=1: one warp per Q4 row
+g_gemv_mmvq: bool // one warp per row for Q4/Q5/Q6. ODINFER_CUDA_GEMV_MMVQ=0 restores the 4-row kernels
 @(private)
 g_launches: int
 @(private)
@@ -286,7 +286,7 @@ g_q8_valid: bool
 @(private)
 k_quant, k_rmsnorm_q8, k_res_norm: cu.Function
 @(private)
-k_gemv2_q4, k_gemv2_q4nc, k_gemv2_q4x, k_gemv2_q4_pipe, k_gemv2_q4w, k_gemv2_q4_pair, k_gemv2_q4_pair_pipe, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q6_pipe, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50: cu.Function
+k_gemv2_q4, k_gemv2_q4nc, k_gemv2_q4x, k_gemv2_q4_pipe, k_gemv2_q4w, k_gemv2_q4w_pair, k_gemv2_q4_pair, k_gemv2_q4_pair_pipe, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q6_pipe, k_gemv2_q6w, k_gemv2_q5k, k_gemv2_q5w, k_gemv2_q8, k_gemv2_q50: cu.Function
 @(private)
 k_gemv2r1_q4, k_gemv2r1_q6: cu.Function
 @(private)
@@ -528,9 +528,17 @@ gemv2_for :: proc(kind: ggml.GGML_Type) -> cu.Function {
 		if g_gemv_pipe && k_gemv2_q6_pipe != nil {
 			return k_gemv2_q6_pipe
 		}
+		if g_gemv_mmvq && k_gemv2_q6w != nil {
+			return k_gemv2_q6w
+		}
 		return k_gemv2_q6
 	}
-	if kind == .Q5_K do return k_gemv2_q5k
+	if kind == .Q5_K {
+		if g_gemv_mmvq && k_gemv2_q5w != nil {
+			return k_gemv2_q5w
+		}
+		return k_gemv2_q5k
+	}
 	if kind == .Q8_0 do return k_gemv2_q8
 	if kind == .Q5_0 do return k_gemv2_q50
 	return nil
@@ -658,8 +666,8 @@ launch_gemv2 :: proc(fn: cu.Function, kind: ggml.GGML_Type, w, y: cu.Device_Ptr,
 	nn, dd := i32(n), i32(d)
 	acc := i32(accumulate)
 	rows_per := warps * 4
-	if r1 || fn == k_gemv2_q4w {
-		// q4w is one row per warp. The 128-bit loads run along K.
+	if r1 || fn == k_gemv2_q4w || fn == k_gemv2_q6w || fn == k_gemv2_q5w {
+		// One row per warp. The 128-bit loads run along K.
 		rows_per = warps
 	} else if fn == k_gemv2_q4x {
 		rows_per = warps * 8
@@ -668,8 +676,8 @@ launch_gemv2 :: proc(fn: cu.Function, kind: ggml.GGML_Type, w, y: cu.Device_Ptr,
 	// when two logits are within a few ulps. Capture includes the split only
 	// when the zeroing memset can be recorded on g_stream.
 	splits := gemv_k_splits(kind, n, d, r1)
-	// gemv2_q4w_k ignores grid.y and would add the whole row once per split.
-	if fn == k_gemv2_q4w {
+	// The warp-per-row kernels ignore grid.y and would add the whole row once per split.
+	if fn == k_gemv2_q4w || fn == k_gemv2_q6w || fn == k_gemv2_q5w {
 		splits = 1
 	}
 	if splits > 1 && g_capturing && (g_stream == nil || cu.gapi.memset_async == nil) {
@@ -697,6 +705,10 @@ launch_gemv2 :: proc(fn: cu.Function, kind: ggml.GGML_Type, w, y: cu.Device_Ptr,
 		what = "gemv2_q4pipe"
 	} else if fn == k_gemv2_q4w {
 		what = "gemv2_q4w"
+	} else if fn == k_gemv2_q6w {
+		what = "gemv2_q6w"
+	} else if fn == k_gemv2_q5w {
+		what = "gemv2_q5w"
 	} else if fn == k_gemv2_q6_pipe {
 		what = "gemv2_q6pipe"
 	}
@@ -705,7 +717,7 @@ launch_gemv2 :: proc(fn: cu.Function, kind: ggml.GGML_Type, w, y: cu.Device_Ptr,
 	// was slower (3.95 -> 4.19 ms). 27B w2 is 5120 x 17408 and the logits
 	// are 248320 rows; staging those was faster (7.99 -> 7.04 ms).
 	// The pipe kernel replaces staging while it is on.
-	if kind == .Q6_K && !r1 && !g_gemv_pipe && k_gemv2_q6s != nil && q6_stage_on(n, d) {
+	if kind == .Q6_K && !r1 && !g_gemv_pipe && fn != k_gemv2_q6w && k_gemv2_q6s != nil && q6_stage_on(n, d) {
 		fn_use = k_gemv2_q6s
 		what = "gemv2_q6s"
 	}
@@ -763,13 +775,18 @@ gemv_k_splits :: proc(kind: ggml.GGML_Type, n, d: int, r1: bool) -> int {
 // both outputs untouched.
 @(private)
 launch_gemv_pair :: proc(a, b: Tensor, x, y0, y1: cu.Device_Ptr, n, d: int) -> bool {
-	if !g_gemv_fuse || g_gemv_mmvq || k_gemv2_q4_pair == nil || g_q4_nc || g_q4_ilp || g_gemv_rows == 1 {
+	if !g_gemv_fuse || k_gemv2_q4_pair == nil || g_q4_nc || g_q4_ilp || g_gemv_rows == 1 {
+		return false
+	}
+	if g_gemv_mmvq && k_gemv2_q4w_pair == nil {
 		return false
 	}
 	if a.kind != .Q4_K || b.kind != .Q4_K || n <= 0 || d <= 0 || n % 256 != 0 {
 		return false
 	}
-	if gemv_k_splits(.Q4_K, n, d, false) != 1 {
+	// The 4-row pair is only for matrices that are not split. The warp-per-row
+	// pair does not split, so a short grid is still one launch.
+	if !g_gemv_mmvq && gemv_k_splits(.Q4_K, n, d, false) != 1 {
 		return false
 	}
 	// 27B w1 is K=5120 and the pair won (0.097 ms vs 0.180). 9B w1 is
@@ -794,12 +811,17 @@ launch_gemv_pair :: proc(a, b: Tensor, x, y0, y1: cu.Device_Ptr, n, d: int) -> b
 		warps = 16
 	}
 	rows_per := warps * 4
+	pfn := k_gemv2_q4_pair
+	pname := "gemv2_q4p"
+	if g_gemv_mmvq {
+		rows_per = warps
+		pfn = k_gemv2_q4w_pair
+		pname = "gemv2_q4wp"
+	}
 	gx := u32((d + rows_per - 1) / rows_per)
 	bx := u32(warps * 32)
 	args := [?]rawptr{&w0, &w1, &qs, &sc, &sm, &yy0, &yy1, &nn, &dd}
-	pfn := k_gemv2_q4_pair
-	pname := "gemv2_q4p"
-	if g_gemv_pipe && k_gemv2_q4_pair_pipe != nil {
+	if !g_gemv_mmvq && g_gemv_pipe && k_gemv2_q4_pair_pipe != nil {
 		pfn = k_gemv2_q4_pair_pipe
 		pname = "gemv2_q4pp"
 	}
@@ -1962,12 +1984,15 @@ bind_kernels :: proc() -> bool {
 	k_gemv2_q4x = get_fn("gemv2_q4x_k")
 	k_gemv2_q4_pipe = get_fn("gemv2_q4_pipe_k")
 	k_gemv2_q4w = get_fn("gemv2_q4w_k")
+	k_gemv2_q4w_pair = get_fn("gemv2_q4w_pair_k")
 	k_gemv2_q4_pair = get_fn("gemv2_q4_pair_k")
 	k_gemv2_q4_pair_pipe = get_fn("gemv2_q4_pair_pipe_k")
 	k_gemv2_q6 = get_fn("gemv2_q6_k")
 	k_gemv2_q6s = get_fn("gemv2_q6s_k")
+	k_gemv2_q6w = get_fn("gemv2_q6w_k")
 	k_gemv2_q6_pipe = get_fn("gemv2_q6_pipe_k")
 	k_gemv2_q5k = get_fn("gemv2_q5_k")
+	k_gemv2_q5w = get_fn("gemv2_q5w_k")
 	k_gemv2_q8 = get_fn("gemv2_q8_0")
 	k_gemv2_q50 = get_fn("gemv2_q5_0")
 	k_gemv2r1_q4 = get_fn("gemv2r1_q4_k")
@@ -1978,7 +2003,7 @@ bind_kernels :: proc() -> bool {
 		k_conv, k_conv_chunk, k_l2, k_l2_chunk, k_delta, k_delta_chunk, k_delta_sm, k_delta_wmma, k_rmsgate, k_rmsgate_q, k_moe_topk,
 		k_gate_q, k_swiglu_q,
 		k_tc2_q4, k_tc2_q6, k_tc2s_q4, k_tc2s_q6, k_tc2m_q4, k_tc2m_q6, k_tc2r_q4, k_tc2r_q6,
-		k_quant, k_rmsnorm_q8, k_res_norm, k_gemv2_q4, k_gemv2_q4nc, k_gemv2_q4x, k_gemv2_q4_pipe, k_gemv2_q4w, k_gemv2_q4_pair, k_gemv2_q4_pair_pipe, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q6_pipe, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50,
+		k_quant, k_rmsnorm_q8, k_res_norm, k_gemv2_q4, k_gemv2_q4nc, k_gemv2_q4x, k_gemv2_q4_pipe, k_gemv2_q4w, k_gemv2_q4w_pair, k_gemv2_q4_pair, k_gemv2_q4_pair_pipe, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q6_pipe, k_gemv2_q6w, k_gemv2_q5k, k_gemv2_q5w, k_gemv2_q8, k_gemv2_q50,
 		k_gemv2r1_q4, k_gemv2r1_q6,
 		k_pgemm_q4, k_pgemm_q6, k_wgemm_q4, k_wgemm_q6, k_wgemm_q5, k_wgemm_q4x, k_wgemm_q6x, k_wgemm_q5x, k_pack_f16, k_quant_batch, k_mmqk_q4, k_mmqk_q4_r4, k_mmqk_q6, k_mmqk_q4_pair, k_mmqk_q6_pair,
 	}
@@ -2360,7 +2385,9 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 			g_gemv_warps = int(v)
 		}
 	}
-	g_gemv_mmvq = os.get_env("ODINFER_CUDA_GEMV_MMVQ", context.temp_allocator) == "1"
+	// On unless set to 0. #23 measured Q4 at T=1 wall 33.29 vs 35.72 and
+	// linear 26.04 vs 28.48. =0 is gemv2_q4 / gemv2_q4p / gemv2_q6s / gemv2_q5_k.
+	g_gemv_mmvq = os.get_env("ODINFER_CUDA_GEMV_MMVQ", context.temp_allocator) != "0"
 	g_gemv_rows = 0
 	if s := os.get_env("ODINFER_CUDA_GEMV_ROWS", context.temp_allocator); s != "" {
 		if v, ok := strconv.parse_int(s); ok && (v == 1 || v == 4) {
@@ -2848,7 +2875,7 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 		fmt.eprintln("cuda: gemv pipe on (next super-block issued before the dot). ODINFER_CUDA_GEMV_PIPE=0 keeps one block in flight")
 	}
 	if g_gemv_mmvq {
-		fmt.eprintln("cuda: gemv mmvq on (one warp per Q4 row, loads along K, no split-K). ODINFER_CUDA_GEMV_MMVQ=0 keeps gemv2_q4")
+		fmt.eprintln("cuda: gemv mmvq on (one warp per Q4/Q5/Q6 row, q4 gate+up pair when K>=5120). ODINFER_CUDA_GEMV_MMVQ=0 keeps the 4-row kernels")
 	}
 	if g_use_graph {
 		fmt.eprintln("cuda: graph on for dense T=1. Split attention recaptures when the KV part count changes (every 32 tokens, every 128 past 2048). MoE stays eager")
