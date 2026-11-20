@@ -888,9 +888,11 @@ extern "C" __global__ void attention_q8v(const float* q, const unsigned char* kc
     }
 }
 
-/* Split decode attention for the mixed-V cache. Prefill stays on
-   attention_q8v: running the parts once per token of a T=128 chunk was
+/* Split decode attention for the mixed-V cache. Prefill does not use
+   these kernels: running the parts once per token of a T=128 chunk was
    slower on the V100S (about 10% on 905 and 1805 token prefills).
+   Prefill is attention_q8v_flash, or attention_q8v when
+   ODINFER_CUDA_PREFILL_FLASH=0.
    attention_q8v is one block per query head. Its V loop walks every
    position on each thread, so a long context uses a handful of SMs and
    the time grows linearly with npos even though the KV row is a few
@@ -1037,6 +1039,124 @@ extern "C" __global__ void attention_q8v_reduce(float* xb3, const float* part_m,
     float inv = l > 0.f ? 1.f / l : 0.f;
     if (has0) xb3[(size_t)h * (size_t)head_dim + i0] = acc0 * inv;
     if (has1) xb3[(size_t)h * (size_t)head_dim + i1] = acc1 * inv;
+}
+
+/* Prefill flash attention for the mixed-V cache. One block owns one KV
+   head and `br` query tokens (the last tile of the chunk may be shorter).
+   It stages 32-token K and V tiles once and reuses them across every query
+   head in the GQA group, so a 27B group of 6 query heads does not reload
+   that KV six times.    Scores stay in registers: each warp keeps an online
+   softmax (max, sum, unnormalized V) and merges the next tile with
+   exp(m_old - m_new). That rescale is the same one attention_q8v_reduce
+   applies once at the end; here it runs as each 32-token tile arrives,
+   so it is not bit-exact against attention_q8v. cuda_selftest allows
+   2e-2 + 1e-3*|ref|. Dots are fp32 warp dots in attn_k_dot's j-then-block
+   order. WMMA fp16 is not used: it would move the softmax enough to risk
+   the greedy-text check, and there is no V100 timing that says it is faster.
+   head_dim is a multiple of 32, at most 256. kv_mul is at most 16. br is
+   1, 2, 3, or 4. Shared memory stays under 48 KB. ODINFER_CUDA_PREFILL_FLASH=0
+   keeps attention_q8v. Decode (T==1) does not launch this kernel. */
+extern "C" __global__ void attention_q8v_flash(const float* q, const unsigned char* kc, const unsigned char* vc, float* xb3,
+                                               int head_dim, int k_pos_bytes, int v_pos_bytes, int kv_mul, int n_heads,
+                                               int pos0, int T, int tok_stride, int br) {
+    int kvh = (int)blockIdx.x;
+    int tile0 = (int)blockIdx.y * br;
+    int tid = (int)threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    if (tile0 >= T || br < 1 || br > 4 || head_dim > 256 || head_dim < 32 || kv_mul < 1 || kv_mul > 16) return;
+    if (kvh * kv_mul >= n_heads) return;
+    int ntok = br;
+    if (tile0 + ntok > T) ntok = T - tile0;
+    int nb = head_dim >> 5;
+    if (nb <= 0) return;
+    int cap = br * kv_mul;
+    int njob = ntok * kv_mul;
+    int max_npos = pos0 + tile0 + ntok;
+    extern __shared__ __align__(16) unsigned char flash_smem[];
+    float* sq = (float*)flash_smem;
+    float* acc = sq + (size_t)cap * (size_t)head_dim;
+    float* ms = acc + (size_t)cap * (size_t)head_dim;
+    float* ls = ms + cap;
+    int fbytes = cap * head_dim * 4 * 2 + cap * 8;
+    fbytes = (fbytes + 15) & ~15;
+    unsigned char* sk = flash_smem + fbytes;
+    unsigned char* sv = sk + (size_t)32 * (size_t)nb * 34;
+    for (int job = 0; job < njob; ++job) {
+        int tok = job / kv_mul;
+        int qi = job - tok * kv_mul;
+        int h = kvh * kv_mul + qi;
+        const float* qh = q + ((size_t)(tile0 + tok) * (size_t)tok_stride + (size_t)h * (size_t)head_dim);
+        float* dst = sq + (size_t)job * (size_t)head_dim;
+        for (int i = tid; i < head_dim; i += 128) {
+            dst[i] = qh[i];
+            acc[(size_t)job * (size_t)head_dim + i] = 0.f;
+        }
+        if (tid == 0) {
+            ms[job] = -1e30f;
+            ls[job] = 0.f;
+        }
+    }
+    __syncthreads();
+    int kbytes = nb * 34;
+    int vbytes = nb * 40;
+    float scale = rsqrtf((float)head_dim);
+    int ntiles = (max_npos + 31) >> 5;
+    for (int tile = 0; tile < ntiles; ++tile) {
+        int begin = tile << 5;
+        int ncopy = max_npos - begin;
+        if (ncopy > 32) ncopy = 32;
+        for (int t = 0; t < ncopy; ++t) {
+            const unsigned char* ks = kc + ((size_t)(begin + t) * (size_t)k_pos_bytes + (size_t)kvh * (size_t)kbytes);
+            const unsigned char* vs = vc + ((size_t)(begin + t) * (size_t)v_pos_bytes + (size_t)kvh * (size_t)vbytes);
+            unsigned char* kd = sk + (size_t)t * (size_t)kbytes;
+            unsigned char* vd = sv + (size_t)t * (size_t)vbytes;
+            for (int i = tid; i < kbytes; i += 128) kd[i] = ks[i];
+            for (int i = tid; i < vbytes; i += 128) vd[i] = vs[i];
+        }
+        __syncthreads();
+        for (int job = warp; job < njob; job += 4) {
+            int tok = job / kv_mul;
+            int npos = pos0 + tile0 + tok + 1;
+            if (begin >= npos) continue;
+            int nlocal = npos - begin;
+            if (nlocal > 32) nlocal = 32;
+            const float* qh = sq + (size_t)job * (size_t)head_dim;
+            float s = -1e30f;
+            if (lane < nlocal) s = attn_k_dot(qh, sk + (size_t)lane * (size_t)kbytes, nb) * scale;
+            float mt = warp_max_all(s);
+            float e = (lane < nlocal) ? expf(s - mt) : 0.f;
+            float lt = warp_sum_all(e);
+            float m_old = ms[job];
+            float l_old = ls[job];
+            float m_new = fmaxf(m_old, mt);
+            float alpha = expf(m_old - m_new);
+            float beta = expf(mt - m_new);
+            float* ao = acc + (size_t)job * (size_t)head_dim;
+            for (int i = lane; i < head_dim; i += 32) {
+                float pv = 0.f;
+                for (int src = 0; src < nlocal; ++src) {
+                    float wt = __shfl_sync(0xffffffff, e, src);
+                    pv += wt * attn_v_at(sv, nb, src, i);
+                }
+                ao[i] = ao[i] * alpha + pv * beta;
+            }
+            if (lane == 0) {
+                ms[job] = m_new;
+                ls[job] = l_old * alpha + lt * beta;
+            }
+        }
+        __syncthreads();
+    }
+    for (int job = 0; job < njob; ++job) {
+        int tok = job / kv_mul;
+        int qi = job - tok * kv_mul;
+        int h = kvh * kv_mul + qi;
+        float inv = ls[job] > 0.f ? 1.f / ls[job] : 0.f;
+        float* ao = acc + (size_t)job * (size_t)head_dim;
+        float* out = xb3 + ((size_t)(tile0 + tok) * (size_t)tok_stride + (size_t)h * (size_t)head_dim);
+        for (int i = tid; i < head_dim; i += 128) out[i] = ao[i] * inv;
+    }
 }
 
 extern "C" __global__ void conv1d_step(float* qkv_out, const float* qkv_in, float* conv_state, const float* weight,
