@@ -863,8 +863,12 @@ run_mmqk :: proc(kind: ggml.GGML_Type, rows, cols, T: int) -> bool {
 	wb, yy := dw, dy
 	dd := i32(rows)
 	args := [?]rawptr{&wb, &qp, &sc, &sm, &yy, &nn, &dd, &tt}
-	// 256 threads, 32 rows x 64 tokens, 22528 bytes of staged q8.
-	gx := u32((rows + 31) / 32)
+	// Q4 is 64 rows per block (8 per warp). Q6 stays at 32. 22528 bytes of q8.
+	bm := 32
+	if kind == .Q4_K {
+		bm = 64
+	}
+	gx := u32((rows + bm - 1) / bm)
 	gy := u32((T + 63) / 64)
 	if cu.launch(fn, gx, gy, 1, 256, 1, 1, 22528, args[:]) != cu.OK || cu.sync() != cu.OK {
 		fmt.eprintf("cuda_selftest: %s launch failed\n", name)
@@ -912,6 +916,159 @@ run_mmqk :: proc(kind: ggml.GGML_Type, rows, cols, T: int) -> bool {
 		cu.download(raw_data(grow), drow, rows * 4)
 		for r in 0 ..< rows {
 			s_note(&st_g, fmt.tprintf("%s gemv2 t=%d r=%d", name, t, r), got[t * rows + r], grow[r], 2e-3, 2e-3)
+		}
+	}
+	ok_cpu := s_report(fmt.tprintf("%s vs cpu T=%d rows=%d cols=%d", name, T, rows, cols), st_cpu, cpu_atol, cpu_rtol)
+	ok_g := s_report(fmt.tprintf("%s vs gemv2 T=%d rows=%d cols=%d", name, T, rows, cols), st_g, 2e-3, 2e-3)
+	return ok_cpu && ok_g
+}
+
+// Two same-shaped matrices on one q8 tile. The second weight is a different
+// byte pattern so a swapped output fails. Same allowances as run_mmqk.
+// The pair block is 32 rows even for Q4.
+@(private)
+run_mmqk_pair :: proc(kind: ggml.GGML_Type, rows, cols, T: int) -> bool {
+	tag := cuda_kind_tag(kind)
+	name := "mmqk_q4_pair"
+	if kind == .Q6_K {
+		name = "mmqk_q6_pair"
+	}
+	fn := s_fn(name)
+	qfn := s_fn("quant_q8_batch")
+	gfn := s_fn(fmt.tprintf("gemv2_%s", tag))
+	q1 := s_fn("quant_q8")
+	if fn == nil || qfn == nil || gfn == nil || q1 == nil {
+		fmt.eprintf("cuda_selftest: missing %s\n", name)
+		return false
+	}
+	raw0 := fill_weight(kind, rows, cols)
+	raw1 := fill_weight(kind, rows, cols)
+	defer delete(raw0)
+	defer delete(raw1)
+	for i in 0 ..< len(raw1) {
+		raw1[i] = u8((int(raw1[i]) + 19) & 0xFF)
+	}
+	x := make([]f32, T * cols)
+	defer delete(x)
+	for t in 0 ..< T {
+		for j in 0 ..< cols {
+			x[t * cols + j] = (f32((t + 1) * (j + 3) % 9) - 4) * 0.03
+		}
+	}
+	ref0 := make([]f32, T * rows)
+	ref1 := make([]f32, T * rows)
+	defer delete(ref0)
+	defer delete(ref1)
+	for t in 0 ..< T {
+		row := cpu_gemv(kind, raw0, x[t * cols:][:cols], rows, cols)
+		copy(ref0[t * rows:][:rows], row)
+		delete(row)
+		row = cpu_gemv(kind, raw1, x[t * cols:][:cols], rows, cols)
+		copy(ref1[t * rows:][:rows], row)
+		delete(row)
+	}
+	ng := cols / 32
+	dw0, e0 := cu.alloc(len(raw0) + 64)
+	dw1, e1 := cu.alloc(len(raw1) + 64)
+	dx, e2 := cu.alloc(T * cols * 4)
+	dy0, e3 := cu.alloc(T * rows * 4)
+	dy1, e4 := cu.alloc(T * rows * 4)
+	dpack, e5 := cu.alloc(T * cols)
+	dsc, e6 := cu.alloc(T * ng * 4)
+	dsm, e7 := cu.alloc(T * ng * 8)
+	dqs, e8 := cu.alloc(cols)
+	dscale, e9 := cu.alloc(ng * 4)
+	dsum, e10 := cu.alloc(ng * 8)
+	drow, e11 := cu.alloc(rows * 4)
+	defer cu.free(dw0)
+	defer cu.free(dw1)
+	defer cu.free(dx)
+	defer cu.free(dy0)
+	defer cu.free(dy1)
+	defer cu.free(dpack)
+	defer cu.free(dsc)
+	defer cu.free(dsm)
+	defer cu.free(dqs)
+	defer cu.free(dscale)
+	defer cu.free(dsum)
+	defer cu.free(drow)
+	if e0 != cu.OK || e1 != cu.OK || e2 != cu.OK || e3 != cu.OK || e4 != cu.OK || e5 != cu.OK || e6 != cu.OK || e7 != cu.OK || e8 != cu.OK || e9 != cu.OK || e10 != cu.OK || e11 != cu.OK {
+		fmt.eprintf("cuda_selftest: %s alloc failed\n", name)
+		return false
+	}
+	cu.upload(dw0, raw_data(raw0), len(raw0))
+	cu.upload(dw1, raw_data(raw1), len(raw1))
+	cu.upload(dx, raw_data(x), T * cols * 4)
+	xx, qp, sc, sm := dx, dpack, dsc, dsm
+	nn, tt := i32(cols), i32(T)
+	qargs := [?]rawptr{&xx, &qp, &sc, &sm, &nn, &tt}
+	blocks := u32((ng * T + 255) / 256)
+	if cu.launch(qfn, blocks, 1, 1, 256, 1, 1, 0, qargs[:]) != cu.OK {
+		fmt.eprintf("cuda_selftest: quant_q8_batch launch failed (%s)\n", name)
+		return false
+	}
+	wb, wb2, yy, yy2 := dw0, dw1, dy0, dy1
+	dd := i32(rows)
+	args := [?]rawptr{&wb, &wb2, &qp, &sc, &sm, &yy, &yy2, &nn, &dd, &tt}
+	gx := u32((rows + 31) / 32)
+	gy := u32((T + 63) / 64)
+	if cu.launch(fn, gx, gy, 1, 256, 1, 1, 22528, args[:]) != cu.OK || cu.sync() != cu.OK {
+		fmt.eprintf("cuda_selftest: %s launch failed\n", name)
+		return false
+	}
+	got0 := make([]f32, T * rows)
+	got1 := make([]f32, T * rows)
+	defer delete(got0)
+	defer delete(got1)
+	cu.download(raw_data(got0), dy0, T * rows * 4)
+	cu.download(raw_data(got1), dy1, T * rows * 4)
+	cpu_atol, cpu_rtol: f32 = 1, 5e-2
+	st_cpu: Case_Err
+	for i in 0 ..< T * rows {
+		s_note(&st_cpu, fmt.tprintf("%s cpu0 [%d]", name, i), got0[i], ref0[i], cpu_atol, cpu_rtol)
+		s_note(&st_cpu, fmt.tprintf("%s cpu1 [%d]", name, i), got1[i], ref1[i], cpu_atol, cpu_rtol)
+	}
+	warps := 4
+	ggx := u32((rows + warps * 4 - 1) / (warps * 4))
+	bx := u32(warps * 32)
+	acc := i32(0)
+	st_g: Case_Err
+	grow := make([]f32, rows)
+	defer delete(grow)
+	for t in 0 ..< T {
+		rowx := cu.ptr_add(dx, t * cols * 4)
+		qs, gsc, gsm := dqs, dscale, dsum
+		rn := i32(cols)
+		one := [?]rawptr{&rowx, &qs, &gsc, &gsm, &rn}
+		if cu.launch(q1, u32((ng + 127) / 128), 1, 1, 128, 1, 1, 0, one[:]) != cu.OK {
+			fmt.eprintf("cuda_selftest: quant_q8 launch failed (%s)\n", name)
+			return false
+		}
+		ry := drow
+		rd := i32(rows)
+		for which in 0 ..< 2 {
+			wsel := dw0
+			got := got0
+			if which == 1 {
+				wsel = dw1
+				got = got1
+			}
+			launched: bool
+			if kind == .Q4_K {
+				gargs := [?]rawptr{&wsel, &qs, &gsc, &gsm, &ry, &rn, &rd, &acc}
+				launched = cu.launch(gfn, ggx, 1, 1, bx, 1, 1, 0, gargs[:]) == cu.OK
+			} else {
+				gargs := [?]rawptr{&wsel, &qs, &gsc, &ry, &rn, &rd, &acc}
+				launched = cu.launch(gfn, ggx, 1, 1, bx, 1, 1, 0, gargs[:]) == cu.OK
+			}
+			if !launched || cu.sync() != cu.OK {
+				fmt.eprintf("cuda_selftest: gemv2 launch failed (%s)\n", name)
+				return false
+			}
+			cu.download(raw_data(grow), drow, rows * 4)
+			for r in 0 ..< rows {
+				s_note(&st_g, fmt.tprintf("%s gemv2 w%d t=%d r=%d", name, which, t, r), got[t * rows + r], grow[r], 2e-3, 2e-3)
+			}
 		}
 	}
 	ok_cpu := s_report(fmt.tprintf("%s vs cpu T=%d rows=%d cols=%d", name, T, rows, cols), st_cpu, cpu_atol, cpu_rtol)
@@ -2140,6 +2297,9 @@ cuda_selftest :: proc() -> bool {
 		}
 		// Same shapes. mmqk must match gemv2 within 2e-3. The CPU compare uses gemv2's q8 allowance.
 		if !run_mmqk(.Q4_K, shape[0], shape[1], shape[2]) || !run_mmqk(.Q6_K, shape[0], shape[1], shape[2]) {
+			ok = false
+		}
+		if !run_mmqk_pair(.Q4_K, shape[0], shape[1], shape[2]) || !run_mmqk_pair(.Q6_K, shape[0], shape[1], shape[2]) {
 			ok = false
 		}
 	}
