@@ -240,61 +240,206 @@ is_special_pair :: proc(a, b: string) -> bool {
 	       len(b) > 0 && b[0] == '<' && strings.contains_rune(b, '|')
 }
 
-encode :: proc(t: ^Tokenizer, text: string, allocator := context.allocator) -> ([]int, mem.Allocator_Error) {
-	tokens := make([dynamic]string, allocator = context.temp_allocator)
+// One symbol in the BPE chain. `start` is the byte offset of its first
+// byte, which is the leftmost-wins tie break of the old scan.
+Bpe_Node :: struct {
+	piece: string,
+	prev:  int,
+	next:  int,
+	ver:   int,
+	start: int,
+}
 
+Bpe_Cand :: struct {
+	rank:  int,
+	start: int,
+	left:  int,
+	right: int,
+	lv:    int,
+	rv:    int,
+}
+
+@(private)
+bpe_before :: proc(a, b: Bpe_Cand) -> bool {
+	if a.rank != b.rank {
+		return a.rank < b.rank
+	}
+	return a.start < b.start
+}
+
+@(private)
+bpe_push :: proc(h: ^[dynamic]Bpe_Cand, c: Bpe_Cand) {
+	append(h, c)
+	i := len(h) - 1
+	for i > 0 {
+		p := (i - 1) / 2
+		if !bpe_before(h[i], h[p]) {
+			break
+		}
+		h[i], h[p] = h[p], h[i]
+		i = p
+	}
+}
+
+@(private)
+bpe_pop :: proc(h: ^[dynamic]Bpe_Cand) -> (Bpe_Cand, bool) {
+	if len(h) == 0 {
+		return {}, false
+	}
+	top := h[0]
+	last := len(h) - 1
+	h[0] = h[last]
+	resize(h, last)
+	i := 0
+	for {
+		l := i * 2 + 1
+		if l >= len(h) {
+			break
+		}
+		s := l
+		r := l + 1
+		if r < len(h) && bpe_before(h[r], h[l]) {
+			s = r
+		}
+		if !bpe_before(h[s], h[i]) {
+			break
+		}
+		h[i], h[s] = h[s], h[i]
+		i = s
+	}
+	return top, true
+}
+
+// Same merges as the old full scan (lowest rank, leftmost on a tie), in
+// O(n log n) instead of one pass over the whole chain per merge. A 5k-token
+// string was 3.7 s; 15k tokens was about a minute.
+encode :: proc(t: ^Tokenizer, text: string, allocator := context.allocator) -> ([]int, mem.Allocator_Error) {
+	nodes := make([dynamic]Bpe_Node, 0, len(text) + 8)
+	owned := make([dynamic][]u8, 0, 64)
+	defer {
+		for b in owned {
+			delete(b)
+		}
+		delete(owned)
+		delete(nodes)
+	}
+
+	prev := -1
 	i := 0
 	for i < len(text) {
+		piece: string
+		start := i
 		if id, match_len, found := match_special_token(t, text[i:]); found {
-			append(&tokens, t.vocab[id])
+			piece = t.vocab[id]
 			i += match_len
+		} else {
+			b := text[i]
+			end := 0
+			for end < len(unicode_bytes[b]) && unicode_bytes[b][end] != 0 {
+				end += 1
+			}
+			piece = string(unicode_bytes[b][:end])
+			i += 1
+		}
+		idx := len(nodes)
+		append(&nodes, Bpe_Node{piece = piece, prev = prev, next = -1, ver = 0, start = start})
+		if prev >= 0 {
+			nodes[prev].next = idx
+		}
+		prev = idx
+	}
+
+	heap := make([dynamic]Bpe_Cand, 0, len(nodes))
+	defer delete(heap)
+	push_pair :: proc(h: ^[dynamic]Bpe_Cand, nodes: ^[dynamic]Bpe_Node, tok: ^Tokenizer, left: int) {
+		if left < 0 {
+			return
+		}
+		right := nodes[left].next
+		if right < 0 {
+			return
+		}
+		rank := get_merge_rank(tok, nodes[left].piece, nodes[right].piece)
+		if rank == MERGE_NOT_FOUND {
+			return
+		}
+		bpe_push(h, Bpe_Cand{
+			rank = rank,
+			start = nodes[left].start,
+			left = left,
+			right = right,
+			lv = nodes[left].ver,
+			rv = nodes[right].ver,
+		})
+	}
+	for n in 0 ..< len(nodes) - 1 {
+		push_pair(&heap, &nodes, t, n)
+	}
+
+	for {
+		cand, ok := bpe_pop(&heap)
+		if !ok {
+			break
+		}
+		if nodes[cand.left].ver != cand.lv || nodes[cand.right].ver != cand.rv {
 			continue
 		}
-
-		b := text[i]
-		end := 0
-		for end < len(unicode_bytes[b]) && unicode_bytes[b][end] != 0 {
-			end += 1
+		if nodes[cand.left].next != cand.right {
+			continue
 		}
-		append(&tokens, strings.clone(string(unicode_bytes[b][:end])))
-		i += 1
+		if is_special_pair(nodes[cand.left].piece, nodes[cand.right].piece) {
+			break
+		}
+		left := nodes[cand.left]
+		right := nodes[cand.right]
+		buf := make([]u8, len(left.piece) + len(right.piece))
+		copy(buf, left.piece)
+		copy(buf[len(left.piece):], right.piece)
+		append(&owned, buf)
+		idx := len(nodes)
+		append(&nodes, Bpe_Node{
+			piece = string(buf),
+			prev = left.prev,
+			next = right.next,
+			ver = 0,
+			start = left.start,
+		})
+		nodes[cand.left].ver += 1
+		nodes[cand.right].ver += 1
+		if left.prev >= 0 {
+			nodes[left.prev].next = idx
+		}
+		if right.next >= 0 {
+			nodes[right.next].prev = idx
+		}
+		push_pair(&heap, &nodes, t, left.prev)
+		push_pair(&heap, &nodes, t, idx)
 	}
 
-	// BPE merge
-	changed := true
-	for changed {
-		changed = false
-		best_rank := MERGE_NOT_FOUND
-		best_pos := -1
-
-		for i in 0 ..< len(tokens) - 1 {
-			rank := get_merge_rank(t, tokens[i], tokens[i + 1])
-			if rank < best_rank {
-				best_rank = rank
-				best_pos = i
-			}
+	count := 0
+	head := -1
+	for n in 0 ..< len(nodes) {
+		if nodes[n].prev < 0 && nodes[n].ver == 0 {
+			head = n
+			break
 		}
-
-		if best_pos == -1 do break
-		if is_special_pair(tokens[best_pos], tokens[best_pos + 1]) do break
-
-		merged := strings.clone(fmt.tprintf("%s%s", tokens[best_pos], tokens[best_pos + 1]))
-		tokens[best_pos] = merged
-		ordered_remove(&tokens, best_pos + 1)
-		changed = true
 	}
-
-	result, err := make([]int, len(tokens), allocator)
-	if err != nil do return nil, err
-
-	for i in 0 ..< len(tokens) {
-		if id, found := t.vocab_lookup[tokens[i]]; found {
-			result[i] = id
+	for at := head; at >= 0 && count < len(nodes); at = nodes[at].next {
+		count += 1
+	}
+	result, err := make([]int, count, allocator)
+	if err != nil {
+		return nil, err
+	}
+	out := 0
+	for at := head; at >= 0; at = nodes[at].next {
+		if id, found := t.vocab_lookup[nodes[at].piece]; found {
+			result[out] = id
 		} else {
-			result[i] = 0
+			result[out] = 0
 		}
+		out += 1
 	}
-
 	return result, nil
 }
 
@@ -409,6 +554,37 @@ encode_chat_template :: proc(t: ^testing.T) {
 		if id == 0 {
 			testing.expect(t, false, "token id 0 used for unknown token")
 		}
+	}
+}
+
+// Locks the heap merge to the old left-to-right scan. The repeated sentence
+// is the cuda_smoke prompt body. 331 tokens used to take 15 ms and 5131
+// tokens 3.7 s; both stay on this hash.
+@(test)
+encode_merge_order :: proc(t: ^testing.T) {
+	tok: Tokenizer
+	build_tokenizer(&tok)
+	defer free_tokenizer(&tok)
+	body := "The quick brown fox jumps over the lazy dog. "
+	reps := [?]int{33, 513}
+	want := [?]u64{2918863925090883675, 13672901658331668571}
+	for i in 0 ..< len(reps) {
+		parts := make([]string, reps[i])
+		for p in 0 ..< reps[i] {
+			parts[p] = body
+		}
+		text := strings.concatenate(parts)
+		delete(parts)
+		ids, err := encode(&tok, text)
+		delete(text)
+		testing.expect(t, err == nil, "encode failed")
+		h: u64 = 14695981039346656037
+		for id in ids {
+			h ~= u64(id)
+			h *= 1099511628211
+		}
+		delete(ids)
+		testing.expect(t, h == want[i], "merge order changed")
 	}
 }
 

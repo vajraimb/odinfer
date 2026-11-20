@@ -226,7 +226,17 @@ handle_client :: proc(client: net.TCP_Socket, handler: Server_Handler) {
 		write_full_response(client, &resp)
 	}
 	t2 := time_to_ms()
-	fmt.eprintfln("[perf] client: read={}ms parse+handler={}ms write={}ms total={}ms", t_read-t0, t1-t_read, t2-t1, t2-t0)
+	// Session KV is written after the socket has the response. It used to
+	// sit inside the decode timer (a 14k-token f32 dump is about 2 GB).
+	persist_ms: i64 = 0
+	if g_defer_persist {
+		g_defer_persist = false
+		tp := time_to_ms()
+		save_session_state()
+		persist_ms = time_to_ms() - tp
+	}
+	t3c := time_to_ms()
+	fmt.eprintfln("[perf] client: read={}ms parse+handler={}ms write={}ms persist={}ms total={}ms", t_read-t0, t1-t_read, t2-t1, persist_ms, t3c-t0)
 }
 
 // Look for chunked-body terminator "0\r\n\r\n" anywhere in body
@@ -663,7 +673,7 @@ handle_chat :: proc(body: string) -> string {
 		next = sampler.sample(&g_state.samp, logits)
 	}
 
-	save_session_state()
+	g_defer_persist = true
 
 	ttft := t_first - t_start
 	t_total := time_to_ms() - t_first  // decode only (excludes prefill)
@@ -1478,6 +1488,7 @@ extract_tool_specs :: proc(body: string, table: ^sampler.TCG_Table) {
 TOKENS_FILE_MAGIC :: u32(0x4F49544B) // 'OITK'
 
 g_kv_dir: string // empty = persistence disabled
+g_defer_persist: bool // set by a handler; flushed after the response is written
 
 kv_persist_path :: proc(name: string) -> string {
 	return fmt.tprintf("%s/%s", g_kv_dir, name)
@@ -1583,7 +1594,7 @@ restore_persisted_state :: proc() {
 		if lok && n == len(pt) {
 			g_state.prefix_kv_k, g_state.prefix_kv_v,
 				g_state.prefix_conv, g_state.prefix_rec =
-				q35.engine_save_full_state(&g_state.engine)
+				q35.engine_save_prefix_state(&g_state.engine, n)
 			g_state.prefix_pos = n
 			clear(&g_state.prefix_tokens)
 			append(&g_state.prefix_tokens, ..pt)
@@ -1744,6 +1755,7 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 
 	t_prefill_start := time_to_ms()
 	t_reset_ms: i64 = 0
+	t_snap_ms: i64 = 0
 
 	// Does the incoming prompt start with the cached system-prefix tokens?
 	// (Direct compare with cached prefix tokens, not common — common compares
@@ -1793,9 +1805,11 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 			common, len(encoded), len(new_tokens))
 	} else if prefix_matches {
 		// Restore full state from snapshot — instantly positions us at prefix_pos
-		q35.engine_restore_full_state(&g_state.engine,
+		t_s0 := time_to_ms()
+		q35.engine_restore_prefix_state(&g_state.engine, g_state.prefix_pos,
 			g_state.prefix_kv_k, g_state.prefix_kv_v,
 			g_state.prefix_conv, g_state.prefix_rec)
+		t_snap_ms += time_to_ms() - t_s0
 		g_state.pos = g_state.prefix_pos
 		// Now prefill only the tokens AFTER the cached prefix
 		suffix_tokens := encoded[g_state.prefix_pos:len(encoded) - 1]  // leave last for per-token fwd
@@ -1856,12 +1870,14 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 						delete(g_state.prefix_kv_k); delete(g_state.prefix_kv_v)
 						delete(g_state.prefix_conv); delete(g_state.prefix_rec)
 					}
-					g_state.prefix_kv_k, g_state.prefix_kv_v,
-						g_state.prefix_conv, g_state.prefix_rec =
-						q35.engine_save_full_state(&g_state.engine)
-					context.allocator = prev
-				}
-				g_state.prefix_pos = snap_pos
+				t_s0 := time_to_ms()
+				g_state.prefix_kv_k, g_state.prefix_kv_v,
+					g_state.prefix_conv, g_state.prefix_rec =
+					q35.engine_save_prefix_state(&g_state.engine, snap_pos)
+				t_snap_ms += time_to_ms() - t_s0
+				context.allocator = prev
+			}
+			g_state.prefix_pos = snap_pos
 				clear(&g_state.prefix_tokens)
 				for i in 0 ..< snap_pos { append(&g_state.prefix_tokens, encoded[i]) }
 				fmt.eprintfln("ollama: prefix snapshot at system boundary pos=%d (%d tokens cached)",
@@ -1876,7 +1892,8 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 			g_state.pc_misses += 1
 			fmt.eprintfln("ollama: full prefill (%d tokens, common=%d)", len(encoded), common)
 		}
-	t_prefill_ms := time_to_ms() - t_prefill_start
+	t_prefill_ms := time_to_ms() - t_prefill_start - t_reset_ms - t_snap_ms
+	if t_prefill_ms < 0 { t_prefill_ms = 0 }
 
 	// Cache this turn's tokens for next time
 	clear(&g_state.last_tokens)
@@ -1986,9 +2003,9 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 	ndjson_end(client)
 	t_gen_ms := time_to_ms() - t_gen_start
 	tps := gen > 0 && t_gen_ms > 0 ? f64(gen) * 1000.0 / f64(t_gen_ms) : 0.0
-	fmt.eprintfln("ollama: %d in / %d out | reset=%dms prefill=%dms gen=%dms (%.1f tok/s)",
-		len(encoded), gen, t_reset_ms, t_prefill_ms, t_gen_ms, tps)
-	save_session_state()
+	fmt.eprintfln("ollama: %d in / %d out | reset=%dms snapshot=%dms prefill=%dms gen=%dms (%.1f tok/s)",
+		len(encoded), gen, t_reset_ms, t_snap_ms, t_prefill_ms, t_gen_ms, tps)
+	g_defer_persist = true
 }
 
 // ====================== OpenAI Responses API (streaming, for Codex) ======================
@@ -2536,6 +2553,7 @@ handle_openai_chat :: proc(body: string) -> string {
 		common < len(encoded) && g_state.pos == common - 1
 
 	t_reset_ms: i64 = 0
+	t_snap_ms: i64 = 0
 	if can_continue && (!prefix_matches || common >= g_state.prefix_pos) {
 		new_tokens := encoded[common:len(encoded) - 1]
 		if len(new_tokens) > 0 {
@@ -2544,9 +2562,11 @@ handle_openai_chat :: proc(body: string) -> string {
 		g_state.pos = len(encoded) - 1
 		g_state.pc_continuation_hits += 1
 	} else if prefix_matches {
-		q35.engine_restore_full_state(&g_state.engine,
+		t_s0 := time_to_ms()
+		q35.engine_restore_prefix_state(&g_state.engine, g_state.prefix_pos,
 			g_state.prefix_kv_k, g_state.prefix_kv_v,
 			g_state.prefix_conv, g_state.prefix_rec)
+		t_snap_ms += time_to_ms() - t_s0
 		g_state.pos = g_state.prefix_pos
 		suffix_tokens := encoded[g_state.prefix_pos:len(encoded) - 1]
 		if len(suffix_tokens) > 0 {
@@ -2569,9 +2589,11 @@ handle_openai_chat :: proc(body: string) -> string {
 					delete(g_state.prefix_kv_k); delete(g_state.prefix_kv_v)
 					delete(g_state.prefix_conv); delete(g_state.prefix_rec)
 				}
+				t_s0 := time_to_ms()
 				g_state.prefix_kv_k, g_state.prefix_kv_v,
 					g_state.prefix_conv, g_state.prefix_rec =
-					q35.engine_save_full_state(&g_state.engine)
+					q35.engine_save_prefix_state(&g_state.engine, snap_pos)
+				t_snap_ms += time_to_ms() - t_s0
 				context.allocator = prev
 			}
 			clear(&g_state.prefix_tokens)
@@ -2630,7 +2652,7 @@ handle_openai_chat :: proc(body: string) -> string {
 		next = sampler.sample(&g_state.samp, logits)
 	}
 
-	save_session_state()
+	g_defer_persist = true
 
 	ttft := t_first - t_start
 	t_total := time_to_ms() - t_first  // decode only (excludes prefill)
@@ -2664,8 +2686,10 @@ handle_openai_chat :: proc(body: string) -> string {
 	strings.write_string(&out, fmt.tprintf(`"total_tokens":%d`, len(encoded) + gen))
 	strings.write_string(&out, "}}")
 	final := strings.clone(strings.to_string(out))
-	fmt.eprintfln("[perf] openai_chat: parse/render={}ms reset={}ms encode={}ms prefill={}ms decode={}ms (ttft={}ms, tps={:.2f}, fwd_cpu={}ms) build_resp={}ms total={}ms (gen={})",
-		t1-t0, t2-t1, t3-t2, t4-t3, t_total, ttft, tps, fwd_cpu_ms, time_to_ms()-t5, time_to_ms()-t0, gen)
+	t_prefill_ms := t4 - t3 - t_reset_ms - t_snap_ms
+	if t_prefill_ms < 0 { t_prefill_ms = 0 }
+	fmt.eprintfln("[perf] openai_chat: parse/render={}ms encode={}ms reset={}ms snapshot={}ms prefill={}ms decode={}ms (ttft={}ms, tps={:.2f}, fwd_cpu={}ms) build_resp={}ms total={}ms (gen={})",
+		t1-t0, t3-t1, t_reset_ms, t_snap_ms, t_prefill_ms, t_total, ttft, tps, fwd_cpu_ms, time_to_ms()-t5, time_to_ms()-t0, gen)
 	return final
 }
 

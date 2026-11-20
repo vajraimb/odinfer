@@ -89,6 +89,8 @@ g_kv_dim, g_rot: int
 @(private)
 g_k_pos, g_v_pos, g_k_layer, g_v_layer: int
 @(private)
+g_n_full: int
+@(private)
 g_k_bytes, g_v_bytes, g_conv_bytes, g_rec_bytes: int
 @(private)
 do_store: Store_Fn
@@ -1756,13 +1758,16 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	g_attn_batch = os.get_env("ODINFER_CUDA_ATTN_BATCH", context.temp_allocator) != "0"
 	// Default on. =0 keeps attention_q8v (one block per query head).
 	g_attn_split = os.get_env("ODINFER_CUDA_ATTN_SPLIT", context.temp_allocator) != "0"
-	// Default is attention_q8v. The fp32 flash was slower on the 9B V100
-	// (16000 tokens 80.7 vs 114.2 tok/s). =1 keeps that kernel. =2 is the
-	// WMMA prefill, opt-in until a V100 run shows it is faster.
+	// Unset on sm_70+ with head_dim 256 is the WMMA prefill (9B V100:
+	// 16000 tokens 182.8 vs 114.2 tok/s, text matched). =0 is attention_q8v.
+	// =1 is the fp32 flash, which was slower on that machine.
 	g_prefill_mode = 0
-	if s := os.get_env("ODINFER_CUDA_PREFILL_FLASH", context.temp_allocator); s == "1" {
+	flash_env := os.get_env("ODINFER_CUDA_PREFILL_FLASH", context.temp_allocator)
+	if flash_env == "0" {
+		g_prefill_mode = 0
+	} else if flash_env == "1" {
 		g_prefill_mode = 1
-	} else if s == "2" {
+	} else if flash_env == "2" || (flash_env == "" && g_sm_major >= 7 && t.config.head_dim == 256) {
 		g_prefill_mode = 2
 	}
 	g_flash_br = 0
@@ -1909,6 +1914,7 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 		}
 	}
 	g_heads = p.n_heads
+	g_n_full = p.n_full
 	g_kv_heads = p.n_kv_heads
 	g_head = p.head_dim
 	g_kv_dim = p.n_kv_heads * p.head_dim
