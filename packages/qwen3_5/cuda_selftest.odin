@@ -348,6 +348,27 @@ run_gemv2 :: proc(kind: ggml.GGML_Type, rows, cols: int, atol, rtol: f32) -> boo
 	if !ok {
 		return false
 	}
+	// Q5_K split-K: two ranges, atomic add, same values as the one-range launch.
+	if kind == .Q5_K && cols >= 512 {
+		if cu.memset(dy, 0, rows * 4) != cu.OK {
+			fmt.eprintln("cuda_selftest: gemv2 q5 split memset failed")
+			return false
+		}
+		acc = 0
+		sargs := [?]rawptr{&wb, &qs, &sc, &sm, &yy, &nn, &dd, &acc}
+		if cu.launch(fn, gx, 2, 1, bx, 1, 1, 0, sargs[:]) != cu.OK || cu.sync() != cu.OK {
+			fmt.eprintln("cuda_selftest: gemv2 q5 split launch failed")
+			return false
+		}
+		cu.download(raw_data(got), dy, rows * 4)
+		st_s: Case_Err
+		for r in 0 ..< rows {
+			s_note(&st_s, fmt.tprintf("gemv2 q5 split row %d", r), got[r], ref[r], atol, rtol)
+		}
+		if !s_report(fmt.tprintf("gemv2 q5_k split %dx%d", rows, cols), st_s, atol, rtol) {
+			return false
+		}
+	}
 	if kind == .Q4_K {
 		nfn := s_fn("gemv2_q4nc_k")
 		xfn := s_fn("gemv2_q4x_k")
@@ -962,6 +983,8 @@ run_mmqk :: proc(kind: ggml.GGML_Type, rows, cols, T: int) -> bool {
 	name := "mmqk_q4_k"
 	if kind == .Q6_K {
 		name = "mmqk_q6_k"
+	} else if kind == .Q5_K {
+		name = "mmqk_q5_k"
 	}
 	fn := s_fn(name)
 	qfn := s_fn("quant_q8_batch")
@@ -1025,7 +1048,7 @@ run_mmqk :: proc(kind: ggml.GGML_Type, rows, cols, T: int) -> bool {
 	wb, yy := dw, dy
 	dd := i32(rows)
 	args := [?]rawptr{&wb, &qp, &sc, &sm, &yy, &nn, &dd, &tt}
-	// Q4 is 64 rows per block (8 per warp). Q6 stays at 32. 22528 bytes of q8.
+	// Q4 is 64 rows per block (8 per warp). Q5 and Q6 stay at 32. 22528 bytes of q8.
 	bm := 32
 	if kind == .Q4_K {
 		bm = 64
@@ -1064,7 +1087,7 @@ run_mmqk :: proc(kind: ggml.GGML_Type, rows, cols, T: int) -> bool {
 		ry := drow
 		rd := i32(rows)
 		launched: bool
-		if kind == .Q4_K {
+		if kind == .Q4_K || kind == .Q5_K {
 			gargs := [?]rawptr{&wb, &qs, &gsc, &gsm, &ry, &rn, &rd, &acc}
 			launched = cu.launch(gfn, ggx, 1, 1, bx, 1, 1, 0, gargs[:]) == cu.OK
 		} else {
@@ -2745,7 +2768,7 @@ cuda_selftest :: proc() -> bool {
 			ok = false
 		}
 		// Same shapes. mmqk must match gemv2 within 2e-3. The CPU compare uses gemv2's q8 allowance.
-		if !run_mmqk(.Q4_K, shape[0], shape[1], shape[2]) || !run_mmqk(.Q6_K, shape[0], shape[1], shape[2]) {
+		if !run_mmqk(.Q4_K, shape[0], shape[1], shape[2]) || !run_mmqk(.Q6_K, shape[0], shape[1], shape[2]) || !run_mmqk(.Q5_K, shape[0], shape[1], shape[2]) {
 			ok = false
 		}
 		if !run_mmqk_pair(.Q4_K, shape[0], shape[1], shape[2]) || !run_mmqk_pair(.Q6_K, shape[0], shape[1], shape[2]) {
