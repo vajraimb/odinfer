@@ -157,6 +157,12 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
 
 ## Verified traps (do not re-learn)
 
+- CUDA prefill `pgemm` (fp16 dequant into smem, then WMMA) was correct on a
+  V100 and slower than the scalar tile (9B 16000 tokens 154 vs 183 tok/s).
+  The fp16 store of 32 rows at one K is a 32-way smem bank conflict, and a
+  64-token N tile dequants every weight twice per 128-token chunk. It is not
+  launched. `mmqk` (q8 + dp4a) is the default and was faster on that V100
+  (9B 16000 tokens 246 vs 213 tok/s, 27B 8000 tokens 93 vs 80).
 - GEMV kernel shape: on this M3 the optimum is 256 threads / 32 rows / 8 lanes;
   every multi-row/multi-thread/fusion variant measured as a regression (data in
   packages/qwen3_5/README.md and gemm_harness).

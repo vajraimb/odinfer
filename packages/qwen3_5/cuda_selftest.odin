@@ -732,6 +732,192 @@ run_tc2m :: proc(kind: ggml.GGML_Type, rows, cols, T: int, atol, rtol: f32) -> b
 	return s_report(fmt.tprintf("%s T=%d rows=%d cols=%d", name, T, rows, cols), st, atol, rtol)
 }
 
+// pgemm is not launched. On the V100 it was slower than the scalar tile.
+// The kernel stays so this compare still runs. fp16 products against the
+// fp32 CPU GEMV. A swapped WMMA layout is O(1), not this tolerance.
+@(private)
+run_pgemm :: proc(kind: ggml.GGML_Type, rows, cols, T: int, atol, rtol: f32) -> bool {
+	name := "pgemm_q4_k"
+	if kind == .Q6_K {
+		name = "pgemm_q6_k"
+	}
+	fn := s_fn(name)
+	if fn == nil {
+		fmt.eprintf("cuda_selftest: missing %s\n", name)
+		return false
+	}
+	raw := fill_weight(kind, rows, cols)
+	defer delete(raw)
+	x := make([]f32, T * cols)
+	defer delete(x)
+	for t in 0 ..< T {
+		for j in 0 ..< cols {
+			x[t * cols + j] = (f32((t + 1) * (j + 3) % 9) - 4) * 0.03
+		}
+	}
+	ref := make([]f32, T * rows)
+	defer delete(ref)
+	for t in 0 ..< T {
+		row := cpu_gemv(kind, raw, x[t * cols:][:cols], rows, cols)
+		copy(ref[t * rows:][:rows], row)
+		delete(row)
+	}
+	dw, _ := cu.alloc(len(raw))
+	dx, _ := cu.alloc(T * cols * 4)
+	dy, _ := cu.alloc(T * rows * 4)
+	defer cu.free(dw)
+	defer cu.free(dx)
+	defer cu.free(dy)
+	cu.upload(dw, raw_data(raw), len(raw))
+	cu.upload(dx, raw_data(x), T * cols * 4)
+	wb, xx, yy := dw, dx, dy
+	nn, dd, tt := i32(cols), i32(rows), i32(T)
+	args := [?]rawptr{&wb, &xx, &yy, &nn, &dd, &tt}
+	gx := u32((rows + 63) / 64)
+	gy := u32((T + 63) / 64)
+	if cu.launch(fn, gx, gy, 1, 512, 1, 1, 0, args[:]) != cu.OK {
+		fmt.eprintf("cuda_selftest: %s launch failed\n", name)
+		return false
+	}
+	got := make([]f32, T * rows)
+	defer delete(got)
+	cu.download(raw_data(got), dy, T * rows * 4)
+	st: Case_Err
+	for i in 0 ..< T * rows {
+		s_note(&st, fmt.tprintf("%s [%d]", name, i), got[i], ref[i], atol, rtol)
+	}
+	return s_report(fmt.tprintf("%s T=%d rows=%d cols=%d", name, T, rows, cols), st, atol, rtol)
+}
+
+// mmqk is the Q4_K / Q6_K prefill. Same q8 + dp4a math as gemv2, so that
+// compare stays tight (2e-3). The fp32 CPU GEMV sees the q8 rounding, and
+// uses the same allowance as run_gemv2: atol 1, rtol 5e-2. On a V100,
+// mmqk_q6_k matched gemv2 within 7.6e-6, while a few elements missed
+// 2e-2 + 2e-2*|ref| by 0.05-0.16.
+@(private)
+run_mmqk :: proc(kind: ggml.GGML_Type, rows, cols, T: int) -> bool {
+	tag := cuda_kind_tag(kind)
+	name := "mmqk_q4_k"
+	if kind == .Q6_K {
+		name = "mmqk_q6_k"
+	}
+	fn := s_fn(name)
+	qfn := s_fn("quant_q8_batch")
+	gfn := s_fn(fmt.tprintf("gemv2_%s", tag))
+	q1 := s_fn("quant_q8")
+	if fn == nil || qfn == nil || gfn == nil || q1 == nil {
+		fmt.eprintf("cuda_selftest: missing %s, quant_q8_batch, or gemv2_%s\n", name, tag)
+		return false
+	}
+	raw := fill_weight(kind, rows, cols)
+	defer delete(raw)
+	x := make([]f32, T * cols)
+	defer delete(x)
+	for t in 0 ..< T {
+		for j in 0 ..< cols {
+			x[t * cols + j] = (f32((t + 1) * (j + 3) % 9) - 4) * 0.03
+		}
+	}
+	ref := make([]f32, T * rows)
+	defer delete(ref)
+	for t in 0 ..< T {
+		row := cpu_gemv(kind, raw, x[t * cols:][:cols], rows, cols)
+		copy(ref[t * rows:][:rows], row)
+		delete(row)
+	}
+	ng := cols / 32
+	dw, e1 := cu.alloc(len(raw) + 64)
+	dx, e2 := cu.alloc(T * cols * 4)
+	dy, e3 := cu.alloc(T * rows * 4)
+	dpack, e4 := cu.alloc(T * cols)
+	dsc, e5 := cu.alloc(T * ng * 4)
+	dsm, e6 := cu.alloc(T * ng * 8)
+	dqs, e7 := cu.alloc(cols)
+	dscale, e8 := cu.alloc(ng * 4)
+	dsum, e9 := cu.alloc(ng * 8)
+	drow, e10 := cu.alloc(rows * 4)
+	defer cu.free(dw)
+	defer cu.free(dx)
+	defer cu.free(dy)
+	defer cu.free(dpack)
+	defer cu.free(dsc)
+	defer cu.free(dsm)
+	defer cu.free(dqs)
+	defer cu.free(dscale)
+	defer cu.free(dsum)
+	defer cu.free(drow)
+	if e1 != cu.OK || e2 != cu.OK || e3 != cu.OK || e4 != cu.OK || e5 != cu.OK || e6 != cu.OK || e7 != cu.OK || e8 != cu.OK || e9 != cu.OK || e10 != cu.OK {
+		fmt.eprintf("cuda_selftest: %s alloc failed\n", name)
+		return false
+	}
+	cu.upload(dw, raw_data(raw), len(raw))
+	cu.upload(dx, raw_data(x), T * cols * 4)
+	xx, qp, sc, sm := dx, dpack, dsc, dsm
+	nn, tt := i32(cols), i32(T)
+	qargs := [?]rawptr{&xx, &qp, &sc, &sm, &nn, &tt}
+	blocks := u32((ng * T + 255) / 256)
+	if cu.launch(qfn, blocks, 1, 1, 256, 1, 1, 0, qargs[:]) != cu.OK {
+		fmt.eprintf("cuda_selftest: quant_q8_batch launch failed (%s)\n", name)
+		return false
+	}
+	wb, yy := dw, dy
+	dd := i32(rows)
+	args := [?]rawptr{&wb, &qp, &sc, &sm, &yy, &nn, &dd, &tt}
+	gx := u32((rows + 31) / 32)
+	gy := u32((T + 63) / 64)
+	if cu.launch(fn, gx, gy, 1, 256, 1, 1, 0, args[:]) != cu.OK || cu.sync() != cu.OK {
+		fmt.eprintf("cuda_selftest: %s launch failed\n", name)
+		return false
+	}
+	got := make([]f32, T * rows)
+	defer delete(got)
+	cu.download(raw_data(got), dy, T * rows * 4)
+	st_cpu: Case_Err
+	// Same q8-vs-fp32 allowance as gemv2 (run_gemv2 passes atol 1, rtol 5e-2).
+	cpu_atol, cpu_rtol: f32 = 1, 5e-2
+	for i in 0 ..< T * rows {
+		s_note(&st_cpu, fmt.tprintf("%s cpu [%d]", name, i), got[i], ref[i], cpu_atol, cpu_rtol)
+	}
+	warps := 4
+	ggx := u32((rows + warps * 4 - 1) / (warps * 4))
+	bx := u32(warps * 32)
+	acc := i32(0)
+	st_g: Case_Err
+	grow := make([]f32, rows)
+	defer delete(grow)
+	for t in 0 ..< T {
+		rowx := cu.ptr_add(dx, t * cols * 4)
+		qs, gsc, gsm := dqs, dscale, dsum
+		rn := i32(cols)
+		one := [?]rawptr{&rowx, &qs, &gsc, &gsm, &rn}
+		if cu.launch(q1, u32((ng + 127) / 128), 1, 1, 128, 1, 1, 0, one[:]) != cu.OK {
+			fmt.eprintf("cuda_selftest: quant_q8 launch failed (%s)\n", name)
+			return false
+		}
+		ry := drow
+		rd := i32(rows)
+		launched: bool
+		if kind == .Q4_K {
+			gargs := [?]rawptr{&wb, &qs, &gsc, &gsm, &ry, &rn, &rd, &acc}
+			launched = cu.launch(gfn, ggx, 1, 1, bx, 1, 1, 0, gargs[:]) == cu.OK
+		} else {
+			gargs := [?]rawptr{&wb, &qs, &gsc, &ry, &rn, &rd, &acc}
+			launched = cu.launch(gfn, ggx, 1, 1, bx, 1, 1, 0, gargs[:]) == cu.OK
+		}
+		if !launched || cu.sync() != cu.OK {
+			fmt.eprintf("cuda_selftest: gemv2 launch failed (%s)\n", name)
+			return false
+		}
+		cu.download(raw_data(grow), drow, rows * 4)
+		for r in 0 ..< rows {
+			s_note(&st_g, fmt.tprintf("%s gemv2 t=%d r=%d", name, t, r), got[t * rows + r], grow[r], 2e-3, 2e-3)
+		}
+	}
+	ok_cpu := s_report(fmt.tprintf("%s vs cpu T=%d rows=%d cols=%d", name, T, rows, cols), st_cpu, cpu_atol, cpu_rtol)
+	ok_g := s_report(fmt.tprintf("%s vs gemv2 T=%d rows=%d cols=%d", name, T, rows, cols), st_g, 2e-3, 2e-3)
+	return ok_cpu && ok_g
+}
+
 // tc2r must match the scalar tc kernel bit for bit. A CPU tolerance of 5e-2
 // also passes kernels that disagree with each other by ~0.04, which is enough
 // to change a sampled token. This compare is the token-relevant check.
@@ -1721,12 +1907,28 @@ run_delta :: proc() -> bool {
 // stepping delta_recurrent_step in token order.
 @(private)
 run_delta_chunk :: proc() -> bool {
-	fn := s_fn("delta_recurrent_chunk")
+	return run_delta_case(4, 4, 1, 2, 2, false)
+}
+
+@(private)
+run_delta_case :: proc(hkd, hvd, nkh, nvh, T: int, smem: bool) -> bool {
+	name := "delta_recurrent_chunk"
+	shared := u32(0)
+	if smem {
+		name = "delta_recurrent_chunk_sm"
+		shared = u32(hkd * hvd * 4)
+	}
+	fn := s_fn(name)
 	if fn == nil {
-		fmt.eprintln("cuda_selftest: delta_recurrent_chunk missing")
+		fmt.eprintf("cuda_selftest: %s missing\n", name)
 		return false
 	}
-	hkd, hvd, nkh, nvh, T := 4, 4, 1, 2, 2
+	if smem && shared > 48 * 1024 {
+		if cu.func_set_max_dynamic_shared(fn, int(shared)) != cu.OK {
+			fmt.eprintf("cuda_selftest: %s could not raise dynamic smem to %d\n", name, shared)
+			return false
+		}
+	}
 	state := make([]f32, nvh * hkd * hvd)
 	q := make([]f32, T * nkh * hkd)
 	k := make([]f32, T * nkh * hkd)
@@ -1774,11 +1976,12 @@ run_delta_chunk :: proc() -> bool {
 		for h in 0 ..< nvh {
 			beta := sigmoid_f32(b[t * nvh + h])
 			g := math.exp_f32(dec[h] * softplus_f32(a[t * nvh + h] + dt[h]))
+			kh := h % nkh
 			delta_recurrent_step(
 				cpu_out[(t * nvh + h) * hvd:][:hvd],
 				cpu_state[h * hkd * hvd:][:hkd * hvd],
-				q[t * nkh * hkd:][:hkd],
-				k[t * nkh * hkd:][:hkd],
+				q[t * nkh * hkd + kh * hkd:][:hkd],
+				k[t * nkh * hkd + kh * hkd:][:hkd],
 				v[(t * nvh + h) * hvd:][:hvd],
 				scratch, beta, g, hkd, hvd,
 			)
@@ -1814,8 +2017,8 @@ run_delta_chunk :: proc() -> bool {
 	ik, iv, nk, nv := i32(hkd), i32(hvd), i32(nkh), i32(nvh)
 	tt, qs, vs := i32(T), i32(nkh * hkd), i32(nvh * hvd)
 	args := [?]rawptr{&o, &stp, &qq, &kk, &vv, &bb, &aa, &decp, &dtp, &ik, &iv, &nk, &nv, &tt, &qs, &vs}
-	if cu.launch(fn, u32(nvh), 1, 1, 128, 1, 1, 0, args[:]) != cu.OK || cu.sync() != cu.OK {
-		fmt.eprintln("cuda_selftest: delta chunk launch failed")
+	if cu.launch(fn, u32(nvh), 1, 1, 128, 1, 1, shared, args[:]) != cu.OK || cu.sync() != cu.OK {
+		fmt.eprintf("cuda_selftest: %s launch failed\n", name)
 		return false
 	}
 	gout := make([]f32, len(cpu_out))
@@ -1924,6 +2127,21 @@ cuda_selftest :: proc() -> bool {
 	if !run_tc2m(.Q6_K, 40, 512, 128, 5e-2, 5e-2) {
 		ok = false
 	}
+	// pgemm: exact 64x64 tile, a partial tile, K across two superblocks, and
+	// a token count that is not a multiple of 64.
+	pgemm_shapes := [?][3]int{{64, 256, 8}, {64, 256, 32}, {64, 256, 128}, {40, 256, 20}, {64, 512, 64}, {48, 512, 96}, {96, 1024, 127}}
+	for shape in pgemm_shapes {
+		if !run_pgemm(.Q4_K, shape[0], shape[1], shape[2], 5e-2, 5e-2) {
+			ok = false
+		}
+		if !run_pgemm(.Q6_K, shape[0], shape[1], shape[2], 5e-2, 5e-2) {
+			ok = false
+		}
+		// Same shapes. mmqk must match gemv2 within 2e-3. The CPU compare uses gemv2's q8 allowance.
+		if !run_mmqk(.Q4_K, shape[0], shape[1], shape[2]) || !run_mmqk(.Q6_K, shape[0], shape[1], shape[2]) {
+			ok = false
+		}
+	}
 	// Partial rows, partial token tiles, K past one superblock, and a wide
 	// activation range. tc2r has to match scalar tc exactly on each of these.
 	pair_q4 := [?][3]int{{64, 256, 128}, {65, 512, 65}, {96, 1024, 127}, {130, 256, 129}, {40, 2048, 160}, {1, 256, 128}, {63, 512, 192}}
@@ -1945,6 +2163,11 @@ cuda_selftest :: proc() -> bool {
 		ok = false
 	}
 	if !run_delta_chunk() {
+		ok = false
+	}
+	// hvd is not a multiple of the block size, and the 128x128 production
+	// state (64 KiB) which needs the dynamic-smem cap raised.
+	if !run_delta_case(16, 20, 2, 2, 3, true) || !run_delta_case(128, 128, 1, 1, 2, true) {
 		ok = false
 	}
 	if !run_elem() {

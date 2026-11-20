@@ -677,6 +677,23 @@ launch :: proc(fn: Function, gx, gy, gz, bx, by, bz: u32, shared: u32, args: []r
 	return drv.LaunchKernel(fn, c.uint(gx), c.uint(gy), c.uint(gz), c.uint(bx), c.uint(by), c.uint(bz), c.uint(shared), stream, raw_data(args), nil)
 }
 
+// CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES. V100's default dynamic
+// cap is 48 KiB; a 64 KiB resident state needs this raised first.
+FUNC_ATTR_MAX_DYNAMIC_SHARED :: i32(8)
+
+Func_Set_Attribute :: proc "c" (fn: Function, attr: i32, value: i32) -> Error
+
+func_set_max_dynamic_shared :: proc(fn: Function, bytes: int) -> Error {
+	if drv.__handle == nil || fn == nil || bytes <= 0 {
+		return Error(1)
+	}
+	set, ok := bind_sym("cuFuncSetAttribute", Func_Set_Attribute)
+	if !ok || set == nil {
+		return Error(500)
+	}
+	return set(fn, FUNC_ATTR_MAX_DYNAMIC_SHARED, i32(bytes))
+}
+
 @(private)
 bind_sym :: proc(name: string, $T: typeid) -> (T, bool) {
 	p := dynlib.symbol_address(drv.__handle, name)
