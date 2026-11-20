@@ -156,6 +156,8 @@ g_gemv_split: bool // short Q4_K / Q6_K GEMV splits K across grid.y
 @(private)
 g_gemv_splits_force: int // ODINFER_CUDA_GEMV_SPLITS; 0 picks from the shape
 @(private)
+g_gemv_fuse: bool // Q4 gate+up share one K sweep; ODINFER_CUDA_GEMV_FUSE=0 is two launches
+@(private)
 g_sm_count: int
 @(private)
 g_wgemm_min: int // T below this uses mmqk; ODINFER_CUDA_WGEMM_MIN, default 128
@@ -248,6 +250,8 @@ g_exec: rawptr
 @(private)
 g_graph_launches: int
 @(private)
+g_graph_bucket: int // attention part count captured in g_exec; -1 if none
+@(private)
 g_pos_sym: cu.Device_Ptr
 @(private)
 g_pos_arg: cu.Device_Ptr // passed into kernels when the module symbol is not exported
@@ -268,7 +272,7 @@ g_q8_valid: bool
 @(private)
 k_quant, k_rmsnorm_q8, k_res_norm: cu.Function
 @(private)
-k_gemv2_q4, k_gemv2_q4nc, k_gemv2_q4x, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50: cu.Function
+k_gemv2_q4, k_gemv2_q4nc, k_gemv2_q4x, k_gemv2_q4_pair, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50: cu.Function
 @(private)
 k_gemv2r1_q4, k_gemv2r1_q6: cu.Function
 @(private)
@@ -631,40 +635,10 @@ launch_gemv2 :: proc(fn: cu.Function, kind: ggml.GGML_Type, w, y: cu.Device_Ptr,
 	} else if fn == k_gemv2_q4x {
 		rows_per = warps * 8
 	}
-	splits := 1
-	// Rows at or under 8192 do not fill the SMs, so K is split. Tall rows
-	// (27B wq, 12288) stay one split and were the 48% shape. 4-way on 27B wo
-	// (5120 x 6144, 24 superblocks) leaves a 6-block loop; the unsplit bench
-	// of that shape was 35% of peak against wq's 48%. When halving the split
-	// still leaves 12 superblocks and the matrix is under 32 warps per SM,
-	// use 2-way. ODINFER_CUDA_GEMV_SPLITS=4 restores the flat 4-way.
 	// float atomicAdd order is not deterministic. Greedy argmax can flip
 	// when two logits are within a few ulps. Capture includes the split only
 	// when the zeroing memset can be recorded on g_stream.
-	if g_gemv_split && !r1 && (kind == .Q4_K || kind == .Q6_K) && d > 0 && d <= 8192 {
-		nb := n / 256
-		if g_gemv_splits_force > 0 {
-			splits = g_gemv_splits_force
-			if splits > nb {
-				splits = nb
-			}
-			if splits < 1 {
-				splits = 1
-			}
-		} else if nb >= 4 {
-			splits = 4
-			sms := g_sm_count
-			if sms < 1 {
-				sms = 80
-			}
-			warps := (d + 3) / 4
-			if nb / 2 >= 12 && warps < sms * 32 {
-				splits = 2
-			}
-		} else if nb >= 2 {
-			splits = 2
-		}
-	}
+	splits := gemv_k_splits(kind, n, d, r1)
 	if splits > 1 && g_capturing && (g_stream == nil || cu.gapi.memset_async == nil) {
 		splits = 1
 	}
@@ -702,6 +676,83 @@ launch_gemv2 :: proc(fn: cu.Function, kind: ggml.GGML_Type, w, y: cu.Device_Ptr,
 	}
 	args := [?]rawptr{&wb, &qs, &sc, &yy, &nn, &dd, &acc}
 	return klaunch(fn_use, gx, gy, 1, bx, 1, 1, args[:], what)
+}
+
+// Rows at or under 8192 do not fill the SMs, so K is split. Tall rows
+// (27B wq 12288, 27B w1/w3 17408) stay one split. 27B wo is 5120x6144
+// (24 superblocks): halving leaves 12, so it is 2-way. The bench r4 line is
+// gy=1 of the unstaged kernel and is not this launch. 27B w2 (K=17408) is
+// staged and 2-way, which is the q6s2 line. 9B w2 (K=12288) is unstaged and
+// 2-way, which is the s2 line. ODINFER_CUDA_GEMV_SPLITS=4 forces the flat
+// split. ODINFER_CUDA_GEMV_SPLIT=0 is one range, still staged when q6_stage_on.
+@(private)
+gemv_k_splits :: proc(kind: ggml.GGML_Type, n, d: int, r1: bool) -> int {
+	if !g_gemv_split || r1 || (kind != .Q4_K && kind != .Q6_K) || d <= 0 || d > 8192 {
+		return 1
+	}
+	nb := n / 256
+	if g_gemv_splits_force > 0 {
+		splits := g_gemv_splits_force
+		if splits > nb {
+			splits = nb
+		}
+		if splits < 1 {
+			splits = 1
+		}
+		return splits
+	}
+	if nb >= 4 {
+		sms := g_sm_count
+		if sms < 1 {
+			sms = 80
+		}
+		warps := (d + 3) / 4
+		if nb / 2 >= 12 && warps < sms * 32 {
+			return 2
+		}
+		return 4
+	}
+	if nb >= 2 {
+		return 2
+	}
+	return 1
+}
+
+// Gate and up are the same shape and the same x. One K sweep writes both.
+// Tall Q4 only: a short matrix stays on two split-K launches. False leaves
+// both outputs untouched.
+@(private)
+launch_gemv_pair :: proc(a, b: Tensor, x, y0, y1: cu.Device_Ptr, n, d: int) -> bool {
+	if !g_gemv_fuse || k_gemv2_q4_pair == nil || g_q4_nc || g_q4_ilp || g_gemv_rows == 1 {
+		return false
+	}
+	if a.kind != .Q4_K || b.kind != .Q4_K || n <= 0 || d <= 0 || n % 256 != 0 {
+		return false
+	}
+	if gemv_k_splits(.Q4_K, n, d, false) != 1 {
+		return false
+	}
+	if !q8_ensure(x, n) {
+		return false
+	}
+	w0 := wptr(raw_data(a.data))
+	w1 := wptr(raw_data(b.data))
+	qs, sc, sm := d_xq, d_xd, d_xs
+	yy0, yy1 := y0, y1
+	nn, dd := i32(n), i32(d)
+	warps := g_gemv_warps
+	if warps < 1 {
+		warps = 1
+	}
+	if warps > 16 {
+		warps = 16
+	}
+	rows_per := warps * 4
+	gx := u32((d + rows_per - 1) / rows_per)
+	bx := u32(warps * 32)
+	args := [?]rawptr{&w0, &w1, &qs, &sc, &sm, &yy0, &yy1, &nn, &dd}
+	must(klaunch(k_gemv2_q4_pair, gx, 1, 1, bx, 1, 1, args[:], "gemv2_q4p"))
+	return true
 }
 
 // Long K or a tall output matrix. The 9B down projection is neither.
@@ -1465,8 +1516,11 @@ attn_q8v_part_launch :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos: int) -> bool {
 	hd := i32(g_head)
 	kb, vb := i32(g_k_pos), i32(g_v_pos)
 	km, nh := i32(mul), i32(g_heads)
-	ps, part := i32(pos), i32(ATTN_PART)
-	slot: cu.Device_Ptr
+	// Grid y is the real part count. The position argument is -1 during
+	// capture so replay reads g_decode_pos and the last part grows until
+	// the next recapture.
+	ps, part := i32(decode_pos(pos)), i32(ATTN_PART)
+	slot := pos_slot()
 	args := [?]rawptr{&a, &b, &c, &pm, &pl, &po, &hd, &kb, &vb, &km, &nh, &ps, &part, &slot}
 	if !klaunch(k_attn_part, u32(g_kv_heads), u32(nsplit), 1, 128, 1, 1, args[:], "attn_part", attn_part_smem(mul)) {
 		return false
@@ -1492,8 +1546,8 @@ attn_q8v_long_launch :: proc(fn: cu.Function, mul: int, q, kc, vc, xb3: cu.Devic
 	hd := i32(g_head)
 	kb, vb := i32(g_k_pos), i32(g_v_pos)
 	km, nh := i32(mul), i32(g_heads)
-	ps, part := i32(pos), i32(ATTN_LONG_PART)
-	slot: cu.Device_Ptr
+	ps, part := i32(decode_pos(pos)), i32(ATTN_LONG_PART)
+	slot := pos_slot()
 	args := [?]rawptr{&a, &b, &c, &pm, &pl, &po, &hd, &kb, &vb, &km, &nh, &ps, &part, &slot}
 	if !klaunch(fn, u32(g_kv_heads), u32(nsplit), 1, 128, 1, 1, args[:], "attn_long", attn_long_smem(mul)) {
 		return false
@@ -1675,6 +1729,7 @@ bind_kernels :: proc() -> bool {
 	k_gemv2_q4 = get_fn("gemv2_q4_k")
 	k_gemv2_q4nc = get_fn("gemv2_q4nc_k")
 	k_gemv2_q4x = get_fn("gemv2_q4x_k")
+	k_gemv2_q4_pair = get_fn("gemv2_q4_pair_k")
 	k_gemv2_q6 = get_fn("gemv2_q6_k")
 	k_gemv2_q6s = get_fn("gemv2_q6s_k")
 	k_gemv2_q5k = get_fn("gemv2_q5_k")
@@ -1688,7 +1743,7 @@ bind_kernels :: proc() -> bool {
 		k_conv, k_l2, k_delta, k_delta_chunk, k_delta_sm, k_delta_wmma, k_rmsgate, k_rmsgate_q, k_moe_topk,
 		k_gate_q, k_swiglu_q,
 		k_tc2_q4, k_tc2_q6, k_tc2s_q4, k_tc2s_q6, k_tc2m_q4, k_tc2m_q6, k_tc2r_q4, k_tc2r_q6,
-		k_quant, k_rmsnorm_q8, k_res_norm, k_gemv2_q4, k_gemv2_q4nc, k_gemv2_q4x, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50,
+		k_quant, k_rmsnorm_q8, k_res_norm, k_gemv2_q4, k_gemv2_q4nc, k_gemv2_q4x, k_gemv2_q4_pair, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50,
 		k_gemv2r1_q4, k_gemv2r1_q6,
 		k_pgemm_q4, k_pgemm_q6, k_wgemm_q4, k_wgemm_q6, k_quant_batch, k_mmqk_q4, k_mmqk_q4_r4, k_mmqk_q6, k_mmqk_q4_pair, k_mmqk_q6_pair,
 	}
@@ -1952,6 +2007,7 @@ cuda_destroy :: proc() {
 	g_exec = nil
 	g_graph_launches = 0
 	g_graph_ready = false
+	g_graph_bucket = -1
 	g_capturing = false
 	g_launch_stream = nil
 	g_pos_sym = 0
@@ -2072,6 +2128,8 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 			g_gemv_splits_force = int(v)
 		}
 	}
+	// Default on for tall Q4 gate+up (27B/9B w1+w3, one K sweep). =0 is two GEMVs.
+	g_gemv_fuse = os.get_env("ODINFER_CUDA_GEMV_FUSE", context.temp_allocator) != "0"
 	g_q6_stage = -1
 	if s := os.get_env("ODINFER_CUDA_Q6_STAGE", context.temp_allocator); s == "0" {
 		g_q6_stage = 0
@@ -2146,13 +2204,11 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	if g_profile {
 		g_use_graph = false
 	}
-	// A captured graph freezes the split count. The next token has a longer
-	// sequence, so the replay would drop the new key. The old kernel reads
-	// npos from the device and can be captured.
-	if g_attn_split && g_use_graph {
-		fmt.eprintln("cuda: graph off while split attention is on; ODINFER_CUDA_ATTN_SPLIT=0 keeps the old kernel and can capture")
-		g_use_graph = false
-	}
+	// Split attention's grid.y is the KV part count. Replay keeps that grid
+	// and reads the position from the device, so a token past the captured
+	// part would miss the new key. cuda_forward_chunk recaptures when the
+	// part count changes. The one-block kernel (npos < 128) is one bucket.
+	g_graph_bucket = -1
 	if g_phase {
 		fmt.eprintln("cuda: phase on (ODINFER_CUDA_PHASE=1). Event sync is on, so tok/s from this process is not the production number. Buckets: linear attn kv norm delta other. A prefill also prints one total")
 	}
@@ -2439,7 +2495,7 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 		if g_gemv_splits_force > 0 {
 			fmt.eprintfln("cuda: gemv split-K forced to {} for Q4_K/Q6_K with rows<=8192 (ODINFER_CUDA_GEMV_SPLITS)", g_gemv_splits_force)
 		} else {
-			fmt.eprintln("cuda: gemv split-K is 2-way when halving still leaves 12 superblocks and the matrix is under 32 warps/SM (27B wo, 27B w2). Other short rows stay 4-way. ODINFER_CUDA_GEMV_SPLITS=4 restores that. ODINFER_CUDA_GEMV_SPLIT=0 disables the split")
+			fmt.eprintln("cuda: gemv split-K is 2-way when halving still leaves 12 superblocks and the matrix is under 32 warps/SM. 27B w2 is staged plus 2-way (bench q6s2). 9B w2 is direct plus 2-way (bench s2). 27B wo is 2-way; its unsplit bench was faster and the matrix is 18 MB. ODINFER_CUDA_GEMV_SPLITS=4 restores 4-way. ODINFER_CUDA_GEMV_SPLIT=0 is one range")
 		}
 	}
 	if g_gemv_new {
@@ -2522,12 +2578,15 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	} else {
 		fmt.eprintln("cuda: prefill attention is attention_q8v (ODINFER_CUDA_PREFILL_FLASH=1 fp32 flash, =2 wmma)")
 	}
+	if g_gemv_fuse {
+		fmt.eprintln("cuda: gemv fuse on for tall Q4 gate+up (one K sweep, gemv2_q4p). ODINFER_CUDA_GEMV_FUSE=0 is two launches")
+	}
 	if g_use_graph {
-		fmt.eprintln("cuda: graph on for dense T=1 (ODINFER_CUDA_GRAPH=1; MoE stays eager)")
+		fmt.eprintln("cuda: graph on for dense T=1. Split attention recaptures when the KV part count changes (every 32 tokens, every 128 past 2048). MoE stays eager")
 	} else if g_profile {
 		fmt.eprintln("cuda: profile on (graph off while profiling)")
 	} else {
-		fmt.eprintln("cuda: graph off (ODINFER_CUDA_GRAPH=1 enables it; replay was slower than eager)")
+		fmt.eprintln("cuda: graph off (ODINFER_CUDA_GRAPH=1). Split attention is captured and recaptured with the part count. The old replay loss was a syncing position copy plus a frozen part count")
 	}
 	kv_b := g_k_bytes + g_v_bytes
 	per := 0
@@ -2716,9 +2775,10 @@ cuda_mlp :: proc(tr: ^Transformer, l, T: int, next_norm: cu.Device_Ptr) {
 	} else {
 		must(launch_rmsnorm(d_x, d_xb, dev_f32(lw.ffn_norm), T, dim, p.rms_eps))
 	}
-	if g_prefill_fuse && !wgemm_applies(lw.w1.kind, dim, T) && lw.w1.kind == lw.w3.kind && mmqk_applies(lw.w1.kind, dim, T) {
+	paired := T == 1 && launch_gemv_pair(lw.w1, lw.w3, d_xb, d_hb, d_hb2, dim, hid)
+	if !paired && g_prefill_fuse && !wgemm_applies(lw.w1.kind, dim, T) && lw.w1.kind == lw.w3.kind && mmqk_applies(lw.w1.kind, dim, T) {
 		must(launch_mmqk_pair(lw.w1.kind, wptr(raw_data(lw.w1.data)), wptr(raw_data(lw.w3.data)), d_xb, d_hb, d_hb2, dim, hid, T))
-	} else {
+	} else if !paired {
 		must(launch_mm(lw.w1, d_xb, d_hb, dim, hid, T))
 		must(launch_mm(lw.w3, d_xb, d_hb2, dim, hid, T))
 	}
@@ -2992,6 +3052,35 @@ write_decode_pos :: proc(pos: int) -> bool {
 	return ck(cu.drv.MemcpyHtoD_v2(g_pos_sym, &g_pos_host, 4), "decode pos")
 }
 
+// 0 is the one-block attention kernel (npos < 128), whose grid does not
+// depend on position. A positive bucket is the split or long part count.
+// Replay is valid while this stays constant: the kernel reads the position
+// from the device and the last part's nlocal grows inside the bucket.
+@(private)
+attn_graph_bucket :: proc(pos: int) -> int {
+	npos := pos + 1
+	if !attn_part_ok(npos) {
+		return 0
+	}
+	if g_attn_long && npos >= ATTN_LONG_MIN && g_head == 256 && g_kv_heads > 0 {
+		mul := g_heads / g_kv_heads
+		if (mul == 4 && k_attn_long4 != nil) || (mul == 6 && k_attn_long6 != nil) {
+			return 100000 + (npos + ATTN_LONG_PART - 1) / ATTN_LONG_PART
+		}
+	}
+	return (npos + ATTN_PART - 1) / ATTN_PART
+}
+
+@(private)
+drop_decode_graph :: proc() {
+	if g_exec != nil && cu.gapi.graph_exec_destroy != nil {
+		cu.gapi.graph_exec_destroy(g_exec)
+	}
+	g_exec = nil
+	g_graph_ready = false
+	g_graph_bucket = -1
+}
+
 // Capture does not run the kernels. On success the caller replays the graph.
 // On failure the stream is left idle and the caller runs the body for real.
 @(private)
@@ -3035,6 +3124,7 @@ capture_decode_graph :: proc(tr: ^Transformer, pos0: int) -> bool {
 	}
 	g_exec = exec
 	g_graph_ready = true
+	g_graph_bucket = attn_graph_bucket(pos0)
 	g_graph_launches = g_launches
 	g_launch_stream = nil
 	return true
@@ -3074,6 +3164,9 @@ cuda_forward_chunk :: proc(tr: ^Transformer, tokens: []int, pos0: int) -> []f32 
 	if use_graph {
 		if !write_decode_pos(pos0) {
 			os.exit(1)
+		}
+		if g_graph_ready && attn_graph_bucket(pos0) != g_graph_bucket {
+			drop_decode_graph()
 		}
 		if !g_graph_ready {
 			if !capture_decode_graph(tr, pos0) {

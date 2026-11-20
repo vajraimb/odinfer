@@ -209,7 +209,8 @@ accumulate.
 | `ODINFER_CUDA_GEMV_ROWS` | `4` | Rows per warp for Q4_K and Q6_K. Unset is four. `1` selects the slower one-row kernel |
 | `ODINFER_CUDA_GEMV_WARPS` | `8` | Warps per bandwidth-GEMV block (1..16) |
 | `ODINFER_CUDA_GEMV_SPLIT` | on | Q4_K / Q6_K with `rows≤8192` split K. `=0` is one K range. The unsplit bench on a V100 was 27B wq 48% of peak, wo 35% (398 GB/s), w2 30% (345 GB/s). wq is 12288 rows and does not split |
-| `ODINFER_CUDA_GEMV_SPLITS` | auto | Unset: 4-way, except 2-way when halving still leaves 12 superblocks and the matrix is under 32 warps per SM (27B wo is 24 superblocks, 27B w2 is 68). `=4` is the previous flat 4-way. `=1` is one K range |
+| `ODINFER_CUDA_GEMV_SPLITS` | auto | Unset: 4-way, except 2-way when halving still leaves 12 superblocks and the matrix is under 32 warps per SM. 27B w2 is that 2-way on the staged kernel (bench `q6s2`, 436 GB/s). 9B w2 is direct 2-way (bench `s2`, 382 GB/s). `r4` is gy=1 unstaged and is not the decode launch. `=4` is the flat split. `=1` is one K range |
+| `ODINFER_CUDA_GEMV_FUSE` | on | Tall Q4 gate+up (`rows>8192`) is one K sweep, `gemv2_q4p`. Same math as two `gemv2_q4_k` launches. Short rows stay split across two launches. `=0` is two launches. `--bench-gemv` prints `pair` against `two r4` on 9B and 27B w1 |
 | `ODINFER_CUDA_TC2` | on | Q4_K / Q6_K prefill. `T<=64` uses the 32-token fp16 tile. `T>64` uses the scalar-dequant tile. `=0` is the scalar tile at every T |
 | `ODINFER_CUDA_TC2_WIDE` | off | `=1` uses the 128-token tile for `T>64`. It was slower than the scalar tile at 581 and 2000 tokens |
 | `ODINFER_CUDA_TC2_BLOCK` | off | `=1` uses `tc2m`. Slower on the V100S (about −26% at 581 and 2000 tokens) and it changed a sampled token. Leave off |
@@ -220,10 +221,10 @@ accumulate.
 | `ODINFER_CUDA_PREFILL_FUSE` | off | `=1` makes gate+up and K+V share one q8 stage. On the 64-row build it was neutral (9B at 8000 tokens, 332 with it off vs 333 on) and the linear bucket was slower, so it stays off |
 | `ODINFER_CUDA_MMQK_ROWS` | `4` | Default Q4 tile is 32 rows per block. `=8` selects 64 rows, which was slower on a V100. Q6 stays at 32 either way |
 | `ODINFER_CUDA_ATTN_LONG` | on | Mixed-V decode with `npos>=2048`, head_dim 256, and 4 or 6 query heads per KV head. 128 positions per block, K dequantized once per group, V once per position, then the same reduce as the 32-wide split. `=0` keeps 32-token parts at every length. Not bit-exact: same `2e-2 + 1e-3*|ref|` allowance |
-| `ODINFER_CUDA_DELTA_WMMA` | on | 128×128 prefill state uses a 16-token gated-delta chunk (WY solve in fp32, intra-chunk state products on WMMA fp16). On the 27B with the flag forced on, text matched and the delta bucket at 8000 tokens went from 13237 ms to 11057; prefill was 115.27 tok/s at 8000 and 100.09 at 16000 against 112.05 and 97.61. `=0` is the fp32 recurrence. The selftest used to pass unnormalized keys (norm about 40) and the WY solve overflowed to NaN; it now l2-normalizes k and scales q by `1/sqrt(head_k)`, and still allows 2e-3 |
+| `ODINFER_CUDA_DELTA_WMMA` | on | 128×128 prefill state uses a 16-token gated-delta chunk (WY solve in fp32, intra-chunk state products on WMMA fp16). The scalar passes hoist the per-column scale (it does not depend on the row) and both thread halves own the 128 columns. On the 27B the earlier chunk dropped the 8000-token delta bucket from 13237 ms to 11057. `=0` is the fp32 recurrence. The selftest allows 2e-3 against `delta_recurrent_step` with normalized keys |
 | `ODINFER_CUDA_PREFILL_CHUNK` | `512` | Prefill tokens per forward. A multiple of 16 from 16 to 512. On the scalar tile, 9B at 16000 tokens was 183/207/213 tok/s for 128/256/512. A size that does not fit falls back through 256, 128, 32, 8, 1, and does not grow past the request |
 | `ODINFER_CUDA_ATTN_BATCH` | on | Prefill full attention is one launch per chunk. `=0` is one launch per token |
-| `ODINFER_CUDA_ATTN_SPLIT` | on | Mixed-V decode (`T==1`) with `npos>=128`. 32-token parts, one block per KV head, then a reduce. GQA query heads in a group share that K/V. Does not select the prefill kernel. `=0` is the one-block kernel for decode. Not bit-exact: `cuda_kernel_test` allows `2e-2 + 1e-3*|ref|` against `attention_q8v`, including npos 300, 1800, 8192, and 32768. f16 and symmetric Q8 stay on the old kernel. Turns the CUDA graph off |
+| `ODINFER_CUDA_ATTN_SPLIT` | on | Mixed-V decode (`T==1`) with `npos>=128`. 32-token parts, one block per KV head, then a reduce. GQA query heads in a group share that K/V. Does not select the prefill kernel. `=0` is the one-block kernel for decode. Not bit-exact: `cuda_kernel_test` allows `2e-2 + 1e-3*|ref|` against `attention_q8v`, including npos 300, 1800, 8192, and 32768. f16 and symmetric Q8 stay on the old kernel. A CUDA graph recaptures when this part count changes |
 | `ODINFER_CUDA_PREFILL_FLASH` | WMMA | Mixed-V prefill (`T>1`). Unset on sm_70+ with head_dim 256 and at most 8 query heads per KV head is `attention_q8v_wmma`. `=0` is `attention_q8v`. `=1` is `attention_q8v_flash` (fp32 online softmax). On the 9B V100S that was slower (16000 tokens 80.7 vs 114.2 tok/s). `=2` forces the WMMA kernel. This tree's kernel owns 32 query tokens and one 64-token fp16 K tile, reused across the query group, then V replaces K. Eight warps each own a 16×16 score tile and accumulate the full head dimension. A tile past the last query is skipped. Shared memory is 91136 bytes. Not timed yet. The previous 16-query, 32-key kernel was the measured one: 9B at 16000 tokens 182.8 vs 114.2, 27B 62.6 vs 40.9, and on e452657 the 27B 16000 attention bucket was 43557 ms. Tolerance versus `attention_q8v` is `1e-1 + 5e-2*|ref|`. Decode stays on the split kernels |
 | `ODINFER_CUDA_FUSE_NORM` | off | `=1` adds the projection in `residual_rmsnorm_q8` and skips the next RMSNorm. Slower than the accum GEMV on the V100S (9B 1.99 vs 1.41 ms) |
 | `ODINFER_CUDA_Q4_NC` | off | `=1` loads Q4 weights and the q8 vector with `ld.global.nc`. Slower on the V100S (9B 6.01 → 6.50 ms) |
@@ -233,7 +234,7 @@ accumulate.
 | `ODINFER_CUDA_LOGITS` | unset | `cuda_smoke` only. `=1` prints the top-5 logits at the first decode position and at the next position, plus the margin to EOS 248046 |
 | `ODINFER_CUDA_LAUNCHES` | off | `=1` prints the kernel launch count for each forward |
 | `ODINFER_CUDA_PEAK_GBS` | `1134` | Peak used by `--bench-gemv` to print % of HBM |
-| `ODINFER_CUDA_GRAPH` | off | `=1` captures dense `T==1` as one CUDA graph. The position is an async copy on the graph stream. MoE and prefill stay eager. `ODINFER_CUDA_PROFILE=1` turns the graph off |
+| `ODINFER_CUDA_GRAPH` | off | `=1` captures dense `T==1` as one CUDA graph. The position is an async copy on the graph stream. Split attention passes `pos=-1` and recaptures when the KV part count changes (every 32 tokens, every 128 past 2048). MoE and prefill stay eager. `ODINFER_CUDA_PROFILE=1` turns the graph off |
 | `ODINFER_CUDA_PROFILE` | off | `=1` prints per-kernel GPU time for that forward, slowest first. The 8192-event ring is folded into name totals as it fills, so a long prefill is not truncated |
 | `ODINFER_CUDA_PHASE` | off | `=1` prints one line per forward: `linear attn kv norm delta other` milliseconds, from the same events as `PROFILE`, plus one `cuda: phase prefill` total for the whole prefill. Tok/s in that process is not the production number. Does not change kernels |
 | `ODINFER_PHASE` | off | `=1` prints CPU milliseconds for the JSON grammar mask and the tool-call grammar mask on each sample. Zero when no grammar is installed |
@@ -298,7 +299,9 @@ was slower than eager (9B 57.6 tok/s versus 63.0): the position update was
 and capture left split-K out because the zeroing memset was not on the
 capture stream. `ODINFER_CUDA_GRAPH=1` opts in. The position is then an
 async copy on the graph stream, and split-K is recorded with
-`cuMemsetD8Async` when the driver has that symbol. A missing
+`cuMemsetD8Async` when the driver has that symbol. Split attention is in
+the graph: the kernel reads the position from the device, and the graph is
+recaptured when the KV part count changes. A missing
 `g_decode_pos` symbol uses a device int instead of turning the graph off.
 Prefill passes the real position and stays eager. If capture or instantiate
 fails, that token runs eager and graphs stay off. `ODINFER_CUDA_PROFILE=1`
