@@ -51,7 +51,7 @@ you isolate per-stage GPU time. Never enable in production.
 | `ODINFER_CUDA_GEMV_WARPS` | `8` | Warps per bandwidth-GEMV block, 1..16. V100S tuning knob. |
 | `ODINFER_CUDA_GEMV_SPLIT` | on | Q4_K / Q6_K decode with `rows≤8192` splits K and `atomicAdd`s the partials. `=0` is one K range. |
 | `ODINFER_CUDA_GEMV_SPLITS` | auto | Unset uses 2-way on short-row matrices whose K still has 12 superblocks per half, and 4-way otherwise. 27B w2 is staged plus that 2-way (bench `q6s2`). 9B w2 is direct 2-way (bench `s2`). `r4` is not the decode launch. `=4` is the flat split. |
-| `ODINFER_CUDA_GEMV_FUSE` | on | Tall Q4 gate+up is one kernel (`gemv2_q4p`). `=0` is two GEMVs. `--bench-gemv` prints `pair` versus `two r4` on the w1 shapes. |
+| `ODINFER_CUDA_GEMV_FUSE` | auto | Q4 gate+up with K≥5120 is one kernel (`gemv2_q4p`). 9B (K=4096) stays two launches. `=1` forces the pair. `=0` is two GEMVs. `--bench-gemv` prints `pair` versus `two r4` on the w1 shapes. |
 | `ODINFER_CUDA_TC2` | on | Q4_K / Q6_K prefill (K multiple of 256). `T<=64` uses the 32-token fp16 tile. `T>64` uses the scalar-dequant tile. `=0` uses the scalar tile at every T. |
 | `ODINFER_CUDA_TC2_WIDE` | off | `=1` uses the 128-token tile for `T>64`. Slower than the scalar tile at 581 and 2000 tokens on the V100S. |
 | `ODINFER_CUDA_TC2_BLOCK` | off | `=1` uses `tc2m`. Measured slower on the V100S and it changed a sampled token. Leave off. |
@@ -75,7 +75,7 @@ you isolate per-stage GPU time. Never enable in production.
 | `ODINFER_CUDA_LOGITS` | unset | `cuda_smoke` only. `=1` prints the top-5 logits at the first decode position and the next one, and the margin to EOS 248046. |
 | `ODINFER_CUDA_GRAPH` | off | `=1` captures dense `T==1` decode as one CUDA graph and recaptures when the split-attention part count changes. MoE and prefill stay eager. Off while `ODINFER_CUDA_PROFILE=1`. |
 | `ODINFER_CUDA_PROFILE` | off | `=1` prints per-kernel GPU time for each forward (disables the graph). The 8192-event ring is aggregated by kernel name as it fills, so a long prefill is complete. |
-| `ODINFER_CUDA_PHASE` | off | `=1` prints one `cuda: phase` line per forward (linear, attn, kv, norm, delta, other) and one `cuda: phase prefill` total across the prefill chunks. Same events as `PROFILE`. Not a production tok/s. |
+| `ODINFER_CUDA_PHASE` | off | `=1` prints one `cuda: phase` line per forward (linear, attn, kv, norm, delta, other, nongemv, gap) and one `cuda: phase prefill` total across the prefill chunks. `nongemv` excludes linear. `gap` is wall minus the events. Same events as `PROFILE`. Not a production tok/s. |
 | `ODINFER_PHASE` | off | `=1` prints CPU time for the grammar mask and the tool-call grammar mask on each sample. |
 | `ODINFER_CUDA_LAUNCHES` | off | `=1` prints the kernel launch count of each CUDA forward on stderr. A graph replay prints the captured count. |
 | `ODINFER_CUDA_PEAK_GBS` | `1134` | HBM peak for `cuda_kernel_test --bench-gemv` (percent of peak). |
