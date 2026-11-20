@@ -195,11 +195,10 @@ block.
 Block size is `ODINFER_CUDA_GEMV_WARPS` warps (default 8, range 1..16).
 With four rows per warp that is 32 rows per block. With one row per warp
 it is one row per warp in the block. V100S has 80 SMs and 64 warp slots
-per SM. When `GEMV_WARPS` is unset and the split grid is still under one
-block per SM, the launch drops warps until the grid covers the SMs. The
-27B Q4/Q6 shapes already cover 80 SMs at 8 warps, so those launches stay
-at 8. Setting `GEMV_WARPS` pins the count. Q5_K uses the same q8-x `dp4a`
-kernel as Q4_K (`gemv2_q5_k`) and the same split when `rows≤8192`.
+per SM. Shrinking warps to fill a short grid changed a 27B decode to EOS
+at 7 tokens when `GEMV_WARPS=8` was pinned against that auto path, and
+decode tok/s did not move, so the warp count stays the env value. Q5_K
+decode is the same q8-x `dp4a` kernel (`gemv2_q5_k`) and does not split K.
 
 On a dense `T==1` step the attention out, the FFN down, and the linear
 out add straight into the residual. `ODINFER_CUDA_FUSE_NORM=1` sends them
@@ -211,17 +210,18 @@ accumulate.
 |----------|---------|--------|
 | `ODINFER_CUDA_GEMV` | auto | `old` or `0`: scalar GEMV. `new`: bandwidth kernel even for small Q5_0 / Q8_0. Unset: bandwidth, except Q5_0 / Q8_0 under 16 MiB |
 | `ODINFER_CUDA_GEMV_ROWS` | `4` | Rows per warp for Q4_K and Q6_K. Unset is four. `1` selects the slower one-row kernel |
-| `ODINFER_CUDA_GEMV_WARPS` | `8` | Warps per bandwidth-GEMV block (1..16). Unset still shrinks a grid that is under one block per SM. A set value pins the count, including the 27B shapes that already fill 80 SMs at 8 |
-| `ODINFER_CUDA_GEMV_SPLIT` | on | Q4_K / Q5_K / Q6_K with `rows≤8192` split K. `=0` is one K range. The unsplit bench on a V100 was 27B wq 48% of peak, wo 35% (398 GB/s), w2 30% (345 GB/s). wq is 12288 rows and does not split |
+| `ODINFER_CUDA_GEMV_WARPS` | `8` | Warps per bandwidth-GEMV block (1..16) |
+| `ODINFER_CUDA_GEMV_SPLIT` | on | Q4_K / Q6_K with `rows≤8192` split K. `=0` is one K range. The unsplit bench on a V100 was 27B wq 48% of peak, wo 35% (398 GB/s), w2 30% (345 GB/s). wq is 12288 rows and does not split. Q5_K is not split: a 2-way Q5 range did not move 27B decode, and `GEMV_SPLIT=0` (which also unsplits Q4/Q6) took 905 decode from 29.50 to 27.32 |
+| `ODINFER_CUDA_GEMV_MMVQ` | off | `=1` launches `gemv2_q4w`: one warp per Q4 row, 128-bit loads along K, no split-K. The gate+up pair stays two launches. Not bit-exact with `gemv2_q4_k` (warp-wide sum). Unset is `gemv2_q4` / `gemv2_q4p`. Profile name `gemv2_q4w` |
 | `ODINFER_CUDA_GEMV_SPLITS` | auto | Unset: 4-way, except 2-way when halving still leaves 12 superblocks and the matrix is under 32 warps per SM. 27B w2 is that 2-way on the staged kernel (bench `q6s2`, 436 GB/s). 9B w2 is direct 2-way (bench `s2`, 382 GB/s). `r4` is gy=1 unstaged and is not the decode launch. `=4` is the flat split. `=1` is one K range |
 | `ODINFER_CUDA_GEMV_FUSE` | auto | Q4 gate+up with `rows>8192` and `K>=5120` is one K sweep, `gemv2_q4p` (27B w1, 0.097 ms vs 0.180 for two `r4`). 9B w1 is K=4096 and stays two launches: the pair took 16k decode from 58.84 to 57.11 tok/s. `=1` forces the pair on every tall Q4. `=0` is two launches. `--bench-gemv` prints `pair` against `two r4` |
 | `ODINFER_CUDA_TC2` | on | Q4_K / Q6_K prefill. `T<=64` uses the 32-token fp16 tile. `T>64` uses the scalar-dequant tile. `=0` is the scalar tile at every T |
 | `ODINFER_CUDA_TC2_WIDE` | off | `=1` uses the 128-token tile for `T>64`. It was slower than the scalar tile at 581 and 2000 tokens |
 | `ODINFER_CUDA_TC2_BLOCK` | off | `=1` uses `tc2m`. Slower on the V100S (about −26% at 581 and 2000 tokens) and it changed a sampled token. Leave off |
 | `ODINFER_CUDA_TC2_REUSE` | off | `=1` uses `tc2r` for `T>64`: one scalar weight tile covers 128 tokens. Not timed. `T<=64` stays the 32-token tile. Wins over `TC2_BLOCK` and `TC2_WIDE` if several are set |
-| `ODINFER_CUDA_PREFILL_GEMM` | on | Q4_K / Q5_K / Q6_K prefill (`T>1`, K multiple of 256). Default is `wgemm` (fp16 WMMA, 128×128) once `T` reaches `WGEMM_MIN`. Below that, including Q5_K, the tile is `mmqk` (`mmqk_q5_k`, 32 rows). `ODINFER_CUDA_PREFILL_LINEAR=mmqk` keeps the dp4a tile at every T. On a V100 the older Q4/Q6 `mmqk` tile, chunk 512, was 9B at 905/1805/8000/16000 371.70/376.91/337.20/290.49 tok/s and 27B at 905/8000/16000 124.00/112.97/97.43. `=0` keeps `tc2` / scalar `tc` and skips both. `wgemm` versus the fp32 CPU GEMV allows `5e-2 + 5e-2*|ref|`. `mmqk` versus `gemv2` allows `2e-3 + 2e-3*|ref|` |
+| `ODINFER_CUDA_PREFILL_GEMM` | on | Q4_K / Q6_K prefill (`T>1`, K multiple of 256), and Q5_K once `T` reaches `WGEMM_MIN`. Default is `wgemm` (fp16 WMMA, 128×128). Q4/Q6 below that is `mmqk`. Q5_K below that stays scalar `tc_q5k`: `mmqk_q5_k` took a T=19 linear bucket from 406.76 ms to 441.98 (the Q5 part 58.40 to about 94). `ODINFER_CUDA_PREFILL_LINEAR=mmqk` keeps the dp4a tile for Q4/Q6. On a V100 the older Q4/Q6 `mmqk` tile, chunk 512, was 9B at 905/1805/8000/16000 371.70/376.91/337.20/290.49 tok/s and 27B at 905/8000/16000 124.00/112.97/97.43. `=0` keeps `tc2` / scalar `tc` and skips both. `wgemm` versus the fp32 CPU GEMV allows `5e-2 + 5e-2*|ref|`. `mmqk` versus `gemv2` allows `2e-3 + 2e-3*|ref|` |
 | `ODINFER_CUDA_PREFILL_LINEAR` | `wgemm` | `=mmqk` selects the q8 dp4a tile. Anything else, including unset, is `wgemm` when `ODINFER_CUDA_PREFILL_GEMM` is on and `T` is at least `ODINFER_CUDA_WGEMM_MIN` |
-| `ODINFER_CUDA_WGEMM_MIN` | `128` | Q4_K / Q5_K / Q6_K prefill with `T` below this uses `mmqk`. Q5_K used to fall through to scalar `tc_q5k` (58.40 ms at T=19). A 24-token prefill on the 128-wide tile was 1661/824 ms against 896/452 for `mmqk`. A partial tile skips 16-wide MMA fragments that start past `T`. `=0` launches `wgemm` for every `T>1`. A 256-token double buffer does not fit in 96 KB |
+| `ODINFER_CUDA_WGEMM_MIN` | `128` | Q4_K / Q6_K prefill with `T` below this uses `mmqk`. Q5_K below this stays `tc_q5k` (58.40 ms at T=19; the mmqk tile was slower). A 24-token prefill on the 128-wide tile was 1661/824 ms against 896/452 for `mmqk`. A partial tile skips 16-wide MMA fragments that start past `T`. `=0` launches `wgemm` for every `T>1`, including Q5_K. A 256-token double buffer does not fit in 96 KB |
 | `ODINFER_CUDA_WGEMM_X` | on | Pack the wgemm activation to fp16 once (`pack_f16`) and reload that from every row-tile. `=0` loads fp32 inside the kernel. Q5_K uses this tile too |
 | `ODINFER_CUDA_GEMV_PIPE` | off | `=1` issues the next Q4/Q6 super-block before the current dot (4 rows/warp). Unset is the per-row x load |
 | `ODINFER_CUDA_DELTA_SM` | on | Decode delta keeps the 128×128 state in shared memory. `=0` is the global recurrence |
