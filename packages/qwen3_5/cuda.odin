@@ -227,6 +227,9 @@ g_delta_sm: bool // delta chunk keeps the state matrix in shared memory
 g_gemv_warps: int
 @(private)
 g_gemv_mmvq: bool // one warp per row for Q4/Q5/Q6. ODINFER_CUDA_GEMV_MMVQ=0 restores the 4-row kernels
+g_gemv_q5: int // 0 gemv2_q5w, 1 gemv2_q5_k, 2 gemv2_q5w2. ODINFER_CUDA_GEMV_Q5
+g_wgemm_bk32: bool // ODINFER_CUDA_WGEMM_BK=32
+g_attn_parts: int // ODINFER_CUDA_ATTN_PARTS. 0 keeps the 80-block planner
 @(private)
 g_launches: int
 @(private)
@@ -286,7 +289,7 @@ g_q8_valid: bool
 @(private)
 k_quant, k_rmsnorm_q8, k_res_norm: cu.Function
 @(private)
-k_gemv2_q4, k_gemv2_q4nc, k_gemv2_q4x, k_gemv2_q4_pipe, k_gemv2_q4w, k_gemv2_q4w_pair, k_gemv2_q4_pair, k_gemv2_q4_pair_pipe, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q6_pipe, k_gemv2_q6w, k_gemv2_q5k, k_gemv2_q5w, k_gemv2_q8, k_gemv2_q50: cu.Function
+k_gemv2_q4, k_gemv2_q4nc, k_gemv2_q4x, k_gemv2_q4_pipe, k_gemv2_q4w, k_gemv2_q4w_pair, k_gemv2_q4_pair, k_gemv2_q4_pair_pipe, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q6_pipe, k_gemv2_q6w, k_gemv2_q5k, k_gemv2_q5w, k_gemv2_q5w2, k_gemv2_q5w_pair, k_gemv2_q8, k_gemv2_q50: cu.Function
 @(private)
 k_gemv2r1_q4, k_gemv2r1_q6: cu.Function
 @(private)
@@ -298,7 +301,7 @@ k_conv, k_conv_chunk, k_l2, k_l2_chunk, k_delta, k_delta_chunk, k_delta_sm, k_de
 @(private)
 k_tc2_q4, k_tc2_q6, k_tc2s_q4, k_tc2s_q6, k_tc2m_q4, k_tc2m_q6, k_tc2r_q4, k_tc2r_q6: cu.Function
 @(private)
-k_pgemm_q4, k_pgemm_q6, k_wgemm_q4, k_wgemm_q6, k_wgemm_q5, k_wgemm_q4x, k_wgemm_q6x, k_wgemm_q5x, k_pack_f16: cu.Function
+k_pgemm_q4, k_pgemm_q6, k_wgemm_q4, k_wgemm_q6, k_wgemm_q5, k_wgemm_q4x, k_wgemm_q6x, k_wgemm_q5x, k_wgemm_q4_b32, k_wgemm_q6_b32, k_wgemm_q5_b32, k_wgemm_q4_b32x, k_wgemm_q6_b32x, k_wgemm_q5_b32x, k_pack_f16: cu.Function
 @(private)
 k_quant_batch, k_mmqk_q4, k_mmqk_q4_r4, k_mmqk_q6, k_mmqk_q4_pair, k_mmqk_q6_pair: cu.Function
 
@@ -534,7 +537,10 @@ gemv2_for :: proc(kind: ggml.GGML_Type) -> cu.Function {
 		return k_gemv2_q6
 	}
 	if kind == .Q5_K {
-		if g_gemv_mmvq && k_gemv2_q5w != nil {
+		if g_gemv_mmvq && g_gemv_q5 == 2 && k_gemv2_q5w2 != nil {
+			return k_gemv2_q5w2
+		}
+		if g_gemv_mmvq && g_gemv_q5 == 0 && k_gemv2_q5w != nil {
 			return k_gemv2_q5w
 		}
 		return k_gemv2_q5k
@@ -666,7 +672,10 @@ launch_gemv2 :: proc(fn: cu.Function, kind: ggml.GGML_Type, w, y: cu.Device_Ptr,
 	nn, dd := i32(n), i32(d)
 	acc := i32(accumulate)
 	rows_per := warps * 4
-	if r1 || fn == k_gemv2_q4w || fn == k_gemv2_q6w || fn == k_gemv2_q5w {
+	if fn == k_gemv2_q5w2 {
+		// Two rows per warp. x is loaded once for the pair.
+		rows_per = warps * 2
+	} else if r1 || fn == k_gemv2_q4w || fn == k_gemv2_q6w || fn == k_gemv2_q5w {
 		// One row per warp. The 128-bit loads run along K.
 		rows_per = warps
 	} else if fn == k_gemv2_q4x {
@@ -677,7 +686,7 @@ launch_gemv2 :: proc(fn: cu.Function, kind: ggml.GGML_Type, w, y: cu.Device_Ptr,
 	// when the zeroing memset can be recorded on g_stream.
 	splits := gemv_k_splits(kind, n, d, r1)
 	// The warp-per-row kernels ignore grid.y and would add the whole row once per split.
-	if fn == k_gemv2_q4w || fn == k_gemv2_q6w || fn == k_gemv2_q5w {
+	if fn == k_gemv2_q4w || fn == k_gemv2_q6w || fn == k_gemv2_q5w || fn == k_gemv2_q5w2 {
 		splits = 1
 	}
 	if splits > 1 && g_capturing && (g_stream == nil || cu.gapi.memset_async == nil) {
@@ -709,6 +718,8 @@ launch_gemv2 :: proc(fn: cu.Function, kind: ggml.GGML_Type, w, y: cu.Device_Ptr,
 		what = "gemv2_q6w"
 	} else if fn == k_gemv2_q5w {
 		what = "gemv2_q5w"
+	} else if fn == k_gemv2_q5w2 {
+		what = "gemv2_q5w2"
 	} else if fn == k_gemv2_q6_pipe {
 		what = "gemv2_q6pipe"
 	}
@@ -775,6 +786,29 @@ gemv_k_splits :: proc(kind: ggml.GGML_Type, n, d: int, r1: bool) -> int {
 // both outputs untouched.
 @(private)
 launch_gemv_pair :: proc(a, b: Tensor, x, y0, y1: cu.Device_Ptr, n, d: int) -> bool {
+	if a.kind == .Q5_K && b.kind == .Q5_K && g_gemv_fuse && g_gemv_mmvq && g_gemv_q5 != 1 && k_gemv2_q5w_pair != nil && (g_gemv_fuse_all || n >= 5120) && n % 256 == 0 && d > 0 {
+		if !q8_ensure(x, n) {
+			return false
+		}
+		w0 := wptr(raw_data(a.data))
+		w1 := wptr(raw_data(b.data))
+		qs, sc, sm := d_xq, d_xd, d_xs
+		yy0, yy1 := y0, y1
+		nn, dd := i32(n), i32(d)
+		warps := g_gemv_warps
+		if warps < 1 {
+			warps = 1
+		}
+		if warps > 16 {
+			warps = 16
+		}
+		rows_per := warps
+		gx := u32((d + rows_per - 1) / rows_per)
+		bx := u32(warps * 32)
+		args := [?]rawptr{&w0, &w1, &qs, &sc, &sm, &yy0, &yy1, &nn, &dd}
+		must(klaunch(k_gemv2_q5w_pair, gx, 1, 1, bx, 1, 1, args[:], "gemv2_q5wp"))
+		return true
+	}
 	if !g_gemv_fuse || k_gemv2_q4_pair == nil || g_q4_nc || g_q4_ilp || g_gemv_rows == 1 {
 		return false
 	}
@@ -986,6 +1020,7 @@ launch_tc :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d, tcount: in
 // ODINFER_CUDA_PREFILL_GEMM=0 keeps tc2 (T<=64) and the scalar tile.
 
 WG_SMEM :: u32(81920)
+WG_SMEM_BK32 :: u32(40960)
 
 @(private)
 wgemm_applies :: proc(kind: ggml.GGML_Type, n, tcount: int) -> bool {
@@ -1033,17 +1068,37 @@ pack_x16 :: proc(x: cu.Device_Ptr, n, tcount: int) -> bool {
 launch_wgemm :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d, tcount: int) -> bool {
 	fn := k_wgemm_q4
 	xx := x
+	smem := WG_SMEM
+	if g_wgemm_bk32 {
+		fn = k_wgemm_q4_b32
+		smem = WG_SMEM_BK32
+	}
 	if kind == .Q6_K {
 		fn = k_wgemm_q6
+		if g_wgemm_bk32 {
+			fn = k_wgemm_q6_b32
+		}
 	} else if kind == .Q5_K {
 		fn = k_wgemm_q5
+		if g_wgemm_bk32 {
+			fn = k_wgemm_q5_b32
+		}
 	}
 	if pack_x16(x, n, tcount) {
 		fn = k_wgemm_q4x
+		if g_wgemm_bk32 {
+			fn = k_wgemm_q4_b32x
+		}
 		if kind == .Q6_K {
 			fn = k_wgemm_q6x
+			if g_wgemm_bk32 {
+				fn = k_wgemm_q6_b32x
+			}
 		} else if kind == .Q5_K {
 			fn = k_wgemm_q5x
+			if g_wgemm_bk32 {
+				fn = k_wgemm_q5_b32x
+			}
 		}
 		xx = d_x16
 	}
@@ -1058,7 +1113,7 @@ launch_wgemm :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d, tcount:
 	if gy < 1 {
 		gy = 1
 	}
-	return klaunch(fn, gx, gy, 1, 256, 1, 1, args[:], "wgemm", WG_SMEM)
+	return klaunch(fn, gx, gy, 1, 256, 1, 1, args[:], "wgemm", smem)
 }
 @(private)
 mmqk_applies :: proc(kind: ggml.GGML_Type, n, tcount: int) -> bool {
@@ -1617,6 +1672,9 @@ attn_wmma_plan :: proc(T, pos0, n_kv: int) -> Attn_Wmma_Plan {
 		base = 1
 	}
 	nparts := (ATTN_WMMA_TARGET + base - 1) / base
+	if g_attn_parts > 0 {
+		nparts = g_attn_parts
+	}
 	if nparts < 1 {
 		nparts = 1
 	}
@@ -1958,6 +2016,12 @@ bind_kernels :: proc() -> bool {
 	k_wgemm_q4x = get_fn("wgemm_q4_x16")
 	k_wgemm_q6x = get_fn("wgemm_q6_x16")
 	k_wgemm_q5x = get_fn("wgemm_q5_x16")
+	k_wgemm_q4_b32 = get_fn("wgemm_q4_bk32")
+	k_wgemm_q6_b32 = get_fn("wgemm_q6_bk32")
+	k_wgemm_q5_b32 = get_fn("wgemm_q5_bk32")
+	k_wgemm_q4_b32x = get_fn("wgemm_q4_bk32x")
+	k_wgemm_q6_b32x = get_fn("wgemm_q6_bk32x")
+	k_wgemm_q5_b32x = get_fn("wgemm_q5_bk32x")
 	k_pack_f16 = get_fn("pack_f16")
 	k_quant_batch = get_fn("quant_q8_batch")
 	k_mmqk_q4 = get_fn("mmqk_q4_k")
@@ -1993,6 +2057,8 @@ bind_kernels :: proc() -> bool {
 	k_gemv2_q6_pipe = get_fn("gemv2_q6_pipe_k")
 	k_gemv2_q5k = get_fn("gemv2_q5_k")
 	k_gemv2_q5w = get_fn("gemv2_q5w_k")
+	k_gemv2_q5w2 = get_fn("gemv2_q5w2_k")
+	k_gemv2_q5w_pair = get_fn("gemv2_q5w_pair_k")
 	k_gemv2_q8 = get_fn("gemv2_q8_0")
 	k_gemv2_q50 = get_fn("gemv2_q5_0")
 	k_gemv2r1_q4 = get_fn("gemv2r1_q4_k")
@@ -2003,9 +2069,9 @@ bind_kernels :: proc() -> bool {
 		k_conv, k_conv_chunk, k_l2, k_l2_chunk, k_delta, k_delta_chunk, k_delta_sm, k_delta_wmma, k_rmsgate, k_rmsgate_q, k_moe_topk,
 		k_gate_q, k_swiglu_q,
 		k_tc2_q4, k_tc2_q6, k_tc2s_q4, k_tc2s_q6, k_tc2m_q4, k_tc2m_q6, k_tc2r_q4, k_tc2r_q6,
-		k_quant, k_rmsnorm_q8, k_res_norm, k_gemv2_q4, k_gemv2_q4nc, k_gemv2_q4x, k_gemv2_q4_pipe, k_gemv2_q4w, k_gemv2_q4w_pair, k_gemv2_q4_pair, k_gemv2_q4_pair_pipe, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q6_pipe, k_gemv2_q6w, k_gemv2_q5k, k_gemv2_q5w, k_gemv2_q8, k_gemv2_q50,
+		k_quant, k_rmsnorm_q8, k_res_norm, k_gemv2_q4, k_gemv2_q4nc, k_gemv2_q4x, k_gemv2_q4_pipe, k_gemv2_q4w, k_gemv2_q4w_pair, k_gemv2_q4_pair, k_gemv2_q4_pair_pipe, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q6_pipe, k_gemv2_q6w, k_gemv2_q5k, k_gemv2_q5w, k_gemv2_q5w2, k_gemv2_q5w_pair, k_gemv2_q8, k_gemv2_q50,
 		k_gemv2r1_q4, k_gemv2r1_q6,
-		k_pgemm_q4, k_pgemm_q6, k_wgemm_q4, k_wgemm_q6, k_wgemm_q5, k_wgemm_q4x, k_wgemm_q6x, k_wgemm_q5x, k_pack_f16, k_quant_batch, k_mmqk_q4, k_mmqk_q4_r4, k_mmqk_q6, k_mmqk_q4_pair, k_mmqk_q6_pair,
+		k_pgemm_q4, k_pgemm_q6, k_wgemm_q4, k_wgemm_q6, k_wgemm_q5, k_wgemm_q4x, k_wgemm_q6x, k_wgemm_q5x, k_wgemm_q4_b32, k_wgemm_q6_b32, k_wgemm_q5_b32, k_wgemm_q4_b32x, k_wgemm_q6_b32x, k_wgemm_q5_b32x, k_pack_f16, k_quant_batch, k_mmqk_q4, k_mmqk_q4_r4, k_mmqk_q6, k_mmqk_q4_pair, k_mmqk_q6_pair,
 	}
 	for h in handles {
 		if h == nil {
@@ -2388,6 +2454,17 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	// On unless set to 0. #23 measured Q4 at T=1 wall 33.29 vs 35.72 and
 	// linear 26.04 vs 28.48. =0 is gemv2_q4 / gemv2_q4p / gemv2_q6s / gemv2_q5_k.
 	g_gemv_mmvq = os.get_env("ODINFER_CUDA_GEMV_MMVQ", context.temp_allocator) != "0"
+	q5env := os.get_env("ODINFER_CUDA_GEMV_Q5", context.temp_allocator)
+	g_gemv_q5 = 0
+	if q5env == "k" {
+		g_gemv_q5 = 1
+	} else if q5env == "w2" {
+		g_gemv_q5 = 2
+	}
+	g_wgemm_bk32 = os.get_env("ODINFER_CUDA_WGEMM_BK", context.temp_allocator) == "32"
+	if v, ok := strconv.parse_int(os.get_env("ODINFER_CUDA_ATTN_PARTS", context.temp_allocator)); ok && v > 0 {
+		g_attn_parts = v
+	}
 	g_gemv_rows = 0
 	if s := os.get_env("ODINFER_CUDA_GEMV_ROWS", context.temp_allocator); s != "" {
 		if v, ok := strconv.parse_int(s); ok && (v == 1 || v == 4) {
@@ -2732,7 +2809,18 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	}
 	fmt.eprintfln("cuda: tensor cores %s  WMMA 16x16x16 fp16, fp32 acc", tc_note)
 	if g_prefill_wgemm && g_wgemm_smem {
-		fmt.eprintfln("cuda: prefill linear is wgemm for Q4_K/Q5_K/Q6_K T>={} (fp16, 128x128, BK=64, stride 80). T below that is mmqk for Q4_K/Q6_K; Q5_K stays on tc. ODINFER_CUDA_WGEMM_MIN=0 forces wgemm. ODINFER_CUDA_PREFILL_LINEAR=mmqk keeps mmqk. ODINFER_CUDA_PREFILL_GEMM=0 keeps tc2/tc", g_wgemm_min)
+		bk := 64
+		if g_wgemm_bk32 {
+			bk = 32
+		}
+		stride := 40
+		if bk == 64 {
+			stride = 80
+		}
+		fmt.eprintfln("cuda: prefill linear is wgemm for Q4_K/Q5_K/Q6_K T>={} (fp16, 128x128, BK={}, stride {}). T below that is mmqk for Q4_K/Q6_K; Q5_K stays on tc. ODINFER_CUDA_WGEMM_MIN=0 forces wgemm. ODINFER_CUDA_WGEMM_BK=32 is the smaller tile. ODINFER_CUDA_PREFILL_LINEAR=mmqk keeps mmqk. ODINFER_CUDA_PREFILL_GEMM=0 keeps tc2/tc", g_wgemm_min, bk, stride)
+		if g_attn_parts > 0 {
+			fmt.eprintfln("cuda: attn wmma KV parts forced to {} (ODINFER_CUDA_ATTN_PARTS). Unset keeps the 80-block planner", g_attn_parts)
+		}
 		if g_wgemm_x16 && d_x16 != 0 {
 			fmt.eprintln("cuda: wgemm X is packed to fp16 once per activation. ODINFER_CUDA_WGEMM_X=0 keeps the fp32 load")
 		}
@@ -2875,7 +2963,13 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 		fmt.eprintln("cuda: gemv pipe on (next super-block issued before the dot). ODINFER_CUDA_GEMV_PIPE=0 keeps one block in flight")
 	}
 	if g_gemv_mmvq {
-		fmt.eprintln("cuda: gemv mmvq on (one warp per Q4/Q5/Q6 row, q4 gate+up pair when K>=5120). ODINFER_CUDA_GEMV_MMVQ=0 keeps the 4-row kernels")
+		q5name := "gemv2_q5w"
+		if g_gemv_q5 == 1 {
+			q5name = "gemv2_q5_k"
+		} else if g_gemv_q5 == 2 {
+			q5name = "gemv2_q5w2"
+		}
+		fmt.eprintfln("cuda: gemv mmvq on (one warp per Q4/Q6 row, Q5 is %s, q4 gate+up pair when K>=5120). ODINFER_CUDA_GEMV_MMVQ=0 keeps the 4-row kernels. ODINFER_CUDA_GEMV_Q5=k|w2", q5name)
 	}
 	if g_use_graph {
 		fmt.eprintln("cuda: graph on for dense T=1. Split attention recaptures when the KV part count changes (every 32 tokens, every 128 past 2048). MoE stays eager")
