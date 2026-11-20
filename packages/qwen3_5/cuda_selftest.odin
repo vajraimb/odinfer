@@ -1435,6 +1435,207 @@ run_elem :: proc() -> bool {
 		return false
 	}
 
+	// qnorm_rope matches qnorm_extract then rope_partial, across two tokens.
+	{
+		head, nper, nt, rot, pos0 := 8, 2, 2, 4, 3
+		heads := nt * nper
+		qsrc := make([]f32, heads * head * 2)
+		qn := make([]f32, head)
+		defer delete(qsrc)
+		defer delete(qn)
+		for i in 0 ..< len(qsrc) {
+			qsrc[i] = (f32(i % 7) - 3) * 0.2
+		}
+		for i in 0 ..< head {
+			qn[i] = 0.5 + f32(i) * 0.1
+		}
+		da, _ := cu.alloc(len(qsrc) * 4)
+		db, _ := cu.alloc(heads * head * 4)
+		dc, _ := cu.alloc(heads * head * 4)
+		dw, _ := cu.alloc(head * 4)
+		defer cu.free(da)
+		defer cu.free(db)
+		defer cu.free(dc)
+		defer cu.free(dw)
+		cu.upload(da, raw_data(qsrc), len(qsrc) * 4)
+		cu.upload(dw, raw_data(qn), head * 4)
+		qf := s_fn("qnorm_extract")
+		rf := s_fn("rope_partial")
+		ff := s_fn("qnorm_rope")
+		if qf == nil || rf == nil || ff == nil {
+			return false
+		}
+		pa, pb, pw := da, db, dw
+		ih, ieps := i32(head), f32(1e-6)
+		qargs := [?]rawptr{&pa, &pb, &pw, &ih, &ieps}
+		if cu.launch(qf, u32(heads), 1, 1, 128, 1, 1, 0, qargs[:]) != cu.OK {
+			return false
+		}
+		theta := f32(10000)
+		irot := i32(rot)
+		inh := i32(nper)
+		slot: cu.Device_Ptr
+		for t in 0 ..< nt {
+			row := cu.ptr_add(db, t * nper * head * 4)
+			ipos := i32(pos0 + t)
+			rargs := [?]rawptr{&row, &ih, &ipos, &theta, &irot, &inh, &slot}
+			if cu.launch(rf, 1, 1, 1, 128, 1, 1, 0, rargs[:]) != cu.OK {
+				return false
+			}
+		}
+		refq := make([]f32, heads * head)
+		gotq := make([]f32, heads * head)
+		defer delete(refq)
+		defer delete(gotq)
+		cu.download(raw_data(refq), db, len(refq) * 4)
+		pc := dc
+		ipos0 := i32(pos0)
+		inper := i32(nper)
+		fargs := [?]rawptr{&pa, &pc, &pw, &ih, &ieps, &ipos0, &theta, &irot, &inper, &slot}
+		if cu.launch(ff, u32(heads), 1, 1, 128, 1, 1, 0, fargs[:]) != cu.OK {
+			fmt.eprintln("cuda_selftest: qnorm_rope launch failed")
+			return false
+		}
+		cu.download(raw_data(gotq), dc, len(gotq) * 4)
+		st_qr: Case_Err
+		for i in 0 ..< len(gotq) {
+			s_note(&st_qr, fmt.tprintf("qnorm_rope[%d]", i), gotq[i], refq[i], 1e-4, 1e-4)
+		}
+		if !s_report("qnorm_rope", st_qr, 1e-4, 1e-4) {
+			return false
+		}
+
+		kf := s_fn("rmsnorm_k")
+		kr := s_fn("rmsnorm_rope")
+		if kf == nil || kr == nil {
+			return false
+		}
+		kin := make([]f32, heads * head)
+		defer delete(kin)
+		for i in 0 ..< len(kin) {
+			kin[i] = (f32(i % 5) - 2) * 0.4
+		}
+		dk, _ := cu.alloc(len(kin) * 4)
+		dk2, _ := cu.alloc(len(kin) * 4)
+		defer cu.free(dk)
+		defer cu.free(dk2)
+		cu.upload(dk, raw_data(kin), len(kin) * 4)
+		cu.upload(dk2, raw_data(kin), len(kin) * 4)
+		pk, po := dk, dk
+		kargs := [?]rawptr{&pk, &po, &pw, &ih, &ieps}
+		if cu.launch(kf, u32(heads), 1, 1, 128, 1, 1, 0, kargs[:]) != cu.OK {
+			return false
+		}
+		for t in 0 ..< nt {
+			row := cu.ptr_add(dk, t * nper * head * 4)
+			ipos := i32(pos0 + t)
+			rargs := [?]rawptr{&row, &ih, &ipos, &theta, &irot, &inh, &slot}
+			if cu.launch(rf, 1, 1, 1, 128, 1, 1, 0, rargs[:]) != cu.OK {
+				return false
+			}
+		}
+		refk := make([]f32, len(kin))
+		gotk := make([]f32, len(kin))
+		defer delete(refk)
+		defer delete(gotk)
+		cu.download(raw_data(refk), dk, len(refk) * 4)
+		pk2 := dk2
+		kargs2 := [?]rawptr{&pk2, &pw, &ih, &ieps, &ipos0, &theta, &irot, &inper, &slot}
+		if cu.launch(kr, u32(heads), 1, 1, 128, 1, 1, 0, kargs2[:]) != cu.OK {
+			fmt.eprintln("cuda_selftest: rmsnorm_rope launch failed")
+			return false
+		}
+		cu.download(raw_data(gotk), dk2, len(gotk) * 4)
+		st_kr: Case_Err
+		for i in 0 ..< len(gotk) {
+			s_note(&st_kr, fmt.tprintf("rmsnorm_rope[%d]", i), gotk[i], refk[i], 1e-4, 1e-4)
+		}
+		if !s_report("rmsnorm_rope", st_kr, 1e-4, 1e-4) {
+			return false
+		}
+	}
+
+	// conv1d_chunk matches two conv1d_step calls, including the state shift.
+	{
+		cd, kern, nt := 4, 3, 2
+		km1 := kern - 1
+		inp := make([]f32, nt * cd)
+		w := make([]f32, cd * kern)
+		st0 := make([]f32, cd * km1)
+		defer delete(inp)
+		defer delete(w)
+		defer delete(st0)
+		for i in 0 ..< len(inp) {
+			inp[i] = (f32(i) - 3) * 0.3
+		}
+		for i in 0 ..< len(w) {
+			w[i] = 0.1 * f32(i + 1)
+		}
+		for i in 0 ..< len(st0) {
+			st0[i] = 0.05 * f32(i)
+		}
+		cf := s_fn("conv1d_step")
+		cc := s_fn("conv1d_chunk")
+		if cf == nil || cc == nil {
+			return false
+		}
+		di, _ := cu.alloc(len(inp) * 4)
+		dout, _ := cu.alloc(len(inp) * 4)
+		dwc, _ := cu.alloc(len(w) * 4)
+		ds, _ := cu.alloc(len(st0) * 4)
+		ds2, _ := cu.alloc(len(st0) * 4)
+		dout2, _ := cu.alloc(len(inp) * 4)
+		defer cu.free(di)
+		defer cu.free(dout)
+		defer cu.free(dwc)
+		defer cu.free(ds)
+		defer cu.free(ds2)
+		defer cu.free(dout2)
+		cu.upload(di, raw_data(inp), len(inp) * 4)
+		cu.upload(dwc, raw_data(w), len(w) * 4)
+		cu.upload(ds, raw_data(st0), len(st0) * 4)
+		cu.upload(ds2, raw_data(st0), len(st0) * 4)
+		icd, ik := i32(cd), i32(kern)
+		pwv, pst := dwc, ds
+		for t in 0 ..< nt {
+			pin := cu.ptr_add(di, t * cd * 4)
+			pout := cu.ptr_add(dout, t * cd * 4)
+			cargs := [?]rawptr{&pout, &pin, &pst, &pwv, &icd, &ik}
+			if cu.launch(cf, 1, 1, 1, 128, 1, 1, 0, cargs[:]) != cu.OK {
+				return false
+			}
+		}
+		refc := make([]f32, len(inp))
+		gotc := make([]f32, len(inp))
+		refs := make([]f32, len(st0))
+		gots := make([]f32, len(st0))
+		defer delete(refc)
+		defer delete(gotc)
+		defer delete(refs)
+		defer delete(gots)
+		cu.download(raw_data(refc), dout, len(refc) * 4)
+		cu.download(raw_data(refs), ds, len(refs) * 4)
+		pin2, pout2, pst2 := di, dout2, ds2
+		itt := i32(nt)
+		cargs2 := [?]rawptr{&pout2, &pin2, &pst2, &pwv, &icd, &ik, &itt}
+		if cu.launch(cc, 1, 1, 1, 128, 1, 1, 0, cargs2[:]) != cu.OK {
+			fmt.eprintln("cuda_selftest: conv1d_chunk launch failed")
+			return false
+		}
+		cu.download(raw_data(gotc), dout2, len(gotc) * 4)
+		cu.download(raw_data(gots), ds2, len(gots) * 4)
+		st_cv: Case_Err
+		for i in 0 ..< len(gotc) {
+			s_note(&st_cv, fmt.tprintf("conv[%d]", i), gotc[i], refc[i], 1e-5, 1e-5)
+		}
+		for i in 0 ..< len(gots) {
+			s_note(&st_cv, fmt.tprintf("conv_state[%d]", i), gots[i], refs[i], 1e-5, 1e-5)
+		}
+		if !s_report("conv_chunk", st_cv, 1e-5, 1e-5) {
+			return false
+		}
+	}
+
 	// SwiGLU
 	m := 17
 	hb := make([]f32, m)

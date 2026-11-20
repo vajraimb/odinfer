@@ -156,7 +156,9 @@ g_gemv_split: bool // short Q4_K / Q6_K GEMV splits K across grid.y
 @(private)
 g_gemv_splits_force: int // ODINFER_CUDA_GEMV_SPLITS; 0 picks from the shape
 @(private)
-g_gemv_fuse: bool // Q4 gate+up share one K sweep; ODINFER_CUDA_GEMV_FUSE=0 is two launches
+g_gemv_fuse: bool // Q4 gate+up share one K sweep when K is long enough
+@(private)
+g_gemv_fuse_all: bool // ODINFER_CUDA_GEMV_FUSE=1 also pairs K<5120 (the 9B)
 @(private)
 g_sm_count: int
 @(private)
@@ -276,11 +278,11 @@ k_gemv2_q4, k_gemv2_q4nc, k_gemv2_q4x, k_gemv2_q4_pair, k_gemv2_q6, k_gemv2_q6s,
 @(private)
 k_gemv2r1_q4, k_gemv2r1_q6: cu.Function
 @(private)
-k_rmsnorm, k_qnorm, k_rope, k_gate, k_gate_q, k_swiglu, k_swiglu_q, k_residual, k_axpy: cu.Function
+k_rmsnorm, k_qnorm, k_qnorm_rope, k_knorm_rope, k_rope, k_gate, k_gate_q, k_swiglu, k_swiglu_q, k_residual, k_axpy: cu.Function
 @(private)
 k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v, k_attn_part, k_attn_red, k_attn_long4, k_attn_long6, k_attn_flash, k_attn_wmma, k_attn_wred: cu.Function
 @(private)
-k_conv, k_l2, k_delta, k_delta_chunk, k_delta_sm, k_delta_wmma, k_rmsgate, k_rmsgate_q, k_moe_topk: cu.Function
+k_conv, k_conv_chunk, k_l2, k_l2_chunk, k_delta, k_delta_chunk, k_delta_sm, k_delta_wmma, k_rmsgate, k_rmsgate_q, k_moe_topk: cu.Function
 @(private)
 k_tc2_q4, k_tc2_q6, k_tc2s_q4, k_tc2s_q6, k_tc2m_q4, k_tc2m_q6, k_tc2r_q4, k_tc2r_q6: cu.Function
 @(private)
@@ -732,6 +734,12 @@ launch_gemv_pair :: proc(a, b: Tensor, x, y0, y1: cu.Device_Ptr, n, d: int) -> b
 	if gemv_k_splits(.Q4_K, n, d, false) != 1 {
 		return false
 	}
+	// 27B w1 is K=5120 and the pair won (0.097 ms vs 0.180). 9B w1 is
+	// K=4096 and the same kernel cost about 0.5 ms/token (16k decode
+	// 58.84 to 57.11). Unset keeps the pair for K>=5120. =1 forces it.
+	if !g_gemv_fuse_all && n < 5120 {
+		return false
+	}
 	if !q8_ensure(x, n) {
 		return false
 	}
@@ -1094,6 +1102,43 @@ launch_qnorm :: proc(qproj, q, qn: cu.Device_Ptr, nheads, head: int, eps: f32) -
 	return klaunch(k_qnorm, u32(nheads), 1, 1, 128, 1, 1, args[:], "qnorm")
 }
 
+// qnorm_extract and the partial RoPE in one launch. nheads is T * n_per.
+// A rotary under 2 keeps the plain norm. Profile name stays "qnorm".
+@(private)
+launch_qnorm_rope :: proc(qproj, q, qn: cu.Device_Ptr, nheads, head, n_per: int, eps: f32, pos: int, theta: f32, rotary: int) -> bool {
+	if rotary < 2 || n_per < 1 || k_qnorm_rope == nil {
+		return launch_qnorm(qproj, q, qn, nheads, head, eps)
+	}
+	a, b, c := qproj, q, qn
+	n := i32(head)
+	ep := eps
+	ps := i32(decode_pos(pos))
+	th := theta
+	rot := i32(rotary)
+	nh := i32(n_per)
+	slot := pos_slot()
+	args := [?]rawptr{&a, &b, &c, &n, &ep, &ps, &th, &rot, &nh, &slot}
+	return klaunch(k_qnorm_rope, u32(nheads), 1, 1, 128, 1, 1, args[:], "qnorm")
+}
+
+// In-place RMSNorm plus the same RoPE. rows is T * n_per.
+@(private)
+launch_knorm_rope :: proc(inout, weight: cu.Device_Ptr, rows, head, n_per: int, eps: f32, pos: int, theta: f32, rotary: int) -> bool {
+	if rotary < 2 || n_per < 1 || k_knorm_rope == nil {
+		return launch_rmsnorm(inout, inout, weight, rows, head, eps)
+	}
+	a, b := inout, weight
+	sz := i32(head)
+	ep := eps
+	ps := i32(decode_pos(pos))
+	th := theta
+	rot := i32(rotary)
+	nh := i32(n_per)
+	slot := pos_slot()
+	args := [?]rawptr{&a, &b, &sz, &ep, &ps, &th, &rot, &nh, &slot}
+	return klaunch(k_knorm_rope, u32(rows), 1, 1, 128, 1, 1, args[:], "rmsnorm")
+}
+
 @(private)
 pos_slot :: proc() -> cu.Device_Ptr {
 	if g_capturing {
@@ -1287,11 +1332,33 @@ attn_q8_batch :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos0, T: int) -> bool {
 
 @(private)
 store_q8v_call :: proc(k, v, kc, vc: cu.Device_Ptr, pos: int) -> bool {
+	return store_range(k, v, kc, vc, pos, 1)
+}
+
+// grid.y is the token. gy=1 is the old store. K and V are token-major.
+@(private)
+store_range :: proc(k, v, kc, vc: cu.Device_Ptr, pos, T: int) -> bool {
+	nt := T
+	if nt < 1 {
+		nt = 1
+	}
 	a, b, c, d := k, v, kc, vc
-	nb, kb, vb, ps := i32(g_kv_dim / 32), i32(g_k_pos), i32(g_v_pos), i32(decode_pos(pos))
+	ps := i32(decode_pos(pos))
 	slot := pos_slot()
-	args := [?]rawptr{&a, &b, &c, &d, &nb, &kb, &vb, &ps, &slot}
-	return klaunch(k_store_q8v, grid_n(g_kv_dim / 32, 64), 1, 1, 64, 1, 1, args[:], "store_q8v")
+	if g_kv_q8 && g_kv_v_mix {
+		nb, kb, vb := i32(g_kv_dim / 32), i32(g_k_pos), i32(g_v_pos)
+		args := [?]rawptr{&a, &b, &c, &d, &nb, &kb, &vb, &ps, &slot}
+		return klaunch(k_store_q8v, grid_n(g_kv_dim / 32, 64), u32(nt), 1, 64, 1, 1, args[:], "store_q8v")
+	}
+	if g_kv_q8 {
+		nb, pb := i32(g_kv_dim / 32), i32(g_k_pos)
+		args := [?]rawptr{&a, &b, &c, &d, &nb, &pb, &ps, &slot}
+		return klaunch(k_store_q8, grid_n(g_kv_dim / 32, 64), u32(nt), 1, 64, 1, 1, args[:], "store_q8")
+	}
+	hd, sl, nk := i32(g_head), i32(g_seq), i32(g_kv_heads)
+	args := [?]rawptr{&a, &b, &c, &d, &hd, &sl, &ps, &nk, &slot}
+	n := g_kv_heads * g_head
+	return klaunch(k_store_f16, grid_n(n, 128), u32(nt), 1, 128, 1, 1, args[:], "store_f16")
 }
 
 @(private)
@@ -1576,19 +1643,47 @@ attn_q8v_dispatch :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos: int) -> bool {
 	return attn_q8v_part_launch(q, kc, vc, xb3, pos)
 }
 
+// One thread walks every token of one channel, so the state shift stays ordered.
 @(private)
-launch_conv :: proc(outp, inp, state, weight: cu.Device_Ptr, conv_dim, kernel: int) -> bool {
+launch_conv_chunk :: proc(outp, inp, state, weight: cu.Device_Ptr, conv_dim, kernel, T: int) -> bool {
+	nt := T
+	if nt < 1 {
+		nt = 1
+	}
 	a, b, c, d := outp, inp, state, weight
-	cd, k := i32(conv_dim), i32(kernel)
-	args := [?]rawptr{&a, &b, &c, &d, &cd, &k}
-	return klaunch(k_conv, grid_n(conv_dim, 128), 1, 1, 128, 1, 1, args[:], "conv")
+	cd, k, tt := i32(conv_dim), i32(kernel), i32(nt)
+	if k_conv_chunk != nil {
+		args := [?]rawptr{&a, &b, &c, &d, &cd, &k, &tt}
+		return klaunch(k_conv_chunk, grid_n(conv_dim, 128), 1, 1, 128, 1, 1, args[:], "conv")
+	}
+	ok := true
+	for ti in 0 ..< nt {
+		args := [?]rawptr{&a, &b, &c, &d, &cd, &k}
+		if !klaunch(k_conv, grid_n(conv_dim, 128), 1, 1, 128, 1, 1, args[:], "conv") {
+			ok = false
+		}
+		a = fp(a, conv_dim)
+		b = fp(b, conv_dim)
+	}
+	return ok
 }
 
+// q_stride is the token step of q_in and k_in. out_stride is the token step
+// of both outputs. grid.y is T.
 @(private)
-launch_l2 :: proc(q_out, k_out, q_in, k_in: cu.Device_Ptr, n_kh, head_k: int, eps, scale: f32) -> bool {
+launch_l2_chunk :: proc(q_out, k_out, q_in, k_in: cu.Device_Ptr, n_kh, head_k: int, eps, scale: f32, q_stride, out_stride, T: int) -> bool {
+	nt := T
+	if nt < 1 {
+		nt = 1
+	}
 	a, b, c, d := q_out, k_out, q_in, k_in
 	hk := i32(head_k)
 	ep, sc := eps, scale
+	qs, os := i32(q_stride), i32(out_stride)
+	if k_l2_chunk != nil {
+		args := [?]rawptr{&a, &b, &c, &d, &hk, &ep, &sc, &qs, &os}
+		return klaunch(k_l2_chunk, u32(n_kh), u32(nt), 1, 128, 1, 1, args[:], "l2norm")
+	}
 	args := [?]rawptr{&a, &b, &c, &d, &hk, &ep, &sc}
 	return klaunch(k_l2, u32(n_kh), 1, 1, 128, 1, 1, args[:], "l2norm")
 }
@@ -1647,6 +1742,21 @@ launch_gated :: proc(outp, inp, weight, gate: cu.Device_Ptr, n_vh, hvd: int, eps
 	return klaunch(k_rmsgate, u32(n_vh), 1, 1, 128, 1, 1, args[:], "rmsnorm_gated")
 }
 
+// T tokens, one launch. grid.x is the value head, grid.y the token. The
+// quant path stays T=1: the q8 cache is one vector.
+@(private)
+launch_gated_chunk :: proc(outp, inp, weight, gate: cu.Device_Ptr, n_vh, hvd, T: int, eps: f32, quant: bool) -> bool {
+	if T <= 1 {
+		return launch_gated(outp, inp, weight, gate, n_vh, hvd, eps, quant)
+	}
+	a, b, c, d := outp, inp, weight, gate
+	sz := i32(hvd)
+	ep := eps
+	args := [?]rawptr{&a, &b, &c, &d, &sz, &ep}
+	q8_drop()
+	return klaunch(k_rmsgate, u32(n_vh), u32(T), 1, 128, 1, 1, args[:], "rmsnorm_gated")
+}
+
 @(private)
 launch_topk :: proc(n, k: int, clamp_v, scale: f32) -> bool {
 	logits, sel, wt := d_moe_logits, d_moe_sel, d_moe_wt
@@ -1676,6 +1786,8 @@ bind_kernels :: proc() -> bool {
 	}
 	k_rmsnorm = get_fn("rmsnorm_k")
 	k_qnorm = get_fn("qnorm_extract")
+	k_qnorm_rope = get_fn("qnorm_rope")
+	k_knorm_rope = get_fn("rmsnorm_rope")
 	k_rope = get_fn("rope_partial")
 	k_gate = get_fn("attn_gate")
 	k_gate_q = get_fn("attn_gate_quant")
@@ -1697,7 +1809,9 @@ bind_kernels :: proc() -> bool {
 	k_attn_wmma = get_fn("attention_q8v_wmma")
 	k_attn_wred = get_fn("attention_q8v_wmma_reduce")
 	k_conv = get_fn("conv1d_step")
+	k_conv_chunk = get_fn("conv1d_chunk")
 	k_l2 = get_fn("l2norm_scale")
+	k_l2_chunk = get_fn("l2norm_chunk")
 	k_delta = get_fn("delta_recurrent")
 	k_delta_chunk = get_fn("delta_recurrent_chunk")
 	k_delta_sm = get_fn("delta_recurrent_chunk_sm")
@@ -1738,9 +1852,9 @@ bind_kernels :: proc() -> bool {
 	k_gemv2r1_q4 = get_fn("gemv2r1_q4_k")
 	k_gemv2r1_q6 = get_fn("gemv2r1_q6_k")
 	handles := [?]cu.Function{
-		k_rmsnorm, k_qnorm, k_rope, k_gate, k_swiglu, k_residual, k_axpy,
+		k_rmsnorm, k_qnorm, k_qnorm_rope, k_knorm_rope, k_rope, k_gate, k_swiglu, k_residual, k_axpy,
 		k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v, k_attn_part, k_attn_red, k_attn_long4, k_attn_long6, k_attn_flash, k_attn_wmma, k_attn_wred,
-		k_conv, k_l2, k_delta, k_delta_chunk, k_delta_sm, k_delta_wmma, k_rmsgate, k_rmsgate_q, k_moe_topk,
+		k_conv, k_conv_chunk, k_l2, k_l2_chunk, k_delta, k_delta_chunk, k_delta_sm, k_delta_wmma, k_rmsgate, k_rmsgate_q, k_moe_topk,
 		k_gate_q, k_swiglu_q,
 		k_tc2_q4, k_tc2_q6, k_tc2s_q4, k_tc2s_q6, k_tc2m_q4, k_tc2m_q6, k_tc2r_q4, k_tc2r_q6,
 		k_quant, k_rmsnorm_q8, k_res_norm, k_gemv2_q4, k_gemv2_q4nc, k_gemv2_q4x, k_gemv2_q4_pair, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50,
@@ -2128,8 +2242,11 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 			g_gemv_splits_force = int(v)
 		}
 	}
-	// Default on for tall Q4 gate+up (27B/9B w1+w3, one K sweep). =0 is two GEMVs.
-	g_gemv_fuse = os.get_env("ODINFER_CUDA_GEMV_FUSE", context.temp_allocator) != "0"
+	// Unset: pair only when K>=5120. =1 is every tall Q4 (the 9B path that
+	// lost 3% decode). =0 is two GEMVs.
+	fuse_env := os.get_env("ODINFER_CUDA_GEMV_FUSE", context.temp_allocator)
+	g_gemv_fuse = fuse_env != "0"
+	g_gemv_fuse_all = fuse_env == "1"
 	g_q6_stage = -1
 	if s := os.get_env("ODINFER_CUDA_Q6_STAGE", context.temp_allocator); s == "0" {
 		g_q6_stage = 0
@@ -2578,8 +2695,10 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	} else {
 		fmt.eprintln("cuda: prefill attention is attention_q8v (ODINFER_CUDA_PREFILL_FLASH=1 fp32 flash, =2 wmma)")
 	}
-	if g_gemv_fuse {
-		fmt.eprintln("cuda: gemv fuse on for tall Q4 gate+up (one K sweep, gemv2_q4p). ODINFER_CUDA_GEMV_FUSE=0 is two launches")
+	if g_gemv_fuse && g_gemv_fuse_all {
+		fmt.eprintln("cuda: gemv fuse on for every tall Q4 gate+up (ODINFER_CUDA_GEMV_FUSE=1). Unset keeps K>=5120")
+	} else if g_gemv_fuse {
+		fmt.eprintln("cuda: gemv fuse on for Q4 gate+up with K>=5120 (27B). 9B stays two launches. ODINFER_CUDA_GEMV_FUSE=1 forces the pair, =0 is two launches")
 	}
 	if g_use_graph {
 		fmt.eprintln("cuda: graph on for dense T=1. Split attention recaptures when the KV part count changes (every 32 tokens, every 128 past 2048). MoE stays eager")
@@ -2645,26 +2764,18 @@ cuda_full :: proc(tr: ^Transformer, l, pos0, T: int) {
 		must(launch_mm(fa.wk, d_xb, d_k, dim, kvdim, T))
 		must(launch_mm(fa.wv, d_xb, d_v, dim, kvdim, T))
 	}
-	must(launch_qnorm(d_qproj, d_q, dev_f32(fa.q_norm), T * p.n_heads, p.head_dim, eps))
-	must(launch_rmsnorm(d_k, d_k, dev_f32(fa.k_norm), T * p.n_kv_heads, p.head_dim, eps))
+	must(launch_qnorm_rope(d_qproj, d_q, dev_f32(fa.q_norm), T * p.n_heads, p.head_dim, p.n_heads, eps, pos0, p.rope_theta, p.rotary_dim))
+	must(launch_knorm_rope(d_k, dev_f32(fa.k_norm), T * p.n_kv_heads, p.head_dim, p.n_kv_heads, eps, pos0, p.rope_theta, p.rotary_dim))
 	slot := tr.full_slot[l]
 	kc := cu.ptr_add(d_kc, slot * g_k_layer)
 	vc := cu.ptr_add(d_vc, slot * g_v_layer)
 	// Store every token before attention. Query t only reads KV through
 	// position t, so writing the rest of the chunk first does not change
-	// the scores. Flash is one launch for the whole chunk. A block holds a
-	// few query tokens and one KV head, stages each 64-token K tile once,
-	// and reuses it across the query heads in the group. The flops stay
-	// O(N^2).
-	for ti in 0 ..< T {
-		qrow := fp(d_q, ti * attdim)
-		krow := fp(d_k, ti * kvdim)
-		vrow := fp(d_v, ti * kvdim)
-		pos := pos0 + ti
-		must(launch_rope(qrow, p.head_dim, pos, p.rope_theta, p.rotary_dim, p.n_heads))
-		must(launch_rope(krow, p.head_dim, pos, p.rope_theta, p.rotary_dim, p.n_kv_heads))
-		must(do_store(krow, vrow, kc, vc, pos))
-	}
+	// the scores. One launch, grid.y = T. Flash is one launch for the
+	// whole chunk. A block holds a few query tokens and one KV head,
+	// stages each 64-token K tile once, and reuses it across the query
+	// heads in the group. The flops stay O(N^2).
+	must(store_range(d_k, d_v, kc, vc, pos0, T))
 	flashed := false
 	if T > 1 && attn_wmma_ok() {
 		must(attn_wmma_launch(d_q, kc, vc, d_xb3, pos0, T))
@@ -2680,13 +2791,15 @@ cuda_full :: proc(tr: ^Transformer, l, pos0, T: int) {
 			must(do_attn_batch(fp(d_q, base * attdim), kc, vc, fp(d_xb3, base * attdim), pos0 + base, ntok))
 		}
 	}
-	for ti in 0 ..< T {
-		qproj := fp(d_qproj, ti * qdim)
-		xb3 := fp(d_xb3, ti * attdim)
-		if !batch && !flashed {
+	if flashed || batch {
+		must(launch_gate(d_xb3, d_qproj, p.head_dim, T * p.n_heads, false))
+	} else {
+		for ti in 0 ..< T {
+			qproj := fp(d_qproj, ti * qdim)
+			xb3 := fp(d_xb3, ti * attdim)
 			must(do_attn(fp(d_q, ti * attdim), kc, vc, xb3, pos0 + ti))
+			must(launch_gate(xb3, qproj, p.head_dim, p.n_heads, T == 1))
 		}
-		must(launch_gate(xb3, qproj, p.head_dim, p.n_heads, T == 1))
 	}
 	applied := false
 	normed := false
@@ -2723,12 +2836,8 @@ cuda_linear :: proc(tr: ^Transformer, l, pos0, T: int) {
 	rstate := cu.ptr_add(d_rec, slot * p.lin_n_v_heads * p.lin_head_k_dim * p.lin_head_v_dim * 4)
 	wconv := wptr(raw_data(la.conv.data))
 	scale := 1.0 / math.sqrt_f32(f32(p.lin_head_k_dim))
-	for ti in 0 ..< T {
-		qin := fp(d_qkv, ti * convdim)
-		qout := fp(d_qkv2, ti * convdim)
-		must(launch_conv(qout, qin, cstate, wconv, convdim, p.lin_conv_kernel))
-		must(launch_l2(fp(d_qlin, ti * key), fp(d_klin, ti * key), qout, fp(qout, key), p.lin_n_k_heads, p.lin_head_k_dim, eps, scale))
-	}
+	must(launch_conv_chunk(d_qkv2, d_qkv, cstate, wconv, convdim, p.lin_conv_kernel, T))
+	must(launch_l2_chunk(d_qlin, d_klin, d_qkv2, fp(d_qkv2, key), p.lin_n_k_heads, p.lin_head_k_dim, eps, scale, convdim, key, T))
 	if T > 1 && k_delta_chunk != nil {
 		must(launch_delta_chunk(
 			d_lout, rstate, d_qlin, d_klin, fp(d_qkv2, key * 2),
@@ -2746,10 +2855,7 @@ cuda_linear :: proc(tr: ^Transformer, l, pos0, T: int) {
 			))
 		}
 	}
-	for ti in 0 ..< T {
-		lout := fp(d_lout, ti * val)
-		must(launch_gated(lout, lout, dev_f32(la.norm_w), fp(d_z, ti * val), p.lin_n_v_heads, p.lin_head_v_dim, eps, T == 1))
-	}
+	must(launch_gated_chunk(d_lout, d_lout, dev_f32(la.norm_w), d_z, p.lin_n_v_heads, p.lin_head_v_dim, T, eps, T == 1))
 	applied := false
 	normed := false
 	if T == 1 && !p.is_moe && g_fuse_norm {
@@ -3011,8 +3117,12 @@ profile_end :: proc(T, pos0: int, t0: time.Tick) {
 	profile_flush()
 	wall := time.duration_milliseconds(time.tick_diff(t0, time.tick_now()))
 	if g_phase {
-		fmt.eprintfln("cuda: phase T={} pos={} wall {:.2f} linear {:.2f} attn {:.2f} kv {:.2f} norm {:.2f} delta {:.2f} other {:.2f} ms ({} launches)",
-			T, pos0, wall, g_phase_ms[0], g_phase_ms[1], g_phase_ms[2], g_phase_ms[3], g_phase_ms[4], g_phase_ms[5], g_prof_launches)
+		gpu := g_phase_ms[0] + g_phase_ms[1] + g_phase_ms[2] + g_phase_ms[3] + g_phase_ms[4] + g_phase_ms[5]
+		// nongemv is GPU time outside the linear bucket. gap is wall minus
+		// the recorded events: launch and host time the events do not cover.
+		// T=1 is one decode token. Bucket ids are unchanged.
+		fmt.eprintfln("cuda: phase T={} pos={} wall {:.2f} linear {:.2f} attn {:.2f} kv {:.2f} norm {:.2f} delta {:.2f} other {:.2f} nongemv {:.2f} gap {:.2f} ms ({} launches)",
+			T, pos0, wall, g_phase_ms[0], g_phase_ms[1], g_phase_ms[2], g_phase_ms[3], g_phase_ms[4], g_phase_ms[5], gpu - g_phase_ms[0], wall - gpu, g_prof_launches)
 	}
 	if !g_profile_full {
 		return
@@ -3236,8 +3346,9 @@ cuda_forward_tokens :: proc(tr: ^Transformer, tokens: []int, pos0: int) -> []f32
 	}
 	if g_phase_sum_on {
 		g_phase_sum_on = false
-		fmt.eprintfln("cuda: phase prefill tokens={} linear {:.2f} attn {:.2f} kv {:.2f} norm {:.2f} delta {:.2f} other {:.2f} ms",
-			len(tokens), g_phase_sum[0], g_phase_sum[1], g_phase_sum[2], g_phase_sum[3], g_phase_sum[4], g_phase_sum[5])
+		psum := g_phase_sum[0] + g_phase_sum[1] + g_phase_sum[2] + g_phase_sum[3] + g_phase_sum[4] + g_phase_sum[5]
+		fmt.eprintfln("cuda: phase prefill tokens={} linear {:.2f} attn {:.2f} kv {:.2f} norm {:.2f} delta {:.2f} other {:.2f} nongemv {:.2f} ms",
+			len(tokens), g_phase_sum[0], g_phase_sum[1], g_phase_sum[2], g_phase_sum[3], g_phase_sum[4], g_phase_sum[5], psum - g_phase_sum[0])
 	}
 	return logits
 }
