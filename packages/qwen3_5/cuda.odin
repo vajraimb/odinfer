@@ -230,7 +230,7 @@ g_gemv_mmvq: bool // one warp per row for Q4/Q5/Q6. ODINFER_CUDA_GEMV_MMVQ=0 res
 g_gemv_q5: int // 0 gemv2_q5w, 1 gemv2_q5_k, 2 gemv2_q5w2. ODINFER_CUDA_GEMV_Q5
 g_wgemm_bk32: bool // ODINFER_CUDA_WGEMM_BK=32
 g_attn_parts: int // ODINFER_CUDA_ATTN_PARTS. 0 keeps the 80-block planner
-g_attn_qtile: int // ODINFER_CUDA_ATTN_QTILE. 4 shares one KV dequant across that many query tiles. 1 is the one-tile kernel
+g_attn_qtile: int // ODINFER_CUDA_ATTN_QTILE. 1 is the one-tile kernel. 4 is the reuse kernel that was slower on a V100
 @(private)
 g_launches: int
 @(private)
@@ -2520,8 +2520,10 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	if v, ok := strconv.parse_int(os.get_env("ODINFER_CUDA_ATTN_PARTS", context.temp_allocator)); ok && v > 0 {
 		g_attn_parts = v
 	}
-	// 4 query tiles share one KV dequant. =1 is the one-tile kernel from #25.
-	g_attn_qtile = 4
+	// One query tile per block. =4 dequantizes KV once for four tiles; on the
+	// V100 that was slower (16k attn 12643 -> 15798 ms, a 512-token chunk at
+	// pos 0 23.45 -> 55.63 ms, and the chunk at pos 15360 767 -> 832 ms).
+	g_attn_qtile = 1
 	if s := os.get_env("ODINFER_CUDA_ATTN_QTILE", context.temp_allocator); s != "" {
 		if v, ok := strconv.parse_int(s); ok && (v == 1 || v == 2 || v == 4) {
 			g_attn_qtile = int(v)
@@ -2886,7 +2888,9 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 			fmt.eprintln("cuda: attn wmma keeps the 80-block target and splits a KV part that would pass 2048 tokens, capped at 8")
 		}
 		if g_attn_qtile > 1 && d_attn_p != 0 {
-			fmt.eprintfln("cuda: attn wmma reuses one KV dequant across {} query tiles (ODINFER_CUDA_ATTN_QTILE=1 is the one-tile kernel)", g_attn_qtile)
+			fmt.eprintfln("cuda: attn wmma reuses one KV dequant across {} query tiles. On a V100, 4 was slower than the one-tile kernel (16k attn 15798 vs 12643 ms). ODINFER_CUDA_ATTN_QTILE=1 is the default", g_attn_qtile)
+		} else {
+			fmt.eprintln("cuda: attn wmma is one query tile per KV tile. ODINFER_CUDA_ATTN_QTILE=4 is the slower reuse kernel")
 		}
 		if g_wgemm_x16 && d_x16 != 0 {
 			fmt.eprintln("cuda: wgemm X is packed to fp16 once per activation. ODINFER_CUDA_WGEMM_X=0 keeps the fp32 load")

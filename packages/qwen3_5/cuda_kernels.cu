@@ -1662,7 +1662,8 @@ extern "C" __global__ void attention_q8v_wmma(const float* q, const unsigned cha
    and dequantizes each 64-key / 64-value tile once for all of them. The
    single-tile kernel stays for q_tiles==1 and for ODINFER_CUDA_ATTN_QTILE=1.
    On a 512-token chunk the old grid dequantizes KV once per query tile, 16
-   times; the 16k attention bucket was 12643 ms after the 2048-token split.
+   times. On a V100, 4 tiles was slower (16k attn 12643 -> 15798 ms), so the
+   host default is one tile. ODINFER_CUDA_ATTN_QTILE=4 still launches this.
    P and the per-row softmax scale are parked in global memory between the
    K pass and the V pass because both do not fit beside K in the 91136-byte
    buffer. Scores, the online softmax, and PV use the same order as the
