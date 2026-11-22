@@ -1111,6 +1111,10 @@ run_wgemm :: proc(kind: ggml.GGML_Type, rows, cols, T: int, atol, rtol: f32) -> 
 		fmt.eprintf("cuda_selftest: missing %s\n", bname)
 		return false
 	}
+	if cu.func_set_max_dynamic_shared(bfn, int(WG_SMEM_BK32)) != cu.OK || cu.func_set_max_dynamic_shared(bxfn, int(WG_SMEM_BK32)) != cu.OK {
+		fmt.eprintf("cuda_selftest: %s cuFuncSetAttribute failed\n", bname)
+		return false
+	}
 	if cu.launch(bfn, gx, gy, 1, 256, 1, 1, WG_SMEM_BK32, args[:]) != cu.OK || cu.sync() != cu.OK {
 		fmt.eprintf("cuda_selftest: %s launch failed\n", bname)
 		return false
@@ -2387,6 +2391,18 @@ run_attn_flash :: proc() -> bool {
 // |reference|, wider than the fp32 flash band because the products are fp16.
 @(private)
 run_attn_wmma :: proc() -> bool {
+	// 27B, 4 KV heads, a 512-token chunk. The start of the context stays at
+	// 2 parts. The chunk that ends at 16000 is 8, the split measured at
+	// 12467 ms against 14137 ms. ODINFER_CUDA_ATTN_PARTS still overrides.
+	saved_parts := g_attn_parts
+	g_attn_parts = 0
+	start := attn_wmma_plan(512, 0, 4)
+	far := attn_wmma_plan(512, 15488, 4)
+	g_attn_parts = saved_parts
+	if start.nparts != 2 || far.nparts != 8 || far.part_len != 2048 {
+		fmt.eprintfln("cuda_selftest: attn plan start {} parts, 16k {} parts len {}", start.nparts, far.nparts, far.part_len)
+		return false
+	}
 	ok := true
 	wide := [?][2]int{{128, 16}, {128, 7}, {128, 64}, {300, 16}, {1800, 16}, {8192, 16}, {32768, 16}}
 	short := [?][2]int{{128, 16}, {1800, 16}}

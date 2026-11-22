@@ -166,7 +166,7 @@ Q5_K 解码同样是 q8 激活加 `dp4a`（`gemv2_q5_k`），不切分 K。
 | `ODINFER_CUDA_GEMV_ROWS` | `4` | Q4_K / Q6_K 每个 warp 的行数。不设是四行。`1` 选更慢的一行内核 |
 | `ODINFER_CUDA_GEMV_WARPS` | `8` | 带宽 GEMV 每块的 warp 数（1..16） |
 | `ODINFER_CUDA_GEMV_MMVQ` | 开 | Q4_K（`gemv2_q4w`）、Q6_K（`gemv2_q6w`）、Q5_K（`gemv2_q5w`）每个行一个 warp，沿 K 做 128 位加载，不切分 K。K≥5120 的 Q4 gate+up 是 `gemv2_q4wp`。9B 的 K=4096 仍是两次 `q4w`。#24 上 T=1 wall 30.40 ms，线性层 23.36；27B 解码 905/8000/16000 是 32.45/31.09/29.54。`=0` 回到 `gemv2_q4` / `gemv2_q4p` / `gemv2_q6s` / `gemv2_q5_k` |
-| `ODINFER_CUDA_GEMV_Q5` | `w` | MMVQ 开着时的 Q5 路径。`w` 是对齐的 `gemv2_q5w`。`k` 是 4 行的 `gemv2_q5_k`（#24 上 2.97 ms，`q5w` 是 3.06）。`w2` 是 `gemv2_q5w2`：连续两行，x 只加载一次。K≥5120 的 Q5 gate+up 走 `gemv2_q5wp`，除非设成 `k`。27B 的 gate+up 是 Q4，不会走到这个配对。`--bench-gemv` 会打 `q5w`、`q5w2`，以及 `q5wp` 对两次 `q5w` |
+| `ODINFER_CUDA_GEMV_Q5` | `w` | MMVQ 开着时的 Q5 路径。`w` 是对齐的 `gemv2_q5w`。`k` 是 4 行的 `gemv2_q5_k`。`w2` 是 `gemv2_q5w2`：连续两行，x 只加载一次。V100 复测 `q5k` 2.94–2.95 ms，`q5w` 3.10–3.13，`q5w2` 3.04–3.09，解码 tok/s 没有变化。K≥5120 的 Q5 gate+up 走 `gemv2_q5wp`，除非设成 `k`。27B 的 gate+up 是 Q4，不会走到这个配对。`--bench-gemv` 会打 `q5w`、`q5w2`，以及 `q5wp` 对两次 `q5w` |
 | `ODINFER_CUDA_GEMV_SPLITS` | auto | 不设：行数不超过 8192 时 4 路；若拆成两半仍有 12 个 superblock，并且 warp 数不到每 SM 32 个，则改成 2 路。27B w2 是暂存加这路 2 分（bench `q6s2`）。9B w2 是直接加载的 2 路（`s2`）。`r4` 不是解码启动。`=4` 恢复固定 4 路 |
 | `ODINFER_CUDA_GEMV_FUSE` | 自动 | 行数超过 8192 且 K≥5120 的 Q4 gate+up 一次扫完 K（`gemv2_q4p`，27B 的 w1）。9B 的 w1 是 K=4096，仍是两次启动：配对把 16k 解码从 58.84 降到 57.11 tok/s。`=1` 强制所有高行数 Q4 都配对。`=0` 是两次 GEMV。`--bench-gemv` 在 w1 上打印 `pair` 和 `two r4` |
 | `ODINFER_CUDA_LAUNCHES` | 关 | `=1` 时每次 forward 打印内核启动次数 |
@@ -179,8 +179,8 @@ Q5_K 解码同样是 q8 激活加 `dp4a`（`gemv2_q5_k`），不切分 K。
 | `ODINFER_CUDA_PREFILL_GEMM` | 开 | Q4_K / Q6_K 预填充（`T>1`，K 是 256 的倍数），Q5_K 在 `T` 达到 `WGEMM_MIN` 之后也走 `wgemm`（fp16 WMMA，128×128）。更短的 Q4/Q6 走 `mmqk`。更短的 Q5_K 仍是逐元素 `tc_q5k`：`mmqk_q5_k` 把 T=19 的线性层从 406.76 ms 拉到 441.98（Q5 那段从 58.40 到大约 94）。`ODINFER_CUDA_PREFILL_LINEAR=mmqk` 只让 Q4/Q6 走 dp4a。旧的 Q4/Q6 `mmqk` 在 V100、chunk 512 上：9B 905/1805/8000/16000 是 371.70/376.91/337.20/290.49 tok/s，27B 905/8000/16000 是 124.00/112.97/97.43。`=0` 跳过两者，仍是 `tc2` / 逐元素 `tc`。`wgemm` 相对 fp32 CPU GEMV 允许 `5e-2 + 5e-2*|ref|`。`mmqk` 相对 `gemv2` 允许 `2e-3 + 2e-3*|ref|` |
 | `ODINFER_CUDA_PREFILL_LINEAR` | `wgemm` | `=mmqk` 选择 q8 dp4a。不设时，`T` 达到 `ODINFER_CUDA_WGEMM_MIN` 才走 `wgemm`。`ODINFER_CUDA_PREFILL_GEMM=0` 时忽略 |
 | `ODINFER_CUDA_WGEMM_MIN` | `128` | 低于这个 token 数的 Q4_K / Q6_K 预填充走 `mmqk`。Q5_K 仍走 `tc_q5k`（#24 上 T=19 是 58.41 ms）。不满的块会跳过起点已经超过 `T` 的 16 列 MMA。`=0` 让所有 `T>1`（含 Q5_K）都走 `wgemm`。256 token 的双缓冲放不进 96 KB |
-| `ODINFER_CUDA_WGEMM_BK` | `64` | `=32` 启动 BK=32 的块（步长 40，双缓冲 40960 字节）。默认 BK=64 不变。27B 一个 512 token 的线性层大约 24.9 TFLOP，#24 上 1614 ms，约 15.4 TFLOPS，是 125 TFLOPS fp16 tensor 峰值的 12%。差距在 HMMA 前面的 fp16 反量化，不是 96 KB 的块本身 |
-| `ODINFER_CUDA_ATTN_PARTS` | 关 | 不设时按 80 个 block 来切。512 token、4 个 KV head 只有 2 段，16k 的 K 只对半切（16k 注意力 14149 ms，约 3.6 TFLOPS，峰值的 3%）。`=4` 或 `=8` 强制那么多段，上限是 KV tile 数和 8 |
+| `ODINFER_CUDA_WGEMM_BK` | `64` | `=32` 启动 BK=32（步长 40）。K 缓冲是 40960 字节，但收尾要把 65536 字节写进同一块共享内存，所以启动大小是 65536。`36447cb` 只给了 40960，写越界。65536 在 96 KB 里放不下两个 block。默认 BK=64 内核回到 #24 的源码：模板化的那个版本就是 16k 线性层从 51064 ms 到 52588 ms 的回退。512 token 一块大约 24.9 TFLOP，#24 上 1614 ms，约 15.4 TFLOPS，是 125 TFLOPS fp16 tensor 峰值的 12%。差距在 HMMA 前面的 fp16 反量化 |
+| `ODINFER_CUDA_ATTN_PARTS` | 关 | 不设时仍按 80 个 block 的目标，并且一段 KV 超过 2048 token 就再切，上限是 8 和 KV tile 数。上下文开头的 512 token 仍是 2 段。落到 16000、4 个 KV head 的 512 token 块是 8 段。整段 16k 预填充强制 8 段时，注意力从 14137 ms 降到 12467 ms。`=4` 或 `=8` 仍是强制段数 |
 | `ODINFER_CUDA_WGEMM_X` | 开 | 每个 wgemm 的激活打成 fp16 一次。`=0` 在核内读 fp32。Q5_K 也走这块 |
 | `ODINFER_CUDA_GEMV_PIPE` | 关 | `=1` 在算当前 Q4/Q6 super-block 之前发出下一块。不设则每行自己加载 x |
 | `ODINFER_CUDA_DELTA_SM` | 开 | 解码 delta 把 128×128 状态放进共享内存。`=0` 走全局内存 |

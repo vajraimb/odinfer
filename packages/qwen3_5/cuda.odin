@@ -1020,7 +1020,10 @@ launch_tc :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d, tcount: in
 // ODINFER_CUDA_PREFILL_GEMM=0 keeps tc2 (T<=64) and the scalar tile.
 
 WG_SMEM :: u32(81920)
-WG_SMEM_BK32 :: u32(40960)
+// BK=32's K buffer is 40960 bytes. The epilogue stores 8*8*256 floats
+// (65536 bytes) into that same allocation. 36447cb launched 40960 and the
+// store walked off the end. 65536 does not fit two blocks in 96 KB.
+WG_SMEM_BK32 :: u32(65536)
 
 @(private)
 wgemm_applies :: proc(kind: ggml.GGML_Type, n, tcount: int) -> bool {
@@ -1672,6 +1675,14 @@ attn_wmma_plan :: proc(T, pos0, n_kv: int) -> Attn_Wmma_Plan {
 		base = 1
 	}
 	nparts := (ATTN_WMMA_TARGET + base - 1) / base
+	// A part longer than 32 BC tiles (2048 KV tokens) is the 16k walk that
+	// ATTN_PARTS=8 cut from 14137 ms to 12467 ms. Ask for that split, and
+	// never fewer parts than the 80-block target, so a 512-token chunk at
+	// pos0=0 stays at 2. The cap below is still 8 and the KV tile count.
+	long_parts := (tiles + 31) / 32
+	if long_parts > nparts {
+		nparts = long_parts
+	}
 	if g_attn_parts > 0 {
 		nparts = g_attn_parts
 	}
@@ -2087,6 +2098,11 @@ bind_kernels :: proc() -> bool {
 	g_wgemm_smem = cu.func_set_max_dynamic_shared(k_wgemm_q4, int(WG_SMEM)) == cu.OK && cu.func_set_max_dynamic_shared(k_wgemm_q6, int(WG_SMEM)) == cu.OK && cu.func_set_max_dynamic_shared(k_wgemm_q5, int(WG_SMEM)) == cu.OK && cu.func_set_max_dynamic_shared(k_wgemm_q4x, int(WG_SMEM)) == cu.OK && cu.func_set_max_dynamic_shared(k_wgemm_q6x, int(WG_SMEM)) == cu.OK && cu.func_set_max_dynamic_shared(k_wgemm_q5x, int(WG_SMEM)) == cu.OK
 	if !g_wgemm_smem {
 		fmt.eprintln("cuda: wgemm stays off (cuFuncSetAttribute failed); Q4_K/Q6_K prefill uses mmqk")
+	}
+	bk32_smem := cu.func_set_max_dynamic_shared(k_wgemm_q4_b32, int(WG_SMEM_BK32)) == cu.OK && cu.func_set_max_dynamic_shared(k_wgemm_q6_b32, int(WG_SMEM_BK32)) == cu.OK && cu.func_set_max_dynamic_shared(k_wgemm_q5_b32, int(WG_SMEM_BK32)) == cu.OK && cu.func_set_max_dynamic_shared(k_wgemm_q4_b32x, int(WG_SMEM_BK32)) == cu.OK && cu.func_set_max_dynamic_shared(k_wgemm_q6_b32x, int(WG_SMEM_BK32)) == cu.OK && cu.func_set_max_dynamic_shared(k_wgemm_q5_b32x, int(WG_SMEM_BK32)) == cu.OK
+	if g_wgemm_bk32 && !bk32_smem {
+		g_wgemm_bk32 = false
+		fmt.eprintln("cuda: WGEMM_BK=32 stays off (cuFuncSetAttribute failed); BK=64")
 	}
 	if !g_wmma_smem {
 		fmt.eprintln("cuda: prefill wmma stays on attention_q8v (cuFuncSetAttribute failed)")
@@ -2817,9 +2833,11 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 		if bk == 64 {
 			stride = 80
 		}
-		fmt.eprintfln("cuda: prefill linear is wgemm for Q4_K/Q5_K/Q6_K T>={} (fp16, 128x128, BK={}, stride {}). T below that is mmqk for Q4_K/Q6_K; Q5_K stays on tc. ODINFER_CUDA_WGEMM_MIN=0 forces wgemm. ODINFER_CUDA_WGEMM_BK=32 is the smaller tile. ODINFER_CUDA_PREFILL_LINEAR=mmqk keeps mmqk. ODINFER_CUDA_PREFILL_GEMM=0 keeps tc2/tc", g_wgemm_min, bk, stride)
+		fmt.eprintfln("cuda: prefill linear is wgemm for Q4_K/Q5_K/Q6_K T>={} (fp16, 128x128, BK={}, stride {}). T below that is mmqk for Q4_K/Q6_K; Q5_K stays on tc. ODINFER_CUDA_WGEMM_MIN=0 forces wgemm. ODINFER_CUDA_WGEMM_BK=32 launches the shorter tile at {} bytes (the epilogue, not the 40960-byte K buffer). ODINFER_CUDA_PREFILL_LINEAR=mmqk keeps mmqk. ODINFER_CUDA_PREFILL_GEMM=0 keeps tc2/tc", g_wgemm_min, bk, stride, WG_SMEM_BK32)
 		if g_attn_parts > 0 {
-			fmt.eprintfln("cuda: attn wmma KV parts forced to {} (ODINFER_CUDA_ATTN_PARTS). Unset keeps the 80-block planner", g_attn_parts)
+			fmt.eprintfln("cuda: attn wmma KV parts forced to {} (ODINFER_CUDA_ATTN_PARTS)", g_attn_parts)
+		} else {
+			fmt.eprintln("cuda: attn wmma keeps the 80-block target and splits a KV part that would pass 2048 tokens, capped at 8")
 		}
 		if g_wgemm_x16 && d_x16 != 0 {
 			fmt.eprintln("cuda: wgemm X is packed to fp16 once per activation. ODINFER_CUDA_WGEMM_X=0 keeps the fp32 load")
