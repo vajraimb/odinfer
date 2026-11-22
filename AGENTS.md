@@ -163,9 +163,10 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
   64-token N tile dequants every weight twice per 128-token chunk. It is not
   launched. `mmqk` (q8 + dp4a) is the default. The global-X tile was faster
   on that V100 (9B 16000 tokens 246 vs 213 tok/s, 27B 8000 tokens 93 vs 80).
-  The tile that ships stages one q8 superblock in 22528 bytes of shared
-  memory (32 rows by 64 tokens). sm_70 ptxas: 128 registers, no spills.
-  That tile has not been timed.
+  The 32-row tile was faster (9B 16000 tokens 290 vs 246 tok/s, 27B 8000
+  tokens 113 vs 93). Q4 now uses 8 rows per warp (128 registers, no spills
+  under launch_bounds). Q6 stays at 4 rows per warp because 8 rows spilled.
+  Gate+up and K+V share one q8 stage. That kernel has not been timed.
 - GEMV kernel shape: on this M3 the optimum is 256 threads / 32 rows / 8 lanes;
   every multi-row/multi-thread/fusion variant measured as a regression (data in
   packages/qwen3_5/README.md and gemm_harness).
