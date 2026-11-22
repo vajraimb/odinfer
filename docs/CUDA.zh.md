@@ -181,7 +181,7 @@ Q5_K 解码同样是 q8 激活加 `dp4a`（`gemv2_q5_k`），不切分 K。
 | `ODINFER_CUDA_WGEMM_MIN` | `128` | 低于这个 token 数的 Q4_K / Q6_K 预填充走 `mmqk`。Q5_K 仍走 `tc_q5k`（#24 上 T=19 是 58.41 ms）。不满的块会跳过起点已经超过 `T` 的 16 列 MMA。`=0` 让所有 `T>1`（含 Q5_K）都走 `wgemm`。256 token 的双缓冲放不进 96 KB |
 | `ODINFER_CUDA_WGEMM_BK` | `64` | `=32` 启动 BK=32（步长 40）。K 缓冲是 40960 字节，但收尾要把 65536 字节写进同一块共享内存，所以启动大小是 65536。`36447cb` 只给了 40960，写越界。65536 在 96 KB 里放不下两个 block。默认 BK=64 内核回到 #24 的源码：模板化的那个版本就是 16k 线性层从 51064 ms 到 52588 ms 的回退。512 token 一块大约 24.9 TFLOP，#24 上 1614 ms，约 15.4 TFLOPS，是 125 TFLOPS fp16 tensor 峰值的 12%。差距在 HMMA 前面的 fp16 反量化 |
 | `ODINFER_CUDA_ATTN_PARTS` | 关 | 不设时仍按 80 个 block 的目标，并且一段 KV 超过 2048 token 就再切，上限是 8 和 KV tile 数。上下文开头的 512 token 仍是 2 段。落到 16000、4 个 KV head 的 512 token 块是 8 段。整段 16k 预填充强制 8 段时，注意力从 14137 ms 降到 12467 ms。`=4` 或 `=8` 仍是强制段数 |
-| `ODINFER_CUDA_ATTN_QTILE` | `4` | 几个 query tile 共用一次 64 token 的 K/V 反量化。512 token 的块有 16 个 query tile，单 tile 内核会把同一段 KV 反量化 16 次。`4` 是 4 次，K 和 V 两趟之间把 P 放在大约 13 MB 的缓冲里。`=1` 是 #25 的 `attn_wmma`。`=2` 是两个 tile 共用。只有一个 query tile 的块仍走 `attn_wmma`。还没有计时 |
+| `ODINFER_CUDA_ATTN_QTILE` | `1` | 每个 KV tile 一个 query tile（`attn_wmma`），就是 `965afd1`。`=4` 让四个 tile 共用一次反量化（`attn_wqr`）。V100 上结果精确（max abs 0）但更慢：16k 注意力 12643 → 15798 ms，pos 0 的 512 token 块 23.45 → 55.63 ms，pos 15360 的块 767 → 832 ms。16k 预填充 218.52 → 209.52 tok/s。`=1` 回到 218.48 / 29.53，注意力 12645。`=2` 没有跑过。只有一个 query tile 的块无论设多少都走 `attn_wmma` |
 | `ODINFER_CUDA_WGEMM_X` | 开 | 每个 wgemm 的激活打成 fp16 一次。`=0` 在核内读 fp32。Q5_K 也走这块 |
 | `ODINFER_CUDA_GEMV_PIPE` | 关 | `=1` 在算当前 Q4/Q6 super-block 之前发出下一块。不设则每行自己加载 x |
 | `ODINFER_CUDA_DELTA_SM` | 开 | 解码 delta 把 128×128 状态放进共享内存。`=0` 走全局内存 |
