@@ -945,8 +945,23 @@ run_mmqk_pair :: proc(kind: ggml.GGML_Type, rows, cols, T: int) -> bool {
 	raw1 := fill_weight(kind, rows, cols)
 	defer delete(raw0)
 	defer delete(raw1)
-	for i in 0 ..< len(raw1) {
-		raw1[i] = u8((int(raw1[i]) + 19) & 0xFF)
+	// Q4 can take +19 on every byte and still land inside the fp32 allowance.
+	// Q6 cannot: +19 also hits the fp16 superblock scale and the int8 scales,
+	// and the shared q8 rounding (the same one gemv2 uses) then exceeds that
+	// allowance. The pair matched gemv2 at ~2e-4 on that pattern, so the
+	// second matrix was not a different kernel. Perturb ql/qh only and leave
+	// the scales and d that fill_weight wrote.
+	if kind == .Q6_K {
+		_, bsz := ggml.ggml_block_info(kind)
+		for i in 0 ..< len(raw1) {
+			if i % bsz < 192 {
+				raw1[i] ~= 0x3C
+			}
+		}
+	} else {
+		for i in 0 ..< len(raw1) {
+			raw1[i] = u8((int(raw1[i]) + 19) & 0xFF)
+		}
 	}
 	x := make([]f32, T * cols)
 	defer delete(x)
@@ -1629,6 +1644,39 @@ run_attn_split :: proc() -> bool {
 		if !s_report(fmt.tprintf("attn_split npos={}", npos), st, 2e-2, 1e-3) {
 			ok = false
 		}
+		// 128-wide decode parts. kv_mul here is 4, the 9B group. Same
+		// reduce and the same allowance as the 32-wide split.
+		if npos == 128 || npos == 300 || npos == 1800 {
+			long_fn := s_fn("attention_q8v_long4")
+			if long_fn == nil {
+				fmt.eprintln("cuda_selftest: attention_q8v_long4 missing")
+				return false
+			}
+			long_part := i32(128)
+			lsplit := (npos + 127) / 128
+			lsmem := u32((kv_mul * hd + kv_mul * 128 + kv_mul * 2 + hd) * 4)
+			largs := [?]rawptr{&qa, &kca, &vca, &pm, &pl, &po, &ihd, &ikb, &ivb, &mul, &nh, &ps, &long_part, &slot}
+			if cu.launch(long_fn, u32(n_kv), u32(lsplit), 1, 128, 1, 1, lsmem, largs[:]) != cu.OK || cu.sync() != cu.OK {
+				fmt.eprintfln("cuda_selftest: attention_q8v_long4 launch failed at npos {}", npos)
+				return false
+			}
+			lns := i32(lsplit)
+			lrargs := [?]rawptr{&xb, &pm, &pl, &po, &ihd, &nh, &lns}
+			if cu.launch(red_fn, u32(n_heads), 1, 1, 128, 1, 1, 0, lrargs[:]) != cu.OK || cu.sync() != cu.OK {
+				fmt.eprintfln("cuda_selftest: attention_q8v_long reduce failed at npos {}", npos)
+				return false
+			}
+			if cu.download(raw_data(got_new), dxb, len(got_new) * 4) != cu.OK {
+				return false
+			}
+			st_long: Case_Err
+			for i in 0 ..< len(got_new) {
+				s_note(&st_long, fmt.tprintf("long[%d] npos %d", i, npos), got_new[i], got_old[i], 2e-2, 1e-3)
+			}
+			if !s_report(fmt.tprintf("attn_long npos={}", npos), st_long, 2e-2, 1e-3) {
+				ok = false
+			}
+		}
 	}
 	return ok
 }
@@ -2065,23 +2113,31 @@ run_delta :: proc() -> bool {
 // stepping delta_recurrent_step in token order.
 @(private)
 run_delta_chunk :: proc() -> bool {
-	return run_delta_case(4, 4, 1, 2, 2, false)
+	return run_delta_case(4, 4, 1, 2, 2, 0)
 }
 
+// which: 0 global recurrence, 1 smem recurrence, 2 chunked WMMA.
 @(private)
-run_delta_case :: proc(hkd, hvd, nkh, nvh, T: int, smem: bool) -> bool {
+run_delta_case :: proc(hkd, hvd, nkh, nvh, T, which: int) -> bool {
 	name := "delta_recurrent_chunk"
 	shared := u32(0)
-	if smem {
+	block := u32(128)
+	atol: f32 = 1e-4
+	if which == 1 {
 		name = "delta_recurrent_chunk_sm"
 		shared = u32(hkd * hvd * 4)
+	} else if which == 2 {
+		name = "delta_chunk_wmma"
+		shared = 49152
+		block = 256
+		atol = 2e-3
 	}
 	fn := s_fn(name)
 	if fn == nil {
 		fmt.eprintf("cuda_selftest: %s missing\n", name)
 		return false
 	}
-	if smem && shared > 48 * 1024 {
+	if which == 1 && shared > 48 * 1024 {
 		if cu.func_set_max_dynamic_shared(fn, int(shared)) != cu.OK {
 			fmt.eprintf("cuda_selftest: %s could not raise dynamic smem to %d\n", name, shared)
 			return false
@@ -2175,7 +2231,7 @@ run_delta_case :: proc(hkd, hvd, nkh, nvh, T: int, smem: bool) -> bool {
 	ik, iv, nk, nv := i32(hkd), i32(hvd), i32(nkh), i32(nvh)
 	tt, qs, vs := i32(T), i32(nkh * hkd), i32(nvh * hvd)
 	args := [?]rawptr{&o, &stp, &qq, &kk, &vv, &bb, &aa, &decp, &dtp, &ik, &iv, &nk, &nv, &tt, &qs, &vs}
-	if cu.launch(fn, u32(nvh), 1, 1, 128, 1, 1, shared, args[:]) != cu.OK || cu.sync() != cu.OK {
+	if cu.launch(fn, u32(nvh), 1, 1, block, 1, 1, shared, args[:]) != cu.OK || cu.sync() != cu.OK {
 		fmt.eprintf("cuda_selftest: %s launch failed\n", name)
 		return false
 	}
@@ -2187,16 +2243,16 @@ run_delta_case :: proc(hkd, hvd, nkh, nvh, T: int, smem: bool) -> bool {
 	cu.download(raw_data(gstate), ds, len(state) * 4)
 	st_out: Case_Err
 	for i in 0 ..< len(cpu_out) {
-		s_note(&st_out, fmt.tprintf("delta chunk out[%d]", i), gout[i], cpu_out[i], 1e-4, 1e-4)
+		s_note(&st_out, fmt.tprintf("%s out[%d]", name, i), gout[i], cpu_out[i], atol, atol)
 	}
-	if !s_report("delta chunk out", st_out, 1e-4, 1e-4) {
+	if !s_report(fmt.tprintf("%s out", name), st_out, atol, atol) {
 		return false
 	}
 	st_state: Case_Err
 	for i in 0 ..< len(state) {
-		s_note(&st_state, fmt.tprintf("delta chunk state[%d]", i), gstate[i], cpu_state[i], 1e-4, 1e-4)
+		s_note(&st_state, fmt.tprintf("%s state[%d]", name, i), gstate[i], cpu_state[i], atol, atol)
 	}
-	return s_report("delta chunk state", st_state, 1e-4, 1e-4)
+	return s_report(fmt.tprintf("%s state", name), st_state, atol, atol)
 }
 
 cuda_selftest :: proc() -> bool {
@@ -2328,7 +2384,12 @@ cuda_selftest :: proc() -> bool {
 	}
 	// hvd is not a multiple of the block size, and the 128x128 production
 	// state (64 KiB) which needs the dynamic-smem cap raised.
-	if !run_delta_case(16, 20, 2, 2, 3, true) || !run_delta_case(128, 128, 1, 1, 2, true) {
+	if !run_delta_case(16, 20, 2, 2, 3, 1) || !run_delta_case(128, 128, 1, 1, 2, 1) {
+		ok = false
+	}
+	// Chunked WMMA against the recurrent step. T=32 is two full chunks.
+	// T=20 leaves a partial chunk. Allowance is the fp16-operand drift.
+	if !run_delta_case(128, 128, 1, 1, 32, 2) || !run_delta_case(128, 128, 1, 2, 20, 2) {
 		ok = false
 	}
 	if !run_elem() {
