@@ -186,6 +186,8 @@ g_q4_nc: bool // ODINFER_CUDA_Q4_NC=1: ld.global.nc Q4 loads (slower on V100)
 @(private)
 g_q4_ilp: bool // ODINFER_CUDA_Q4_ILP=1: 8 rows/warp, two super-blocks
 @(private)
+g_gemv_pipe: bool // ODINFER_CUDA_GEMV_PIPE=1: next super-block issued before the dot
+@(private)
 g_skip_ffn, g_skip_attn: bool
 @(private)
 g_score_batch: int // how many query tokens d_scores can hold
@@ -282,7 +284,7 @@ g_q8_valid: bool
 @(private)
 k_quant, k_rmsnorm_q8, k_res_norm: cu.Function
 @(private)
-k_gemv2_q4, k_gemv2_q4nc, k_gemv2_q4x, k_gemv2_q4_pair, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50: cu.Function
+k_gemv2_q4, k_gemv2_q4nc, k_gemv2_q4x, k_gemv2_q4_pipe, k_gemv2_q4_pair, k_gemv2_q4_pair_pipe, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q6_pipe, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50: cu.Function
 @(private)
 k_gemv2r1_q4, k_gemv2r1_q6: cu.Function
 @(private)
@@ -294,7 +296,7 @@ k_conv, k_conv_chunk, k_l2, k_l2_chunk, k_delta, k_delta_chunk, k_delta_sm, k_de
 @(private)
 k_tc2_q4, k_tc2_q6, k_tc2s_q4, k_tc2s_q6, k_tc2m_q4, k_tc2m_q6, k_tc2r_q4, k_tc2r_q6: cu.Function
 @(private)
-k_pgemm_q4, k_pgemm_q6, k_wgemm_q4, k_wgemm_q6, k_wgemm_q4x, k_wgemm_q6x, k_pack_f16: cu.Function
+k_pgemm_q4, k_pgemm_q6, k_wgemm_q4, k_wgemm_q6, k_wgemm_q5, k_wgemm_q4x, k_wgemm_q6x, k_wgemm_q5x, k_pack_f16: cu.Function
 @(private)
 k_quant_batch, k_mmqk_q4, k_mmqk_q4_r4, k_mmqk_q6, k_mmqk_q4_pair, k_mmqk_q6_pair: cu.Function
 
@@ -512,9 +514,17 @@ gemv2_for :: proc(kind: ggml.GGML_Type) -> cu.Function {
 		if g_q4_nc && k_gemv2_q4nc != nil {
 			return k_gemv2_q4nc
 		}
+		if g_gemv_pipe && k_gemv2_q4_pipe != nil {
+			return k_gemv2_q4_pipe
+		}
 		return k_gemv2_q4
 	}
-	if kind == .Q6_K do return k_gemv2_q6
+	if kind == .Q6_K {
+		if g_gemv_pipe && k_gemv2_q6_pipe != nil {
+			return k_gemv2_q6_pipe
+		}
+		return k_gemv2_q6
+	}
 	if kind == .Q5_K do return k_gemv2_q5k
 	if kind == .Q8_0 do return k_gemv2_q8
 	if kind == .Q5_0 do return k_gemv2_q50
@@ -673,12 +683,17 @@ launch_gemv2 :: proc(fn: cu.Function, kind: ggml.GGML_Type, w, y: cu.Device_Ptr,
 		what = "gemv2_q4x"
 	} else if fn == k_gemv2_q4nc {
 		what = "gemv2_q4nc"
+	} else if fn == k_gemv2_q4_pipe {
+		what = "gemv2_q4pipe"
+	} else if fn == k_gemv2_q6_pipe {
+		what = "gemv2_q6pipe"
 	}
 	fn_use := fn
 	// 9B q6 is 33 launches: 32 of them are w2 (4096 x 12288). Staging those
 	// was slower (3.95 -> 4.19 ms). 27B w2 is 5120 x 17408 and the logits
 	// are 248320 rows; staging those was faster (7.99 -> 7.04 ms).
-	if kind == .Q6_K && !r1 && k_gemv2_q6s != nil && q6_stage_on(n, d) {
+	// The pipe kernel replaces staging while it is on.
+	if kind == .Q6_K && !r1 && !g_gemv_pipe && k_gemv2_q6s != nil && q6_stage_on(n, d) {
 		fn_use = k_gemv2_q6s
 		what = "gemv2_q6s"
 	}
@@ -770,7 +785,13 @@ launch_gemv_pair :: proc(a, b: Tensor, x, y0, y1: cu.Device_Ptr, n, d: int) -> b
 	gx := u32((d + rows_per - 1) / rows_per)
 	bx := u32(warps * 32)
 	args := [?]rawptr{&w0, &w1, &qs, &sc, &sm, &yy0, &yy1, &nn, &dd}
-	must(klaunch(k_gemv2_q4_pair, gx, 1, 1, bx, 1, 1, args[:], "gemv2_q4p"))
+	pfn := k_gemv2_q4_pair
+	pname := "gemv2_q4p"
+	if g_gemv_pipe && k_gemv2_q4_pair_pipe != nil {
+		pfn = k_gemv2_q4_pair_pipe
+		pname = "gemv2_q4pp"
+	}
+	must(klaunch(pfn, gx, 1, 1, bx, 1, 1, args[:], pname))
 	return true
 }
 
@@ -904,7 +925,24 @@ launch_tc :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d, tcount: in
 	}
 	gx := u32((d + 63) / 64)
 	gy := u32((tcount + 63) / 64)
-	return klaunch(fn, gx, gy, 1, 512, 1, 1, args[:], "tc")
+	name := "tc"
+	#partial switch kind {
+	case .Q5_K:
+		name = "tc_q5k"
+	case .Q4_K:
+		name = "tc_q4k"
+	case .Q6_K:
+		name = "tc_q6k"
+	case .Q8_0:
+		name = "tc_q8"
+	case .Q8_K:
+		name = "tc_q8k"
+	case .F16:
+		name = "tc_f16"
+	case .F32:
+		name = "tc_f32"
+	}
+	return klaunch(fn, gx, gy, 1, 512, 1, 1, args[:], name)
 }
 
 // Q4_K / Q6_K prefill. The default is wgemm: dequant the weight tile to fp16
@@ -922,6 +960,9 @@ wgemm_applies :: proc(kind: ggml.GGML_Type, n, tcount: int) -> bool {
 	}
 	if n <= 0 || n % 256 != 0 || tcount <= 1 || tcount > g_max_t || tcount < g_wgemm_min {
 		return false
+	}
+	if kind == .Q5_K {
+		return k_wgemm_q5 != nil
 	}
 	return kind == .Q4_K || kind == .Q6_K
 }
@@ -960,11 +1001,15 @@ launch_wgemm :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d, tcount:
 	xx := x
 	if kind == .Q6_K {
 		fn = k_wgemm_q6
+	} else if kind == .Q5_K {
+		fn = k_wgemm_q5
 	}
 	if pack_x16(x, n, tcount) {
 		fn = k_wgemm_q4x
 		if kind == .Q6_K {
 			fn = k_wgemm_q6x
+		} else if kind == .Q5_K {
+			fn = k_wgemm_q5x
 		}
 		xx = d_x16
 	}
@@ -1873,8 +1918,10 @@ bind_kernels :: proc() -> bool {
 	k_pgemm_q6 = get_fn("pgemm_q6_k")
 	k_wgemm_q4 = get_fn("wgemm_q4_k")
 	k_wgemm_q6 = get_fn("wgemm_q6_k")
+	k_wgemm_q5 = get_fn("wgemm_q5_k")
 	k_wgemm_q4x = get_fn("wgemm_q4_x16")
 	k_wgemm_q6x = get_fn("wgemm_q6_x16")
+	k_wgemm_q5x = get_fn("wgemm_q5_x16")
 	k_pack_f16 = get_fn("pack_f16")
 	k_quant_batch = get_fn("quant_q8_batch")
 	k_mmqk_q4 = get_fn("mmqk_q4_k")
@@ -1899,9 +1946,12 @@ bind_kernels :: proc() -> bool {
 	k_gemv2_q4 = get_fn("gemv2_q4_k")
 	k_gemv2_q4nc = get_fn("gemv2_q4nc_k")
 	k_gemv2_q4x = get_fn("gemv2_q4x_k")
+	k_gemv2_q4_pipe = get_fn("gemv2_q4_pipe_k")
 	k_gemv2_q4_pair = get_fn("gemv2_q4_pair_k")
+	k_gemv2_q4_pair_pipe = get_fn("gemv2_q4_pair_pipe_k")
 	k_gemv2_q6 = get_fn("gemv2_q6_k")
 	k_gemv2_q6s = get_fn("gemv2_q6s_k")
+	k_gemv2_q6_pipe = get_fn("gemv2_q6_pipe_k")
 	k_gemv2_q5k = get_fn("gemv2_q5_k")
 	k_gemv2_q8 = get_fn("gemv2_q8_0")
 	k_gemv2_q50 = get_fn("gemv2_q5_0")
@@ -1913,9 +1963,9 @@ bind_kernels :: proc() -> bool {
 		k_conv, k_conv_chunk, k_l2, k_l2_chunk, k_delta, k_delta_chunk, k_delta_sm, k_delta_wmma, k_rmsgate, k_rmsgate_q, k_moe_topk,
 		k_gate_q, k_swiglu_q,
 		k_tc2_q4, k_tc2_q6, k_tc2s_q4, k_tc2s_q6, k_tc2m_q4, k_tc2m_q6, k_tc2r_q4, k_tc2r_q6,
-		k_quant, k_rmsnorm_q8, k_res_norm, k_gemv2_q4, k_gemv2_q4nc, k_gemv2_q4x, k_gemv2_q4_pair, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50,
+		k_quant, k_rmsnorm_q8, k_res_norm, k_gemv2_q4, k_gemv2_q4nc, k_gemv2_q4x, k_gemv2_q4_pipe, k_gemv2_q4_pair, k_gemv2_q4_pair_pipe, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q6_pipe, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50,
 		k_gemv2r1_q4, k_gemv2r1_q6,
-		k_pgemm_q4, k_pgemm_q6, k_wgemm_q4, k_wgemm_q6, k_wgemm_q4x, k_wgemm_q6x, k_pack_f16, k_quant_batch, k_mmqk_q4, k_mmqk_q4_r4, k_mmqk_q6, k_mmqk_q4_pair, k_mmqk_q6_pair,
+		k_pgemm_q4, k_pgemm_q6, k_wgemm_q4, k_wgemm_q6, k_wgemm_q5, k_wgemm_q4x, k_wgemm_q6x, k_wgemm_q5x, k_pack_f16, k_quant_batch, k_mmqk_q4, k_mmqk_q4_r4, k_mmqk_q6, k_mmqk_q4_pair, k_mmqk_q6_pair,
 	}
 	for h in handles {
 		if h == nil {
@@ -1928,7 +1978,7 @@ bind_kernels :: proc() -> bool {
 		fmt.eprintln("cuda: delta state stays in global memory (cuFuncSetAttribute failed)")
 	}
 	g_wmma_smem = cu.func_set_max_dynamic_shared(k_attn_wmma, ATTN_WMMA_SMEM) == cu.OK
-	g_wgemm_smem = cu.func_set_max_dynamic_shared(k_wgemm_q4, int(WG_SMEM)) == cu.OK && cu.func_set_max_dynamic_shared(k_wgemm_q6, int(WG_SMEM)) == cu.OK && cu.func_set_max_dynamic_shared(k_wgemm_q4x, int(WG_SMEM)) == cu.OK && cu.func_set_max_dynamic_shared(k_wgemm_q6x, int(WG_SMEM)) == cu.OK
+	g_wgemm_smem = cu.func_set_max_dynamic_shared(k_wgemm_q4, int(WG_SMEM)) == cu.OK && cu.func_set_max_dynamic_shared(k_wgemm_q6, int(WG_SMEM)) == cu.OK && cu.func_set_max_dynamic_shared(k_wgemm_q5, int(WG_SMEM)) == cu.OK && cu.func_set_max_dynamic_shared(k_wgemm_q4x, int(WG_SMEM)) == cu.OK && cu.func_set_max_dynamic_shared(k_wgemm_q6x, int(WG_SMEM)) == cu.OK && cu.func_set_max_dynamic_shared(k_wgemm_q5x, int(WG_SMEM)) == cu.OK
 	if !g_wgemm_smem {
 		fmt.eprintln("cuda: wgemm stays off (cuFuncSetAttribute failed); Q4_K/Q6_K prefill uses mmqk")
 	}
@@ -2327,6 +2377,9 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	// Pack the activation to fp16 once so every row-tile reloads half of it.
 	// =0 keeps the in-kernel fp32 load.
 	g_wgemm_x16 = os.get_env("ODINFER_CUDA_WGEMM_X", context.temp_allocator) != "0"
+	// =1 issues the next super-block before the current dot. Off: the 8cd511d
+	// per-row x loads, which is also the 905-token decode A/B.
+	g_gemv_pipe = os.get_env("ODINFER_CUDA_GEMV_PIPE", context.temp_allocator) == "1"
 	// A 24-token prefill on the 128-wide tile was 1661/824 ms against 896/452
 	// for mmqk. T below this stays on mmqk. 0 forces wgemm at every T>1.
 	g_wgemm_min = 128
@@ -2468,6 +2521,9 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	if !bind_kernels() {
 		cuda_destroy()
 		return false
+	}
+	if os.get_env("ODINFER_CUDA_DELTA_SM", context.temp_allocator) == "0" {
+		g_delta_sm = false
 	}
 	if !scan_model(t) {
 		cuda_destroy()
@@ -2771,6 +2827,9 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 		fmt.eprintln("cuda: gemv fuse on for every tall Q4 gate+up (ODINFER_CUDA_GEMV_FUSE=1). Unset keeps K>=5120")
 	} else if g_gemv_fuse {
 		fmt.eprintln("cuda: gemv fuse on for Q4 gate+up with K>=5120 (27B). 9B stays two launches. ODINFER_CUDA_GEMV_FUSE=1 forces the pair, =0 is two launches")
+	}
+	if g_gemv_pipe {
+		fmt.eprintln("cuda: gemv pipe on (next super-block issued before the dot). ODINFER_CUDA_GEMV_PIPE=0 keeps one block in flight")
 	}
 	if g_use_graph {
 		fmt.eprintln("cuda: graph on for dense T=1. Split attention recaptures when the KV part count changes (every 32 tokens, every 128 past 2048). MoE stays eager")

@@ -76,7 +76,9 @@ you isolate per-stage GPU time. Never enable in production.
 | `ODINFER_CUDA_GRAPH` | off | `=1` captures dense `T==1` decode as one CUDA graph and recaptures when the split-attention part count changes. MoE and prefill stay eager. Off while `ODINFER_CUDA_PROFILE=1`. |
 | `ODINFER_CUDA_PROFILE` | off | `=1` prints per-kernel GPU time for each forward (disables the graph). The 8192-event ring is aggregated by kernel name as it fills, so a long prefill is complete. |
 | `ODINFER_CUDA_PHASE` | off | `=1` prints one `cuda: phase` line per forward (linear, attn, kv, norm, delta, other, nongemv, gap), a `cuda: phase kernels` line of the eight largest kernel totals, and one `cuda: phase prefill` total across the prefill chunks. `nongemv` excludes linear. `gap` is wall minus the events. Same events as `PROFILE`. Not a production tok/s. |
-| `ODINFER_CUDA_WGEMM_X` | on | Pack each wgemm activation to fp16 once. `=0` loads fp32 inside the tile. |
+| `ODINFER_CUDA_WGEMM_X` | on | Pack each wgemm activation to fp16 once. `=0` loads fp32 inside the tile. Q5_K prefill uses the same tile. |
+| `ODINFER_CUDA_GEMV_PIPE` | off | `=1` prefetches the next Q4/Q6 super-block. Unset is one block in flight and a per-row x load. |
+| `ODINFER_CUDA_DELTA_SM` | on | `=0` keeps the decode delta state in global memory. |
 | `ODINFER_PHASE` | off | `=1` prints CPU time for the grammar mask and the tool-call grammar mask on each sample. |
 | `ODINFER_CUDA_LAUNCHES` | off | `=1` prints the kernel launch count of each CUDA forward on stderr. A graph replay prints the captured count. |
 | `ODINFER_CUDA_PEAK_GBS` | `1134` | HBM peak for `cuda_kernel_test --bench-gemv` (percent of peak). |

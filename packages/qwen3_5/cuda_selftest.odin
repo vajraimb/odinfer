@@ -853,6 +853,8 @@ run_wgemm :: proc(kind: ggml.GGML_Type, rows, cols, T: int, atol, rtol: f32) -> 
 	name := "wgemm_q4_k"
 	if kind == .Q6_K {
 		name = "wgemm_q6_k"
+	} else if kind == .Q5_K {
+		name = "wgemm_q5_k"
 	}
 	fn := s_fn(name)
 	if fn == nil {
@@ -909,6 +911,8 @@ run_wgemm :: proc(kind: ggml.GGML_Type, rows, cols, T: int, atol, rtol: f32) -> 
 	xname := "wgemm_q4_x16"
 	if kind == .Q6_K {
 		xname = "wgemm_q6_x16"
+	} else if kind == .Q5_K {
+		xname = "wgemm_q5_x16"
 	}
 	xfn := s_fn(xname)
 	pfn := s_fn("pack_f16")
@@ -2756,6 +2760,9 @@ cuda_selftest :: proc() -> bool {
 			ok = false
 		}
 		if !run_wgemm(.Q6_K, shape[0], shape[1], shape[2], 5e-2, 5e-2) {
+			ok = false
+		}
+		if !run_wgemm(.Q5_K, shape[0], shape[1], shape[2], 5e-2, 5e-2) {
 			ok = false
 		}
 	}
