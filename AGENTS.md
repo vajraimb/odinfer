@@ -163,7 +163,7 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
   64-token N tile dequants every weight twice per 128-token chunk. It is not
   launched. `wgemm` (128×128, stride-80 fp16 tile, 4×2 fragments per warp,
   fp16 activations, double-buffered) is the unmeasured default.
-  `ODINFER_CUDA_PREFILL_LINEAR=mmqk` keeps `mmqk` (q8 + dp4a). `T<128` stays on `mmqk` (`ODINFER_CUDA_WGEMM_MIN`): a 24-token prefill was 1661/824 ms against 896/452. A partial tile skips MMA fragments past `T`. A 256-token double buffer does not fit in 96 KB. 27B wo/w2 GEMV is 2-way split-K, not 4-way (`ODINFER_CUDA_GEMV_SPLITS=4` restores it). The mmqk global-X tile was faster
+  `ODINFER_CUDA_PREFILL_LINEAR=mmqk` keeps `mmqk` (q8 + dp4a). `T<128` stays on `mmqk` (`ODINFER_CUDA_WGEMM_MIN`): a 24-token prefill was 1661/824 ms against 896/452. A partial tile skips MMA fragments past `T`. A 256-token double buffer does not fit in 96 KB. 27B w2 decode is staged Q6 plus 2-way split-K (bench `q6s2`); 9B w2 is direct 2-way (bench `s2`). `r4` is the unstaged gy=1 line, not that launch. Tall Q4 gate+up is one K sweep (`ODINFER_CUDA_GEMV_FUSE=0` is two launches). `ODINFER_CUDA_GRAPH=1` recaptures when the attention part count changes. The prefill delta scalar passes hoist the per-column scale. The mmqk global-X tile was faster
   on that V100 (9B 16000 tokens 246 vs 213 tok/s, 27B 8000 tokens 93 vs 80).
   The 32-row tile was faster (9B 16000 tokens 290 vs 246 tok/s, 27B 8000
   tokens 113 vs 93). A later 64-row Q4 tile was slower (9B at 8000 tokens
