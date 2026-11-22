@@ -184,7 +184,11 @@ g_pos_host: i32 // stable source for the async decode-pos copy
 @(private)
 g_tc2: bool // Q4_K / Q6_K prefill uses the block-dequant WMMA kernel
 @(private)
-g_prefill_gemm: bool // Q4_K / Q6_K T>1 uses mmqk dp4a; ODINFER_CUDA_PREFILL_GEMM=0 keeps tc/tc2
+g_prefill_gemm: bool // Q4_K / Q6_K T>1 may use a prefill GEMM; ODINFER_CUDA_PREFILL_GEMM=0 keeps tc/tc2
+@(private)
+g_prefill_wgemm: bool // default Q4_K / Q6_K path is wgemm; ODINFER_CUDA_PREFILL_LINEAR=mmqk keeps mmqk
+@(private)
+g_wgemm_smem: bool // wgemm raised its dynamic smem to 81920
 @(private)
 g_prefill_fuse: bool // gate+up and K+V share one q8 stage; ODINFER_CUDA_PREFILL_FUSE=1 opts in
 @(private)
@@ -270,7 +274,7 @@ k_conv, k_l2, k_delta, k_delta_chunk, k_delta_sm, k_delta_wmma, k_rmsgate, k_rms
 @(private)
 k_tc2_q4, k_tc2_q6, k_tc2s_q4, k_tc2s_q6, k_tc2m_q4, k_tc2m_q6, k_tc2r_q4, k_tc2r_q6: cu.Function
 @(private)
-k_pgemm_q4, k_pgemm_q6: cu.Function
+k_pgemm_q4, k_pgemm_q6, k_wgemm_q4, k_wgemm_q6: cu.Function
 @(private)
 k_quant_batch, k_mmqk_q4, k_mmqk_q4_r4, k_mmqk_q6, k_mmqk_q4_pair, k_mmqk_q6_pair: cu.Function
 
@@ -809,12 +813,44 @@ launch_tc :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d, tcount: in
 	return klaunch(fn, gx, gy, 1, 512, 1, 1, args[:], "tc")
 }
 
-// Q4_K / Q6_K prefill. Activations are quantized to q8 once, then dp4a
-// against the stored nibbles. pgemm (fp16 dequant + WMMA) stays in the
-// module for the kernel test and is not launched: on the V100 it was slower
-// than the scalar tile (9B prefill 905/16000 tokens 174/154 vs 222/183 tok/s;
-// a T=128 chunk's linear time 584 vs 450 ms).
+// Q4_K / Q6_K prefill. The default is wgemm: dequant the weight tile to fp16
+// once, narrow activations to fp16, WMMA a 128x128 tile. It has not been
+// timed. ODINFER_CUDA_PREFILL_LINEAR=mmqk keeps the q8 + dp4a tile. pgemm
+// stays in the module for the kernel test and is not launched.
 // ODINFER_CUDA_PREFILL_GEMM=0 keeps tc2 (T<=64) and the scalar tile.
+
+WG_SMEM :: u32(81920)
+
+@(private)
+wgemm_applies :: proc(kind: ggml.GGML_Type, n, tcount: int) -> bool {
+	if !g_prefill_wgemm || !g_wgemm_smem || k_wgemm_q4 == nil || k_wgemm_q6 == nil {
+		return false
+	}
+	if n <= 0 || n % 256 != 0 || tcount <= 1 || tcount > g_max_t {
+		return false
+	}
+	return kind == .Q4_K || kind == .Q6_K
+}
+
+@(private)
+launch_wgemm :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d, tcount: int) -> bool {
+	fn := k_wgemm_q4
+	if kind == .Q6_K {
+		fn = k_wgemm_q6
+	}
+	wb, xx, yy := w, x, y
+	nn, dd, tt := i32(n), i32(d), i32(tcount)
+	args := [?]rawptr{&wb, &xx, &yy, &nn, &dd, &tt}
+	gx := u32((d + 127) / 128)
+	gy := u32((tcount + 127) / 128)
+	if gx < 1 {
+		gx = 1
+	}
+	if gy < 1 {
+		gy = 1
+	}
+	return klaunch(fn, gx, gy, 1, 256, 1, 1, args[:], "wgemm", WG_SMEM)
+}
 @(private)
 mmqk_applies :: proc(kind: ggml.GGML_Type, n, tcount: int) -> bool {
 	if !g_prefill_gemm || d_mmq_q == 0 || k_quant_batch == nil || k_mmqk_q4 == nil {
@@ -932,6 +968,9 @@ launch_mm :: proc(t: Tensor, x, y: cu.Device_Ptr, n, d, tcount: int) -> bool {
 	w := wptr(raw_data(t.data))
 	if tcount <= 1 {
 		return launch_gemv(t.kind, w, x, y, n, d)
+	}
+	if wgemm_applies(t.kind, n, tcount) {
+		return launch_wgemm(t.kind, w, x, y, n, d, tcount)
 	}
 	if mmqk_applies(t.kind, n, tcount) {
 		return launch_mmqk(t.kind, w, x, y, n, d, tcount)
@@ -1587,6 +1626,8 @@ bind_kernels :: proc() -> bool {
 	k_delta_wmma = get_fn("delta_chunk_wmma")
 	k_pgemm_q4 = get_fn("pgemm_q4_k")
 	k_pgemm_q6 = get_fn("pgemm_q6_k")
+	k_wgemm_q4 = get_fn("wgemm_q4_k")
+	k_wgemm_q6 = get_fn("wgemm_q6_k")
 	k_quant_batch = get_fn("quant_q8_batch")
 	k_mmqk_q4 = get_fn("mmqk_q4_k")
 	k_mmqk_q4_r4 = get_fn("mmqk_q4_r4")
@@ -1625,7 +1666,7 @@ bind_kernels :: proc() -> bool {
 		k_tc2_q4, k_tc2_q6, k_tc2s_q4, k_tc2s_q6, k_tc2m_q4, k_tc2m_q6, k_tc2r_q4, k_tc2r_q6,
 		k_quant, k_rmsnorm_q8, k_res_norm, k_gemv2_q4, k_gemv2_q4nc, k_gemv2_q4x, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50,
 		k_gemv2r1_q4, k_gemv2r1_q6,
-		k_pgemm_q4, k_pgemm_q6, k_quant_batch, k_mmqk_q4, k_mmqk_q4_r4, k_mmqk_q6, k_mmqk_q4_pair, k_mmqk_q6_pair,
+		k_pgemm_q4, k_pgemm_q6, k_wgemm_q4, k_wgemm_q6, k_quant_batch, k_mmqk_q4, k_mmqk_q4_r4, k_mmqk_q6, k_mmqk_q4_pair, k_mmqk_q6_pair,
 	}
 	for h in handles {
 		if h == nil {
@@ -1638,6 +1679,10 @@ bind_kernels :: proc() -> bool {
 		fmt.eprintln("cuda: delta state stays in global memory (cuFuncSetAttribute failed)")
 	}
 	g_wmma_smem = cu.func_set_max_dynamic_shared(k_attn_wmma, ATTN_WMMA_SMEM) == cu.OK
+	g_wgemm_smem = cu.func_set_max_dynamic_shared(k_wgemm_q4, int(WG_SMEM)) == cu.OK && cu.func_set_max_dynamic_shared(k_wgemm_q6, int(WG_SMEM)) == cu.OK
+	if !g_wgemm_smem {
+		fmt.eprintln("cuda: wgemm stays off (cuFuncSetAttribute failed); Q4_K/Q6_K prefill uses mmqk")
+	}
 	if !g_wmma_smem {
 		fmt.eprintln("cuda: prefill wmma stays on attention_q8v (cuFuncSetAttribute failed)")
 	}
@@ -2000,6 +2045,8 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	g_tc2 = os.get_env("ODINFER_CUDA_TC2", context.temp_allocator) != "0"
 	// Default on. =0 keeps tc2 for T<=64 and the scalar tile for T>64.
 	g_prefill_gemm = os.get_env("ODINFER_CUDA_PREFILL_GEMM", context.temp_allocator) != "0"
+	// Default is the fp16 128x128 tile. =mmqk keeps the q8 dp4a tile.
+	g_prefill_wgemm = g_prefill_gemm && os.get_env("ODINFER_CUDA_PREFILL_LINEAR", context.temp_allocator) != "mmqk"
 	// Fusion was neutral on the V100 and the linear bucket got slower, so it
 	// stays available and off. The 64-row Q4 tile was slower than 32.
 	g_prefill_fuse = os.get_env("ODINFER_CUDA_PREFILL_FUSE", context.temp_allocator) == "1"
@@ -2299,7 +2346,9 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 		tc_note = "on for T>1 (ODINFER_CUDA_TC=1)"
 	}
 	fmt.eprintfln("cuda: tensor cores %s  WMMA 16x16x16 fp16, fp32 acc", tc_note)
-	if g_prefill_gemm {
+	if g_prefill_wgemm && g_wgemm_smem {
+		fmt.eprintln("cuda: prefill linear is wgemm for Q4_K/Q6_K T>1 (fp16, 128x128, BK=64, stride 80). Not timed. ODINFER_CUDA_PREFILL_LINEAR=mmqk keeps mmqk. ODINFER_CUDA_PREFILL_GEMM=0 keeps tc2/tc")
+	} else if g_prefill_gemm {
 		fmt.eprintln("cuda: prefill gemm on for Q4_K/Q6_K T>1 (mmqk, q8 in smem, dp4a, 32 rows x 64 tokens). ODINFER_CUDA_PREFILL_GEMM=0 keeps tc2/tc")
 		if g_prefill_fuse {
 			fmt.eprintln("cuda: prefill fuse on (gate+up and K+V share one q8 stage). It was neutral on a V100")
@@ -2483,7 +2532,7 @@ cuda_full :: proc(tr: ^Transformer, l, pos0, T: int) {
 	attdim := p.n_heads * p.head_dim
 	eps := p.rms_eps
 	must(launch_mm(fa.wq, d_xb, d_qproj, dim, qdim, T))
-	if g_prefill_fuse && fa.wk.kind == fa.wv.kind && mmqk_applies(fa.wk.kind, dim, T) {
+	if g_prefill_fuse && !g_prefill_wgemm && fa.wk.kind == fa.wv.kind && mmqk_applies(fa.wk.kind, dim, T) {
 		must(launch_mmqk_pair(fa.wk.kind, wptr(raw_data(fa.wk.data)), wptr(raw_data(fa.wv.data)), d_xb, d_k, d_v, dim, kvdim, T))
 	} else {
 		must(launch_mm(fa.wk, d_xb, d_k, dim, kvdim, T))
@@ -2619,7 +2668,7 @@ cuda_mlp :: proc(tr: ^Transformer, l, T: int, next_norm: cu.Device_Ptr) {
 	} else {
 		must(launch_rmsnorm(d_x, d_xb, dev_f32(lw.ffn_norm), T, dim, p.rms_eps))
 	}
-	if g_prefill_fuse && lw.w1.kind == lw.w3.kind && mmqk_applies(lw.w1.kind, dim, T) {
+	if g_prefill_fuse && !g_prefill_wgemm && lw.w1.kind == lw.w3.kind && mmqk_applies(lw.w1.kind, dim, T) {
 		must(launch_mmqk_pair(lw.w1.kind, wptr(raw_data(lw.w1.data)), wptr(raw_data(lw.w3.data)), d_xb, d_hb, d_hb2, dim, hid, T))
 	} else {
 		must(launch_mm(lw.w1, d_xb, d_hb, dim, hid, T))
@@ -2840,7 +2889,7 @@ phase_bucket :: proc(name: string) -> int {
 	if strings.has_prefix(name, "rmsnorm") || name == "residual_norm" || name == "qnorm" {
 		return 3
 	}
-	if strings.has_prefix(name, "gemv") || strings.has_prefix(name, "tc") || strings.has_prefix(name, "pgemm") || strings.has_prefix(name, "mmqk") || name == "mmq" {
+	if strings.has_prefix(name, "gemv") || strings.has_prefix(name, "tc") || strings.has_prefix(name, "pgemm") || strings.has_prefix(name, "wgemm") || strings.has_prefix(name, "mmqk") || name == "mmq" {
 		return 0
 	}
 	return 5
