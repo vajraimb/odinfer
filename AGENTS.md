@@ -168,7 +168,9 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
   333 vs 337) and is `ODINFER_CUDA_MMQK_ROWS=8` only. Q6 stays at 4 rows per
   warp because 8 rows spilled. Gate+up and K+V fusion was neutral and is
   `ODINFER_CUDA_PREFILL_FUSE=1` only. The vectorized KV dequant in prefill
-  attention stayed (9B at 8000, attn 3872 vs 4161 ms).
+  attention stayed (9B at 8000, attn 3872 vs 4161 ms). The 4-row `mmqk` kernels
+  picked up `launch_bounds(256, 2)` with the pair template; that cap is off
+  them again. The 27B 905 prefill on e452657 was 121.86 tok/s against 124.00.
 - GEMV kernel shape: on this M3 the optimum is 256 threads / 32 rows / 8 lanes;
   every multi-row/multi-thread/fusion variant measured as a regression (data in
   packages/qwen3_5/README.md and gemm_harness).

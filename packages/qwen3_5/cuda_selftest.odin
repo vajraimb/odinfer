@@ -1939,6 +1939,10 @@ run_attn_wmma_shape :: proc(kv_mul: int, cases: [][2]int) -> bool {
 		fmt.eprintln("cuda_selftest: attn wmma kernels missing")
 		return false
 	}
+	if cu.func_set_max_dynamic_shared(wmma_fn, ATTN_WMMA_SMEM) != cu.OK {
+		fmt.eprintln("cuda_selftest: attn wmma could not raise dynamic smem")
+		return false
+	}
 	got_old := make([]f32, t_max * n_heads * hd)
 	got_new := make([]f32, t_max * n_heads * hd)
 	one := make([]f32, n_heads * hd)
@@ -2178,6 +2182,32 @@ run_delta_case :: proc(hkd, hvd, nkh, nvh, T, which: int) -> bool {
 	for h in 0 ..< nvh {
 		dec[h] = -0.4 - 0.1 * f32(h)
 		dt[h] = 0.05 * f32(h + 1)
+	}
+	if which == 2 {
+		// Production l2-normalizes k and scales q by 1/sqrt(head_k). The raw
+		// pattern has ||k|| around 40, and the fp32 WY substitution overflows.
+		inv_sqrt := 1 / math.sqrt(f32(hkd))
+		for t in 0 ..< T {
+			for h in 0 ..< nkh {
+				base := t * nkh * hkd + h * hkd
+				ss: f32
+				for i in 0 ..< hkd {
+					ss += k[base + i] * k[base + i]
+				}
+				inv := 1 / math.sqrt(ss)
+				for i in 0 ..< hkd {
+					k[base + i] *= inv
+				}
+				ss = 0
+				for i in 0 ..< hkd {
+					ss += q[base + i] * q[base + i]
+				}
+				inv = inv_sqrt / math.sqrt(ss)
+				for i in 0 ..< hkd {
+					q[base + i] *= inv
+				}
+			}
+		}
 	}
 	cpu_state := make([]f32, len(state))
 	copy(cpu_state, state)
