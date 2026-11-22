@@ -185,7 +185,7 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
 
 ## 已验证的坑（不要再踩）
 
-- CUDA 预填充的 `pgemm`（fp16 反量化进共享内存再 WMMA）在 V100 上结果正确但比标量块慢（9B 16000 token 154 对 183 tok/s）。同一个 K 上写 32 行 fp16 是 32 路 bank 冲突，64 token 的 N 块在 128 token 的 chunk 里把每个权重反量化两遍。不再启动。`mmqk`（q8 + dp4a）是默认，在那台 V100 上更快（9B 16000 token 246 对 213 tok/s，27B 8000 token 93 对 80）。
+- CUDA 预填充的 `pgemm`（fp16 反量化进共享内存再 WMMA）在 V100 上结果正确但比标量块慢（9B 16000 token 154 对 183 tok/s）。同一个 K 上写 32 行 fp16 是 32 路 bank 冲突，64 token 的 N 块在 128 token 的 chunk 里把每个权重反量化两遍。不再启动。`mmqk`（q8 + dp4a）是默认。全局 X 的块在那台 V100 上更快（9B 16000 token 246 对 213 tok/s，27B 8000 token 93 对 80）。现在发出去的块把一个 q8 superblock 放进 22528 字节共享内存（32 行 × 64 token）。sm_70 ptxas：128 个寄存器，没有 spill。这个块还没有计时。
 - GEMV 内核形状：本机（M3）最优 = 256 线程/32 行/8 lanes；其余多行/多线程/
   融合变体实测回归（数据在 packages/qwen3_5/README.md 与 gemm_harness）。
 - **内核 A/B 必须同窗交错计时（2026-11-17 实证）**：M3 Air 被动散热，GPU 时钟

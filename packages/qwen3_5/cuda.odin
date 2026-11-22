@@ -824,6 +824,7 @@ launch_mmqk :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d, tcount: 
 	wb, yy := w, y
 	dd := i32(d)
 	args := [?]rawptr{&wb, &qp, &sc, &sm, &yy, &nn, &dd, &tt}
+	// 8 warps * 4 rows, 64 tokens. Smem is one q8 superblock (22528 bytes).
 	gx := u32((d + 31) / 32)
 	gy := u32((tcount + 63) / 64)
 	if gx < 1 {
@@ -832,7 +833,7 @@ launch_mmqk :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d, tcount: 
 	if gy < 1 {
 		gy = 1
 	}
-	return klaunch(fn, gx, gy, 1, 256, 1, 1, args[:], "mmqk")
+	return klaunch(fn, gx, gy, 1, 256, 1, 1, args[:], "mmqk", 22528)
 }
 
 @(private)
@@ -2148,7 +2149,7 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	}
 	fmt.eprintfln("cuda: tensor cores %s  WMMA 16x16x16 fp16, fp32 acc", tc_note)
 	if g_prefill_gemm {
-		fmt.eprintln("cuda: prefill gemm on for Q4_K/Q6_K T>1 (mmqk, q8 activations, dp4a, 4 rows x 64 tokens). ODINFER_CUDA_PREFILL_GEMM=0 keeps tc2/tc")
+		fmt.eprintln("cuda: prefill gemm on for Q4_K/Q6_K T>1 (mmqk, q8 in smem, dp4a, 32 rows x 64 tokens). ODINFER_CUDA_PREFILL_GEMM=0 keeps tc2/tc. Not timed on a V100")
 	} else {
 		fmt.eprintln("cuda: prefill gemm off (ODINFER_CUDA_PREFILL_GEMM=0)")
 	}
