@@ -560,6 +560,63 @@ extern "C" __global__ void qnorm_extract(const float* qproj, float* q, const flo
     for (int j = tid; j < n; j += 128) dst[j] = qn[j] * (inv * src[j]);
 }
 
+/* qnorm_extract, then the partial RoPE that rope_partial applies. One block
+   is one head of one token (block = token * n_heads + head). rotary_dim < 2
+   leaves the vector unrotated. Pairs do not overlap, so the only extra
+   barrier is the one before the rotate reads another thread's store. */
+extern "C" __global__ void qnorm_rope(const float* qproj, float* q, const float* qn, int n, float eps,
+                                      int pos, float rope_freq, int rotary_dim, int n_heads, const int* pos_slot) {
+    int h = (int)blockIdx.x;
+    int tid = (int)threadIdx.x;
+    const float* src = qproj + (size_t)h * (size_t)(2 * n);
+    float* dst = q + (size_t)h * (size_t)n;
+    float ss = 0.f;
+    for (int j = tid; j < n; j += 128) ss += src[j] * src[j];
+    ss = block_sum_128(ss);
+    float inv = rsqrtf(ss / (float)n + eps);
+    for (int j = tid; j < n; j += 128) dst[j] = qn[j] * (inv * src[j]);
+    __syncthreads();
+    if (rotary_dim < 2 || n_heads < 1) return;
+    int half = rotary_dim >> 1;
+    int token = h / n_heads;
+    int p = live_pos(pos, pos_slot) + token;
+    for (int i = tid; i < half; i += 128) {
+        float freq = 1.f / powf(rope_freq, (float)i / (float)half);
+        float ang = (float)p * freq;
+        float c = cosf(ang), s = sinf(ang);
+        float x0 = dst[i], y0 = dst[i + half];
+        dst[i] = x0 * c - y0 * s;
+        dst[i + half] = x0 * s + y0 * c;
+    }
+}
+
+/* In-place RMSNorm plus the same RoPE. Block = token * n_heads + head.
+   The weight vector is one head, shared by every block. */
+extern "C" __global__ void rmsnorm_rope(float* inout, const float* w, int size, float eps,
+                                        int pos, float rope_freq, int rotary_dim, int n_heads, const int* pos_slot) {
+    int h = (int)blockIdx.x;
+    int tid = (int)threadIdx.x;
+    float* oi = inout + (size_t)h * (size_t)size;
+    float ss = 0.f;
+    for (int j = tid; j < size; j += 128) ss += oi[j] * oi[j];
+    ss = block_sum_128(ss);
+    float inv = rsqrtf(ss / (float)size + eps);
+    for (int j = tid; j < size; j += 128) oi[j] = w[j] * (inv * oi[j]);
+    __syncthreads();
+    if (rotary_dim < 2 || n_heads < 1) return;
+    int half = rotary_dim >> 1;
+    int token = h / n_heads;
+    int p = live_pos(pos, pos_slot) + token;
+    for (int i = tid; i < half; i += 128) {
+        float freq = 1.f / powf(rope_freq, (float)i / (float)half);
+        float ang = (float)p * freq;
+        float c = cosf(ang), s = sinf(ang);
+        float x0 = oi[i], y0 = oi[i + half];
+        oi[i] = x0 * c - y0 * s;
+        oi[i + half] = x0 * s + y0 * c;
+    }
+}
+
 extern "C" __global__ void rope_partial(float* vec, int head_dim, int pos, float rope_freq, int rotary_dim, int n_heads, const int* pos_slot) {
     int half = rotary_dim >> 1;
     int total = n_heads * half;
@@ -664,9 +721,12 @@ extern "C" __global__ void store_kv_f16(const float* k, const float* v, unsigned
     int gid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     int n = n_kv * head_dim;
     if (gid >= n) return;
+    int ti = (int)blockIdx.y;
+    k += (size_t)ti * (size_t)n;
+    v += (size_t)ti * (size_t)n;
     int kvh = gid / head_dim;
     int i = gid - kvh * head_dim;
-    size_t dst = (((size_t)kvh * (size_t)seq_len + (size_t)live_pos(pos, pos_slot)) * (size_t)head_dim + (size_t)i) * 2;
+    size_t dst = (((size_t)kvh * (size_t)seq_len + (size_t)(live_pos(pos, pos_slot) + ti)) * (size_t)head_dim + (size_t)i) * 2;
     st_f16(kc + dst, k[gid]);
     st_f16(vc + dst, v[gid]);
 }
@@ -725,6 +785,9 @@ extern "C" __global__ void store_kv_q8(const float* k, const float* v, unsigned 
                                        int nblocks, int pos_bytes, int pos, const int* pos_slot) {
     int gid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (gid >= nblocks) return;
+    int ti = (int)blockIdx.y;
+    k += (size_t)ti * (size_t)nblocks * 32;
+    v += (size_t)ti * (size_t)nblocks * 32;
     const float* k32 = k + (size_t)gid * 32;
     const float* v32 = v + (size_t)gid * 32;
     float kamax = 0.f, vamax = 0.f;
@@ -735,7 +798,7 @@ extern "C" __global__ void store_kv_q8(const float* k, const float* v, unsigned 
     float kd = kamax / 127.f, vd = vamax / 127.f;
     float kid = kd != 0.f ? 1.f / kd : 0.f;
     float vid = vd != 0.f ? 1.f / vd : 0.f;
-    int pslot = live_pos(pos, pos_slot);
+    int pslot = live_pos(pos, pos_slot) + (int)blockIdx.y;
     unsigned char* kb = kc + (size_t)pslot * (size_t)pos_bytes + (size_t)gid * 34;
     unsigned char* vb = vc + (size_t)pslot * (size_t)pos_bytes + (size_t)gid * 34;
     st_f16(kb, kd);
@@ -802,13 +865,16 @@ extern "C" __global__ void store_kv_q8v(const float* k, const float* v, unsigned
                                         int nblocks, int k_pos_bytes, int v_pos_bytes, int pos, const int* pos_slot) {
     int gid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (gid >= nblocks) return;
+    int ti = (int)blockIdx.y;
+    k += (size_t)ti * (size_t)nblocks * 32;
+    v += (size_t)ti * (size_t)nblocks * 32;
     const float* k32 = k + (size_t)gid * 32;
     const float* v32 = v + (size_t)gid * 32;
     float kamax = 0.f;
     for (int j = 0; j < 32; ++j) kamax = fmaxf(kamax, fabsf(k32[j]));
     float kd = kamax / 127.f;
     float kid = kd != 0.f ? 1.f / kd : 0.f;
-    int pslot = live_pos(pos, pos_slot);
+    int pslot = live_pos(pos, pos_slot) + (int)blockIdx.y;
     unsigned char* kb = kc + (size_t)pslot * (size_t)k_pos_bytes + (size_t)gid * 34;
     st_f16(kb, kd);
     for (int j = 0; j < 32; ++j) kb[2 + j] = (unsigned char)(signed char)(int)roundf(k32[j] * kid);
@@ -1615,6 +1681,52 @@ extern "C" __global__ void conv1d_step(float* qkv_out, const float* qkv_in, floa
     if (km1 > 0) conv_state[c * km1 + km1 - 1] = qkv_in[c];
 }
 
+/* T steps of conv1d_step on one channel. Token t+1 reads the state token t
+   just wrote, so the T loop stays on the thread. One launch per layer. */
+extern "C" __global__ void conv1d_chunk(float* qkv_out, const float* qkv_in, float* conv_state, const float* weight,
+                                        int conv_dim, int kernel, int T) {
+    int c = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (c >= conv_dim || T <= 0) return;
+    int km1 = kernel - 1;
+    for (int t = 0; t < T; ++t) {
+        const float* in = qkv_in + (size_t)t * (size_t)conv_dim;
+        float* out = qkv_out + (size_t)t * (size_t)conv_dim;
+        float acc = weight[c * kernel + km1] * in[c];
+        for (int i = 0; i < km1; ++i) acc += weight[c * kernel + i] * conv_state[c * km1 + i];
+        out[c] = acc * sigmoid_stable(acc);
+        for (int i = 0; i + 1 < km1; ++i) conv_state[c * km1 + i] = conv_state[c * km1 + i + 1];
+        if (km1 > 0) conv_state[c * km1 + km1 - 1] = in[c];
+    }
+}
+
+/* blockIdx.y is the token. q_in and k_in advance by q_stride (the conv
+   width). q_out and k_out advance by head_k * n_heads, which the host
+   passes as out_stride. gridDim.y == 1 is one token. */
+extern "C" __global__ void l2norm_chunk(float* q_out, float* k_out, const float* q_in, const float* k_in,
+                                        int head_k_dim, float eps, float scale, int q_stride, int out_stride) {
+    int kh = (int)blockIdx.x;
+    int tid = (int)threadIdx.x;
+    int t = (int)blockIdx.y;
+    int n = head_k_dim;
+    const float* qi = q_in + (size_t)t * (size_t)q_stride + (size_t)kh * (size_t)n;
+    const float* ki = k_in + (size_t)t * (size_t)q_stride + (size_t)kh * (size_t)n;
+    float* qo = q_out + (size_t)t * (size_t)out_stride + (size_t)kh * (size_t)n;
+    float* ko = k_out + (size_t)t * (size_t)out_stride + (size_t)kh * (size_t)n;
+    float sq = 0.f, sk = 0.f;
+    for (int j = tid; j < n; j += 128) {
+        sq += qi[j] * qi[j];
+        sk += ki[j] * ki[j];
+    }
+    sq = block_sum_128(sq);
+    sk = block_sum_128(sk);
+    float iq = 1.f / fmaxf(sqrtf(sq), eps);
+    float ik = 1.f / fmaxf(sqrtf(sk), eps);
+    for (int j = tid; j < n; j += 128) {
+        qo[j] = qi[j] * iq * scale;
+        ko[j] = ki[j] * ik;
+    }
+}
+
 extern "C" __global__ void l2norm_scale(float* q_out, float* k_out, const float* q_in, const float* k_in,
                                         int head_k_dim, float eps, float scale) {
     int kh = (int)blockIdx.x;
@@ -1744,9 +1856,11 @@ extern "C" __global__ void delta_recurrent_chunk_sm(float* out, float* state_all
 extern "C" __global__ void rmsnorm_gated(float* out, const float* inp, const float* weight, const float* gate, int size, float eps) {
     int vh = (int)blockIdx.x;
     int tid = (int)threadIdx.x;
-    const float* xi = inp + (size_t)vh * (size_t)size;
-    float* oi = out + (size_t)vh * (size_t)size;
-    const float* zi = gate + (size_t)vh * (size_t)size;
+    int t = (int)blockIdx.y;
+    int stride = (int)gridDim.x * size;
+    const float* xi = inp + (size_t)t * (size_t)stride + (size_t)vh * (size_t)size;
+    float* oi = out + (size_t)t * (size_t)stride + (size_t)vh * (size_t)size;
+    const float* zi = gate + (size_t)t * (size_t)stride + (size_t)vh * (size_t)size;
     float ss = 0.f;
     for (int j = tid; j < size; j += 128) ss += xi[j] * xi[j];
     ss = block_sum_128(ss);
@@ -4028,6 +4142,18 @@ __device__ __forceinline__ void wg_commit(int n, int T, int n0, int t0, int k0, 
     }
 }
 
+/* Tile stays 128x128, BK=64, 256 threads, one block per SM. The double
+   buffer is 81920 bytes, so a second resident block does not fit in 96 KB.
+   A 27B MLP prefill is latency bound, not bandwidth bound: 16000 tokens
+   read about 1.5 TB of weights in 85 s, ~18 GB/s on a 1134 GB/s V100, and
+   about 10x off the tensor-core roof. X is fp32 and every row-tile reloads
+   it (17408/128 tiles; one 128x5120 tile is 2.6 MB, ~7x the Q4 weights of
+   that tile). Caching a Q4 panel as fp16 for the four token-tiles of a
+   512 chunk increases traffic: 368 KB of Q4 versus 1.31 MB of fp16, and
+   the first tile also writes the cache. A BK=32 panel plus this double
+   buffer, or a 256-row tile, does not fit in 96 KB either (two weight
+   panels + the current double buffer is 122880). A second accumulator
+   set spills. The launched kernel is unchanged. */
 template<int Q6>
 __device__ void wgemm_run(const unsigned char* wb, const float* x, float* out, int n, int d, int T) {
     const int tid = (int)threadIdx.x;
