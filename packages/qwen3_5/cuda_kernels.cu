@@ -1870,13 +1870,47 @@ extern "C" __global__ void delta_recurrent_chunk_sm(float* out, float* state_all
         float g_decay = expf(a_decay[vh] * softplus_stable(a_vec[(size_t)t * (size_t)n_v_heads + vh] + dt_bias[vh]));
         float* oout = out + ((size_t)t * (size_t)n_v_heads + (size_t)vh) * (size_t)hvd;
         for (int j = tid; j < hvd; j += (int)blockDim.x) {
-            for (int i = 0; i < hkd; ++i) sst[(size_t)i * (size_t)hvd + j] *= g_decay;
+            /* Four independent columns of i, added in the same order as the
+               scalar loop. hkd is 128 on the decode path and 16 in the test. */
+            int i = 0;
+            for (; i + 3 < hkd; i += 4) {
+                float* p = sst + (size_t)i * (size_t)hvd + j;
+                p[0] *= g_decay;
+                p[hvd] *= g_decay;
+                p[2 * hvd] *= g_decay;
+                p[3 * hvd] *= g_decay;
+            }
+            for (; i < hkd; ++i) sst[(size_t)i * (size_t)hvd + j] *= g_decay;
             float kv_mem = 0.f;
-            for (int i = 0; i < hkd; ++i) kv_mem += sst[(size_t)i * (size_t)hvd + j] * kt[i];
+            i = 0;
+            for (; i + 3 < hkd; i += 4) {
+                float* p = sst + (size_t)i * (size_t)hvd + j;
+                kv_mem += p[0] * kt[i];
+                kv_mem += p[hvd] * kt[i + 1];
+                kv_mem += p[2 * hvd] * kt[i + 2];
+                kv_mem += p[3 * hvd] * kt[i + 3];
+            }
+            for (; i < hkd; ++i) kv_mem += sst[(size_t)i * (size_t)hvd + j] * kt[i];
             float delta = (vt[j] - kv_mem) * beta;
-            for (int i = 0; i < hkd; ++i) sst[(size_t)i * (size_t)hvd + j] += kt[i] * delta;
+            i = 0;
+            for (; i + 3 < hkd; i += 4) {
+                float* p = sst + (size_t)i * (size_t)hvd + j;
+                p[0] += kt[i] * delta;
+                p[hvd] += kt[i + 1] * delta;
+                p[2 * hvd] += kt[i + 2] * delta;
+                p[3 * hvd] += kt[i + 3] * delta;
+            }
+            for (; i < hkd; ++i) sst[(size_t)i * (size_t)hvd + j] += kt[i] * delta;
             float o = 0.f;
-            for (int i = 0; i < hkd; ++i) o += sst[(size_t)i * (size_t)hvd + j] * qt[i];
+            i = 0;
+            for (; i + 3 < hkd; i += 4) {
+                float* p = sst + (size_t)i * (size_t)hvd + j;
+                o += p[0] * qt[i];
+                o += p[hvd] * qt[i + 1];
+                o += p[2 * hvd] * qt[i + 2];
+                o += p[3 * hvd] * qt[i + 3];
+            }
+            for (; i < hkd; ++i) o += sst[(size_t)i * (size_t)hvd + j] * qt[i];
             oout[j] = o;
         }
     }
@@ -3752,8 +3786,8 @@ __device__ __forceinline__ float q5_slot(uint4 hdr, uint4 qv, uint4 hv,
     unsigned bit_hi = bit_lo << 1;
     int group = b * 8 + p * 2;
     int off = half * 16;
-    uint4 xlo = *(const uint4*)(xq + (size_t)group * 32 + off);
-    uint4 xhi = *(const uint4*)(xq + (size_t)(group + 1) * 32 + off);
+    uint4 xlo = ld_global_v4(xq + (size_t)group * 32 + off);
+    uint4 xhi = ld_global_v4(xq + (size_t)(group + 1) * 32 + off);
     unsigned qw[4] = {qv.x, qv.y, qv.z, qv.w};
     unsigned hw[4] = {hv.x, hv.y, hv.z, hv.w};
     unsigned al[4] = {xlo.x, xlo.y, xlo.z, xlo.w};
@@ -3783,7 +3817,8 @@ __device__ __forceinline__ float q5_slot(uint4 hdr, uint4 qv, uint4 hv,
     return acc;
 }
 
-/* One warp, one Q5 row. 176-byte blocks stay 16-aligned. No split-K. */
+/* One warp, one Q5 row. 176-byte blocks are 16-aligned, so the loads are
+   ld.global.v4. No split-K. ODINFER_CUDA_GEMV_Q5=k keeps gemv2_q5_k. */
 extern "C" __global__ void gemv2_q5w_k(const unsigned char* wb, const signed char* xq, const float* xd, const float2* sum16,
                                       float* out, int n, int d, int accumulate) {
     int lane = (int)threadIdx.x & 31;
@@ -3803,9 +3838,9 @@ extern "C" __global__ void gemv2_q5w_k(const unsigned char* wb, const signed cha
                 t = slot & 7;
                 int half = t & 1;
                 const unsigned char* blk = wb + ((size_t)row * (size_t)nb + (size_t)b) * 176;
-                if (t == 0) hdr = *(const uint4*)blk;
-                qv = *(const uint4*)(blk + 48 + t * 16);
-                hv = *(const uint4*)(blk + 16 + half * 16);
+                if (t == 0) hdr = ld_global_v4(blk);
+                qv = ld_global_v4(blk + 48 + t * 16);
+                hv = ld_global_v4(blk + 16 + half * 16);
             }
             hdr = shfl_u4(hdr, lane & ~7);
             if (live) acc += q5_slot(hdr, qv, hv, xq, xd, sum16, b, t);
@@ -3815,6 +3850,177 @@ extern "C" __global__ void gemv2_q5w_k(const unsigned char* wb, const signed cha
     if (lane == 0 && row < d) {
         if (accumulate) out[row] += acc;
         else out[row] = acc;
+    }
+}
+
+/* Same slot as q5_slot, x loaded once for two rows. */
+__device__ __forceinline__ void q5_share(uint4 h0, uint4 q0, uint4 v0, uint4 h1, uint4 q1, uint4 v1,
+                                        const signed char* xq, const float* xd, const float2* sum16,
+                                        int b, int t, float* a0, float* a1) {
+    int p = t >> 1;
+    int half = t & 1;
+    float dW0 = f16_bits(h0.x & 0xffff);
+    float dmin0 = f16_bits(h0.x >> 16);
+    float dW1 = f16_bits(h1.x & 0xffff);
+    float dmin1 = f16_bits(h1.x >> 16);
+    int sc0, m0, sc1, m1, tc0, n0, tc1, n1;
+    scale_min_hdr(p * 2, h0, &sc0, &m0);
+    scale_min_hdr(p * 2 + 1, h0, &sc1, &m1);
+    scale_min_hdr(p * 2, h1, &tc0, &n0);
+    scale_min_hdr(p * 2 + 1, h1, &tc1, &n1);
+    unsigned bit_lo = 1u << (2 * p);
+    unsigned bit_hi = bit_lo << 1;
+    int group = b * 8 + p * 2;
+    int off = half * 16;
+    uint4 xlo = ld_global_v4(xq + (size_t)group * 32 + off);
+    uint4 xhi = ld_global_v4(xq + (size_t)(group + 1) * 32 + off);
+    unsigned al[4] = {xlo.x, xlo.y, xlo.z, xlo.w};
+    unsigned ah[4] = {xhi.x, xhi.y, xhi.z, xhi.w};
+    unsigned q0w[4] = {q0.x, q0.y, q0.z, q0.w};
+    unsigned v0w[4] = {v0.x, v0.y, v0.z, v0.w};
+    unsigned q1w[4] = {q1.x, q1.y, q1.z, q1.w};
+    unsigned v1w[4] = {v1.x, v1.y, v1.z, v1.w};
+    int dlo0 = 0, dhi0 = 0, dlo1 = 0, dhi1 = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int plo0 = 0, phi0 = 0, plo1 = 0, phi1 = 0;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            unsigned byte0 = (q0w[i] >> (8 * k)) & 0xff;
+            unsigned hb0 = (v0w[i] >> (8 * k)) & 0xff;
+            unsigned byte1 = (q1w[i] >> (8 * k)) & 0xff;
+            unsigned hb1 = (v1w[i] >> (8 * k)) & 0xff;
+            int lo0 = (int)(byte0 & 0xf) + ((hb0 & bit_lo) ? 16 : 0);
+            int hi0 = (int)(byte0 >> 4) + ((hb0 & bit_hi) ? 16 : 0);
+            int lo1 = (int)(byte1 & 0xf) + ((hb1 & bit_lo) ? 16 : 0);
+            int hi1 = (int)(byte1 >> 4) + ((hb1 & bit_hi) ? 16 : 0);
+            plo0 |= (lo0 & 0xff) << (8 * k);
+            phi0 |= (hi0 & 0xff) << (8 * k);
+            plo1 |= (lo1 & 0xff) << (8 * k);
+            phi1 |= (hi1 & 0xff) << (8 * k);
+        }
+        dlo0 = dp4a_s32(plo0, (int)al[i], dlo0);
+        dhi0 = dp4a_s32(phi0, (int)ah[i], dhi0);
+        dlo1 = dp4a_s32(plo1, (int)al[i], dlo1);
+        dhi1 = dp4a_s32(phi1, (int)ah[i], dhi1);
+    }
+    float2 slo = sum16[group];
+    float2 shi = sum16[group + 1];
+    float sum_lo = half ? slo.y : slo.x;
+    float sum_hi = half ? shi.y : shi.x;
+    *a0 = (dW0 * (float)sc0) * xd[group] * (float)dlo0 - (dmin0 * (float)m0) * sum_lo;
+    *a0 += (dW0 * (float)sc1) * xd[group + 1] * (float)dhi0 - (dmin0 * (float)m1) * sum_hi;
+    *a1 = (dW1 * (float)tc0) * xd[group] * (float)dlo1 - (dmin1 * (float)n0) * sum_lo;
+    *a1 += (dW1 * (float)tc1) * xd[group + 1] * (float)dhi1 - (dmin1 * (float)n1) * sum_hi;
+}
+
+/* One warp, two consecutive Q5 rows. x is loaded once. The 4-row kernel
+   beat one-row q5w (3.06 vs 2.97 ms) because those four rows share x.
+   ODINFER_CUDA_GEMV_Q5=w2. No split-K. */
+extern "C" __global__ void gemv2_q5w2_k(const unsigned char* wb, const signed char* xq, const float* xd, const float2* sum16,
+                                       float* out, int n, int d, int accumulate) {
+    int lane = (int)threadIdx.x & 31;
+    int warp = (int)threadIdx.x >> 5;
+    int pair = (int)blockIdx.x * ((int)blockDim.x >> 5) + warp;
+    int row0 = pair << 1;
+    int row1 = row0 + 1;
+    int nb = n >> 8;
+    float a0 = 0.f, a1 = 0.f;
+    if (row0 < d) {
+        int nslot = nb << 3;
+        int second = row1 < d;
+        for (int base = 0; base < nslot; base += 32) {
+            int slot = base + lane;
+            int live = slot < nslot;
+            int b = 0, t = 0;
+            uint4 h0 = make_uint4(0, 0, 0, 0), q0 = make_uint4(0, 0, 0, 0), v0 = make_uint4(0, 0, 0, 0);
+            uint4 h1 = make_uint4(0, 0, 0, 0), q1 = make_uint4(0, 0, 0, 0), v1 = make_uint4(0, 0, 0, 0);
+            if (live) {
+                b = slot >> 3;
+                t = slot & 7;
+                int half = t & 1;
+                const unsigned char* b0 = wb + ((size_t)row0 * (size_t)nb + (size_t)b) * 176;
+                if (t == 0) h0 = ld_global_v4(b0);
+                q0 = ld_global_v4(b0 + 48 + t * 16);
+                v0 = ld_global_v4(b0 + 16 + half * 16);
+                if (second) {
+                    const unsigned char* b1 = wb + ((size_t)row1 * (size_t)nb + (size_t)b) * 176;
+                    if (t == 0) h1 = ld_global_v4(b1);
+                    q1 = ld_global_v4(b1 + 48 + t * 16);
+                    v1 = ld_global_v4(b1 + 16 + half * 16);
+                }
+            }
+            int src = lane & ~7;
+            h0 = shfl_u4(h0, src);
+            h1 = shfl_u4(h1, src);
+            if (live) {
+                float p0, p1;
+                q5_share(h0, q0, v0, h1, q1, v1, xq, xd, sum16, b, t, &p0, &p1);
+                a0 += p0;
+                if (second) a1 += p1;
+            }
+        }
+    }
+    a0 = warp32_sum(a0);
+    a1 = warp32_sum(a1);
+    if (lane == 0 && row0 < d) {
+        if (accumulate) out[row0] += a0;
+        else out[row0] = a0;
+        if (row1 < d) {
+            if (accumulate) out[row1] += a1;
+            else out[row1] = a1;
+        }
+    }
+}
+
+/* Gate and up, both Q5. One warp, one row of each matrix, x loaded once. */
+extern "C" __global__ void gemv2_q5w_pair_k(const unsigned char* w0, const unsigned char* w1,
+                                           const signed char* xq, const float* xd, const float2* sum16,
+                                           float* y0, float* y1, int n, int d) {
+    int lane = (int)threadIdx.x & 31;
+    int warp = (int)threadIdx.x >> 5;
+    int row = (int)blockIdx.x * ((int)blockDim.x >> 5) + warp;
+    int nb = n >> 8;
+    float a0 = 0.f, a1 = 0.f;
+    if (row < d) {
+        int nslot = nb << 3;
+        for (int base = 0; base < nslot; base += 32) {
+            int slot = base + lane;
+            int live = slot < nslot;
+            int b = 0, t = 0;
+            uint4 h0 = make_uint4(0, 0, 0, 0), q0 = make_uint4(0, 0, 0, 0), v0 = make_uint4(0, 0, 0, 0);
+            uint4 h1 = make_uint4(0, 0, 0, 0), q1 = make_uint4(0, 0, 0, 0), v1 = make_uint4(0, 0, 0, 0);
+            if (live) {
+                b = slot >> 3;
+                t = slot & 7;
+                int half = t & 1;
+                const unsigned char* b0 = w0 + ((size_t)row * (size_t)nb + (size_t)b) * 176;
+                const unsigned char* b1 = w1 + ((size_t)row * (size_t)nb + (size_t)b) * 176;
+                if (t == 0) {
+                    h0 = ld_global_v4(b0);
+                    h1 = ld_global_v4(b1);
+                }
+                q0 = ld_global_v4(b0 + 48 + t * 16);
+                v0 = ld_global_v4(b0 + 16 + half * 16);
+                q1 = ld_global_v4(b1 + 48 + t * 16);
+                v1 = ld_global_v4(b1 + 16 + half * 16);
+            }
+            int src = lane & ~7;
+            h0 = shfl_u4(h0, src);
+            h1 = shfl_u4(h1, src);
+            if (live) {
+                float p0, p1;
+                q5_share(h0, q0, v0, h1, q1, v1, xq, xd, sum16, b, t, &p0, &p1);
+                a0 += p0;
+                a1 += p1;
+            }
+        }
+    }
+    a0 = warp32_sum(a0);
+    a1 = warp32_sum(a1);
+    if (lane == 0 && row < d) {
+        y0[row] = a0;
+        y1[row] = a1;
     }
 }
 
@@ -4982,6 +5188,306 @@ extern "C" __global__ void wgemm_q5_k(const unsigned char* wb, const float* x, f
 }
 extern "C" __global__ void wgemm_q5_x16(const unsigned char* wb, const unsigned short* x, float* out, int n, int d, int T) {
     wgemm_run<2, 1>(wb, x, out, n, d, T);
+}
+
+template<int Q6, int X16, int BK, int LD>
+__device__ __forceinline__ void wg_prefetch32(const unsigned char* wb, const void* x, int n, int d, int T,
+                                            int n0, int t0, int k0, int tid,
+                                            float4& x0, float4& x1, float4& x2, float4& x3,
+                                            float4& x4, float4& x5, float4& x6, float4& x7,
+                                            uint4& h, uint4& q0, uint4& q1, uint4& q2, uint4& q3,
+                                            unsigned& sc_lo, unsigned& sc_hi, unsigned& d_bits, int& row_ok) {
+    float4 z = make_float4(0.f, 0.f, 0.f, 0.f);
+    float4 got[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) got[i] = z;
+#pragma unroll
+    for (int i = 0; i < BK / 8; ++i) {
+        int e = tid + i * 256;
+        int elem = e << 2;
+        int token = elem / BK;
+        int kk = elem - token * BK;
+        int tt = t0 + token;
+        int kkabs = k0 + kk;
+        if (tt < T && kkabs + 3 < n) {
+            if (X16) {
+                /* Four fp16 values packed once per chunk. The bits ride in
+                   the float4 channels and wg_commit writes them back out. */
+                const unsigned short* hp = (const unsigned short*)x + ((size_t)tt * (size_t)n + (size_t)kkabs);
+                uint2 h = *reinterpret_cast<const uint2*>(hp);
+                got[i].x = __uint_as_float(h.x & 0xffffu);
+                got[i].y = __uint_as_float(h.x >> 16);
+                got[i].z = __uint_as_float(h.y & 0xffffu);
+                got[i].w = __uint_as_float(h.y >> 16);
+            } else {
+                const float* p = (const float*)x + ((size_t)tt * (size_t)n + (size_t)kkabs);
+                got[i] = *reinterpret_cast<const float4*>(p);
+            }
+        } else {
+            got[i] = z;
+        }
+    }
+    x0 = got[0]; x1 = got[1]; x2 = got[2]; x3 = got[3];
+    x4 = got[4]; x5 = got[5]; x6 = got[6]; x7 = got[7];
+
+    int row = tid & 127;
+    int sub = (BK == 64) ? (tid >> 7) : 0;
+    int part = ((k0 & 255) >> 5) + sub;
+    int do_w = (BK == 64) || (tid < 128);
+    row_ok = (do_w && n0 + row < d) ? 1 : 0;
+    h = q0 = q1 = q2 = q3 = make_uint4(0, 0, 0, 0);
+    sc_lo = sc_hi = d_bits = 0;
+    if (!row_ok) return;
+    int bbytes = Q6 == 1 ? 210 : (Q6 == 2 ? 176 : 144);
+    int nb = n >> 8;
+    const unsigned char* blk = wb + ((size_t)(n0 + row) * (size_t)nb + (size_t)(k0 >> 8)) * (size_t)bbytes;
+    if (Q6 == 0) {
+        h = ld_global_v4(blk);
+        const unsigned char* qs = blk + 16 + (part >> 1) * 32;
+        q0 = ld_global_v4(qs);
+        q1 = ld_global_v4(qs + 16);
+        return;
+    }
+    if (Q6 == 2) {
+        h = ld_global_v4(blk);
+        q0 = ld_global_v4(blk + 16);
+        q1 = ld_global_v4(blk + 32);
+        const unsigned char* ql = blk + 48 + (part >> 1) * 32;
+        q2 = ld_global_v4(ql);
+        q3 = ld_global_v4(ql + 16);
+        return;
+    }
+    int half = part >> 2;
+    int group = part & 3;
+    int ql_off = (group == 1 || group == 3) ? 32 : 0;
+    const unsigned char* ql = blk + half * 64 + ql_off;
+    const unsigned char* qh = blk + 128 + half * 32;
+    const unsigned char* scb = blk + 192 + half * 8;
+    q0 = wg_ld_u4(ql);
+    q1 = wg_ld_u4(ql + 16);
+    q2 = wg_ld_u4(qh);
+    q3 = wg_ld_u4(qh + 16);
+    sc_lo = (unsigned)scb[0] | ((unsigned)scb[1] << 8) | ((unsigned)scb[2] << 16) | ((unsigned)scb[3] << 24);
+    sc_hi = (unsigned)scb[4] | ((unsigned)scb[5] << 8) | ((unsigned)scb[6] << 16) | ((unsigned)scb[7] << 24);
+    d_bits = (unsigned)blk[208] | ((unsigned)blk[209] << 8);
+}
+
+template<int Q6, int X16, int BK, int LD>
+__device__ __forceinline__ void wg_commit32(int n, int T, int n0, int t0, int k0, int tid,
+                                          float4 x0, float4 x1, float4 x2, float4 x3,
+                                          float4 x4, float4 x5, float4 x6, float4 x7,
+                                          uint4 h, uint4 q0, uint4 q1, uint4 q2, uint4 q3,
+                                          unsigned sc_lo, unsigned sc_hi, unsigned d_bits, int row_ok,
+                                          unsigned short* Xs, unsigned short* Ws) {
+    float4 xv[8] = {x0, x1, x2, x3, x4, x5, x6, x7};
+#pragma unroll
+    for (int i = 0; i < BK / 8; ++i) {
+        int e = tid + i * 256;
+        int elem = e << 2;
+        int token = elem / BK;
+        int kk = elem - token * BK;
+        unsigned short* dst = Xs + token * LD + kk;
+        int tt = t0 + token;
+        int kkabs = k0 + kk;
+        float4 v = xv[i];
+        if (X16) {
+            dst[0] = (tt < T && kkabs < n) ? (unsigned short)__float_as_uint(v.x) : 0;
+            dst[1] = (tt < T && kkabs + 1 < n) ? (unsigned short)__float_as_uint(v.y) : 0;
+            dst[2] = (tt < T && kkabs + 2 < n) ? (unsigned short)__float_as_uint(v.z) : 0;
+            dst[3] = (tt < T && kkabs + 3 < n) ? (unsigned short)__float_as_uint(v.w) : 0;
+        } else {
+            dst[0] = (tt < T && kkabs < n) ? f32_to_f16(v.x) : 0;
+            dst[1] = (tt < T && kkabs + 1 < n) ? f32_to_f16(v.y) : 0;
+            dst[2] = (tt < T && kkabs + 2 < n) ? f32_to_f16(v.z) : 0;
+            dst[3] = (tt < T && kkabs + 3 < n) ? f32_to_f16(v.w) : 0;
+        }
+    }
+    int row = tid & 127;
+    int sub = (BK == 64) ? (tid >> 7) : 0;
+    int part = ((k0 & 255) >> 5) + sub;
+    if (BK != 64 && tid >= 128) return;
+    unsigned short* wdst = Ws + row * LD + sub * 32;
+    if (row_ok) {
+        if (Q6 == 0) wg_dequant_q4(h, q0, q1, part, wdst);
+        else if (Q6 == 2) wg_dequant_q5(h, q0, q1, q2, q3, part, wdst);
+        else wg_dequant_q6(q0, q1, q2, q3, sc_lo, sc_hi, d_bits, part, wdst);
+    } else {
+#pragma unroll
+        for (int j = 0; j < 32; ++j) wdst[j] = 0;
+    }
+}
+
+/* Tile stays 128x128, BK=64, 256 threads, one block per SM. The double
+   buffer is 81920 bytes, so a second resident block does not fit in 96 KB.
+   A 27B MLP prefill is latency bound, not bandwidth bound: 16000 tokens
+   read about 1.5 TB of weights in 85 s, ~18 GB/s on a 1134 GB/s V100, and
+   about 10x off the tensor-core roof. X is fp32 and every row-tile reloads
+   it (17408/128 tiles; one 128x5120 tile is 2.6 MB, ~7x the Q4 weights of
+   that tile). Caching a Q4 panel as fp16 for the four token-tiles of a
+   512 chunk increases traffic: 368 KB of Q4 versus 1.31 MB of fp16, and
+   the first tile also writes the cache. A BK=32 panel plus this double
+   buffer, or a 256-row tile, does not fit in 96 KB either (two weight
+   panels + the current double buffer is 122880). A second accumulator
+   set spills. The launched kernel is unchanged. */
+template<int Q6, int X16, int BK, int LD>
+__device__ void wgemm_run32(const unsigned char* wb, const void* x, float* out, int n, int d, int T) {
+    const int tid = (int)threadIdx.x;
+    const int warp = tid >> 5;
+    const int t0 = (int)blockIdx.y * 128;
+    const int n0 = (int)blockIdx.x * 128;
+    if (t0 >= T || n0 >= d || n <= 0) return;
+
+    extern __shared__ __align__(16) unsigned char wgemm_sm[];
+    const int tw = warp & 3;
+    const int rw = warp >> 2;
+
+    float acc[8][8];
+#pragma unroll
+    for (int f = 0; f < 8; ++f) {
+#pragma unroll
+        for (int r = 0; r < 8; ++r) acc[f][r] = 0.f;
+    }
+
+    float4 x0, x1, x2, x3, x4, x5, x6, x7;
+    uint4 h, q0, q1, q2, q3;
+    unsigned sc_lo, sc_hi, d_bits;
+    int row_ok;
+    wg_prefetch32<Q6, X16, BK, LD>(wb, x, n, d, T, n0, t0, 0, tid, x0, x1, x2, x3, x4, x5, x6, x7, h, q0, q1, q2, q3, sc_lo, sc_hi, d_bits, row_ok);
+    {
+        unsigned short* base = (unsigned short*)wgemm_sm;
+        wg_commit32<Q6, X16, BK, LD>(n, T, n0, t0, 0, tid, x0, x1, x2, x3, x4, x5, x6, x7, h, q0, q1, q2, q3, sc_lo, sc_hi, d_bits, row_ok, base, base + 128 * LD);
+    }
+    __syncthreads();
+
+    int phase = 0;
+    const int stage = 512 * LD;
+    for (int k0 = 0; k0 < n; k0 += BK) {
+        int nxt = k0 + BK;
+        float4 nx0, nx1, nx2, nx3, nx4, nx5, nx6, nx7;
+        uint4 nh, nq0, nq1, nq2, nq3;
+        unsigned nsc_lo, nsc_hi, nd_bits;
+        int nrow_ok = 0;
+        if (nxt < n) {
+            wg_prefetch32<Q6, X16, BK, LD>(wb, x, n, d, T, n0, t0, nxt, tid, nx0, nx1, nx2, nx3, nx4, nx5, nx6, nx7, nh, nq0, nq1, nq2, nq3, nsc_lo, nsc_hi, nd_bits, nrow_ok);
+        }
+        unsigned short* cur = (unsigned short*)(wgemm_sm + phase * stage);
+        unsigned short* Xs = cur;
+        unsigned short* Ws = cur + 128 * LD;
+        /* A partial token tile still dequants the weight rows once. Skip the
+           16-wide MMA fragments that start past T, so a 15-token tail does
+           not run the other 112 columns. Full tiles take the first branch
+           and the inner loop stays free of that test. Syncs stay outside. */
+        int ntok = T - t0;
+        if (ntok > 128) ntok = 128;
+        int alive0 = (tw * 32) < ntok;
+        int alive1 = (tw * 32 + 16) < ntok;
+        if (alive0 && alive1) {
+#pragma unroll
+            for (int kk = 0; kk < BK; kk += 16) {
+                unsigned a00, a01, a02, a03, a04, a05, a06, a07;
+                unsigned a10, a11, a12, a13, a14, a15, a16, a17;
+                unsigned b00, b01, b02, b03, b04, b05, b06, b07;
+                unsigned b10, b11, b12, b13, b14, b15, b16, b17;
+                unsigned b20, b21, b22, b23, b24, b25, b26, b27;
+                unsigned b30, b31, b32, b33, b34, b35, b36, b37;
+                wmma_load_a(a00, a01, a02, a03, a04, a05, a06, a07, Xs + (tw * 32) * LD + kk, LD);
+                wmma_load_a(a10, a11, a12, a13, a14, a15, a16, a17, Xs + (tw * 32 + 16) * LD + kk, LD);
+                wmma_load_b(b00, b01, b02, b03, b04, b05, b06, b07, Ws + (rw * 64) * LD + kk, LD);
+                wmma_load_b(b10, b11, b12, b13, b14, b15, b16, b17, Ws + (rw * 64 + 16) * LD + kk, LD);
+                wmma_load_b(b20, b21, b22, b23, b24, b25, b26, b27, Ws + (rw * 64 + 32) * LD + kk, LD);
+                wmma_load_b(b30, b31, b32, b33, b34, b35, b36, b37, Ws + (rw * 64 + 48) * LD + kk, LD);
+                wmma_mma(acc[0][0], acc[0][1], acc[0][2], acc[0][3], acc[0][4], acc[0][5], acc[0][6], acc[0][7], a00, a01, a02, a03, a04, a05, a06, a07, b00, b01, b02, b03, b04, b05, b06, b07);
+                wmma_mma(acc[1][0], acc[1][1], acc[1][2], acc[1][3], acc[1][4], acc[1][5], acc[1][6], acc[1][7], a10, a11, a12, a13, a14, a15, a16, a17, b00, b01, b02, b03, b04, b05, b06, b07);
+                wmma_mma(acc[2][0], acc[2][1], acc[2][2], acc[2][3], acc[2][4], acc[2][5], acc[2][6], acc[2][7], a00, a01, a02, a03, a04, a05, a06, a07, b10, b11, b12, b13, b14, b15, b16, b17);
+                wmma_mma(acc[3][0], acc[3][1], acc[3][2], acc[3][3], acc[3][4], acc[3][5], acc[3][6], acc[3][7], a10, a11, a12, a13, a14, a15, a16, a17, b10, b11, b12, b13, b14, b15, b16, b17);
+                wmma_mma(acc[4][0], acc[4][1], acc[4][2], acc[4][3], acc[4][4], acc[4][5], acc[4][6], acc[4][7], a00, a01, a02, a03, a04, a05, a06, a07, b20, b21, b22, b23, b24, b25, b26, b27);
+                wmma_mma(acc[5][0], acc[5][1], acc[5][2], acc[5][3], acc[5][4], acc[5][5], acc[5][6], acc[5][7], a10, a11, a12, a13, a14, a15, a16, a17, b20, b21, b22, b23, b24, b25, b26, b27);
+                wmma_mma(acc[6][0], acc[6][1], acc[6][2], acc[6][3], acc[6][4], acc[6][5], acc[6][6], acc[6][7], a00, a01, a02, a03, a04, a05, a06, a07, b30, b31, b32, b33, b34, b35, b36, b37);
+                wmma_mma(acc[7][0], acc[7][1], acc[7][2], acc[7][3], acc[7][4], acc[7][5], acc[7][6], acc[7][7], a10, a11, a12, a13, a14, a15, a16, a17, b30, b31, b32, b33, b34, b35, b36, b37);
+            }
+        } else if (alive0 || alive1) {
+#pragma unroll
+            for (int kk = 0; kk < BK; kk += 16) {
+                unsigned a00, a01, a02, a03, a04, a05, a06, a07;
+                unsigned b00, b01, b02, b03, b04, b05, b06, b07;
+                unsigned b10, b11, b12, b13, b14, b15, b16, b17;
+                unsigned b20, b21, b22, b23, b24, b25, b26, b27;
+                unsigned b30, b31, b32, b33, b34, b35, b36, b37;
+                wmma_load_b(b00, b01, b02, b03, b04, b05, b06, b07, Ws + (rw * 64) * LD + kk, LD);
+                wmma_load_b(b10, b11, b12, b13, b14, b15, b16, b17, Ws + (rw * 64 + 16) * LD + kk, LD);
+                wmma_load_b(b20, b21, b22, b23, b24, b25, b26, b27, Ws + (rw * 64 + 32) * LD + kk, LD);
+                wmma_load_b(b30, b31, b32, b33, b34, b35, b36, b37, Ws + (rw * 64 + 48) * LD + kk, LD);
+                if (alive0) {
+                    wmma_load_a(a00, a01, a02, a03, a04, a05, a06, a07, Xs + (tw * 32) * LD + kk, LD);
+                    wmma_mma(acc[0][0], acc[0][1], acc[0][2], acc[0][3], acc[0][4], acc[0][5], acc[0][6], acc[0][7], a00, a01, a02, a03, a04, a05, a06, a07, b00, b01, b02, b03, b04, b05, b06, b07);
+                    wmma_mma(acc[2][0], acc[2][1], acc[2][2], acc[2][3], acc[2][4], acc[2][5], acc[2][6], acc[2][7], a00, a01, a02, a03, a04, a05, a06, a07, b10, b11, b12, b13, b14, b15, b16, b17);
+                    wmma_mma(acc[4][0], acc[4][1], acc[4][2], acc[4][3], acc[4][4], acc[4][5], acc[4][6], acc[4][7], a00, a01, a02, a03, a04, a05, a06, a07, b20, b21, b22, b23, b24, b25, b26, b27);
+                    wmma_mma(acc[6][0], acc[6][1], acc[6][2], acc[6][3], acc[6][4], acc[6][5], acc[6][6], acc[6][7], a00, a01, a02, a03, a04, a05, a06, a07, b30, b31, b32, b33, b34, b35, b36, b37);
+                }
+                if (alive1) {
+                    wmma_load_a(a00, a01, a02, a03, a04, a05, a06, a07, Xs + (tw * 32 + 16) * LD + kk, LD);
+                    wmma_mma(acc[1][0], acc[1][1], acc[1][2], acc[1][3], acc[1][4], acc[1][5], acc[1][6], acc[1][7], a00, a01, a02, a03, a04, a05, a06, a07, b00, b01, b02, b03, b04, b05, b06, b07);
+                    wmma_mma(acc[3][0], acc[3][1], acc[3][2], acc[3][3], acc[3][4], acc[3][5], acc[3][6], acc[3][7], a00, a01, a02, a03, a04, a05, a06, a07, b10, b11, b12, b13, b14, b15, b16, b17);
+                    wmma_mma(acc[5][0], acc[5][1], acc[5][2], acc[5][3], acc[5][4], acc[5][5], acc[5][6], acc[5][7], a00, a01, a02, a03, a04, a05, a06, a07, b20, b21, b22, b23, b24, b25, b26, b27);
+                    wmma_mma(acc[7][0], acc[7][1], acc[7][2], acc[7][3], acc[7][4], acc[7][5], acc[7][6], acc[7][7], a00, a01, a02, a03, a04, a05, a06, a07, b30, b31, b32, b33, b34, b35, b36, b37);
+                }
+            }
+        }
+        if (nxt < n) {
+            int np = phase ^ 1;
+            unsigned short* nb = (unsigned short*)(wgemm_sm + np * stage);
+            wg_commit32<Q6, X16, BK, LD>(n, T, n0, t0, nxt, tid, nx0, nx1, nx2, nx3, nx4, nx5, nx6, nx7, nh, nq0, nq1, nq2, nq3, nsc_lo, nsc_hi, nd_bits, nrow_ok, nb, nb + 128 * LD);
+            __syncthreads();
+            phase = np;
+        }
+    }
+    __syncthreads();
+
+    float* tile = (float*)wgemm_sm;
+#pragma unroll
+    for (int f = 0; f < 8; ++f) {
+        wmma_store(tile + (warp * 8 + f) * 256, 16,
+                   acc[f][0], acc[f][1], acc[f][2], acc[f][3], acc[f][4], acc[f][5], acc[f][6], acc[f][7]);
+    }
+    __syncthreads();
+    for (int idx = tid; idx < 8 * 8 * 256; idx += 256) {
+        int frag = idx >> 8;
+        int e = idx & 255;
+        int w = frag >> 3;
+        int fi = frag & 7;
+        int ri = fi >> 1;
+        int ci = fi & 1;
+        int i = e >> 4;
+        int j = e & 15;
+        int t = t0 + (w & 3) * 32 + ci * 16 + i;
+        int orow = n0 + (w >> 2) * 64 + ri * 16 + j;
+        if (t < T && orow < d) out[(size_t)t * (size_t)d + orow] = tile[idx];
+    }
+}
+
+/* BK=32, stride 40. The K double buffer is 40960 bytes. The epilogue then
+   stores 8 warps * 8 fragments * 256 floats = 65536 bytes into the same
+   smem, so the launch size is 65536. 36447cb launched 40960 and the store
+   walked off the end (illegal address; the next sync reported whatever
+   kernel ran after). 65536 does not fit two blocks in 96 KB. The default
+   BK=64 kernel above is the #24 source. ODINFER_CUDA_WGEMM_BK=32. */
+extern "C" __global__ void wgemm_q4_bk32(const unsigned char* wb, const float* x, float* out, int n, int d, int T) {
+    wgemm_run32<0, 0, 32, 40>(wb, x, out, n, d, T);
+}
+extern "C" __global__ void wgemm_q6_bk32(const unsigned char* wb, const float* x, float* out, int n, int d, int T) {
+    wgemm_run32<1, 0, 32, 40>(wb, x, out, n, d, T);
+}
+extern "C" __global__ void wgemm_q5_bk32(const unsigned char* wb, const float* x, float* out, int n, int d, int T) {
+    wgemm_run32<2, 0, 32, 40>(wb, x, out, n, d, T);
+}
+extern "C" __global__ void wgemm_q4_bk32x(const unsigned char* wb, const unsigned short* x, float* out, int n, int d, int T) {
+    wgemm_run32<0, 1, 32, 40>(wb, x, out, n, d, T);
+}
+extern "C" __global__ void wgemm_q6_bk32x(const unsigned char* wb, const unsigned short* x, float* out, int n, int d, int T) {
+    wgemm_run32<1, 1, 32, 40>(wb, x, out, n, d, T);
+}
+extern "C" __global__ void wgemm_q5_bk32x(const unsigned char* wb, const unsigned short* x, float* out, int n, int d, int T) {
+    wgemm_run32<2, 1, 32, 40>(wb, x, out, n, d, T);
 }
 
 extern "C" __global__ void pack_f16(const float* x, unsigned short* y, int n) {
