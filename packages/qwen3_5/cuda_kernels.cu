@@ -1658,6 +1658,224 @@ extern "C" __global__ void attention_q8v_wmma(const float* q, const unsigned cha
     }
 }
 
+/* Same math as attention_q8v_wmma. One block owns q_per query tiles (2 or 4)
+   and dequantizes each 64-key / 64-value tile once for all of them. The
+   single-tile kernel stays for q_tiles==1 and for ODINFER_CUDA_ATTN_QTILE=1.
+   On a 512-token chunk the old grid dequantizes KV once per query tile, 16
+   times; the 16k attention bucket was 12643 ms after the 2048-token split.
+   P and the per-row softmax scale are parked in global memory between the
+   K pass and the V pass because both do not fit beside K in the 91136-byte
+   buffer. Scores, the online softmax, and PV use the same order as the
+   one-tile kernel. The KV loop runs to the last tile's causal end; earlier
+   tiles mask those keys to -inf, which does not enter max or sum. */
+extern "C" __global__ void attention_q8v_wmma_qr(const float* q, const unsigned char* kc, const unsigned char* vc,
+                                                 float* partial_o, float* partial_m, float* partial_l,
+                                                 unsigned short* p_store, float* alpha_store,
+                                                 int head_dim, int k_pos_bytes, int v_pos_bytes, int kv_mul, int n_heads,
+                                                 int pos0, int T, int tok_stride, int q_tiles, int part_len, int q_per) {
+    const int BQ = 32;
+    const int BC = 64;
+    int group = (int)blockIdx.x;
+    int kvh = (int)blockIdx.y;
+    int part = (int)blockIdx.z;
+    int tid = (int)threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    if (head_dim != 256 || blockDim.x != 512 || kv_mul < 1 || kv_mul > 8 || q_per < 1) return;
+    int q_begin = group * q_per;
+    int n_local = q_tiles - q_begin;
+    if (n_local > q_per) n_local = q_per;
+    if (n_local <= 0 || q_begin >= q_tiles) return;
+    int q_last = q_begin + n_local - 1;
+    int q0_last = q_last * BQ;
+    int ntok_last = BQ;
+    if (q0_last + ntok_last > T) ntok_last = T - q0_last;
+    if (ntok_last < 0) ntok_last = 0;
+    int kv_len = pos0 + T;
+    int part_begin = part * part_len;
+    int part_end = part_begin + part_len;
+    if (part_end > kv_len) part_end = kv_len;
+    int causal_last = pos0 + q0_last + ntok_last;
+    int nb = head_dim >> 5;
+    extern __shared__ __align__(16) unsigned char wmma_smem[];
+    unsigned short* Ks = (unsigned short*)wmma_smem;
+    unsigned short* Ps = Ks + BC * 256;
+    unsigned short* Qs = Ps + 8 * BQ * BC;
+    float* S = (float*)(Qs + BQ * 256);
+    float* alpha = S + BQ * BC;
+    float* scratch = (float*)Qs;
+    float scale = rsqrtf(256.f);
+    size_t tile_stride = (size_t)kv_mul * (size_t)(BQ * BC);
+    size_t block_base = (((size_t)part * (size_t)gridDim.y + (size_t)kvh) * (size_t)gridDim.x + (size_t)group) * (size_t)q_per;
+    for (int ql = 0; ql < n_local; ++ql) {
+        int q_tile = q_begin + ql;
+        int q0 = q_tile * BQ;
+        int ntok = BQ;
+        if (q0 + ntok > T) ntok = T - q0;
+        if (ntok < 0) ntok = 0;
+        for (int qi = 0; qi < kv_mul; ++qi) {
+            int h = kvh * kv_mul + qi;
+            for (int r = 0; r < ntok; ++r) {
+                size_t mi = wmma_mi(part, q_tiles, q_tile, n_heads, h, BQ, r);
+                if (tid == 0) {
+                    partial_m[mi] = -1e30f;
+                    partial_l[mi] = 0.f;
+                }
+                for (int i = tid; i < 256; i += (int)blockDim.x) partial_o[mi * 256 + i] = 0.f;
+            }
+        }
+    }
+    __syncthreads();
+    if (part_begin >= part_end || part_begin >= causal_last) return;
+    for (int kv = part_begin; kv < part_end; kv += BC) {
+        if (kv >= causal_last) break;
+        int nvalid = part_end - kv;
+        if (nvalid > BC) nvalid = BC;
+        int room = causal_last - kv;
+        if (nvalid > room) nvalid = room;
+        if (nvalid <= 0) break;
+        dequant_k256(Ks, kc, k_pos_bytes, kvh, nb, BC, kv, nvalid, tid, (int)blockDim.x);
+        __syncthreads();
+        for (int ql = 0; ql < n_local; ++ql) {
+            int q_tile = q_begin + ql;
+            int q0 = q_tile * BQ;
+            int ntok = BQ;
+            if (q0 + ntok > T) ntok = T - q0;
+            if (ntok < 0) ntok = 0;
+            for (int qi = 0; qi < kv_mul; ++qi) {
+                int h = kvh * kv_mul + qi;
+                for (int e = tid; e < BQ * 256; e += (int)blockDim.x) {
+                    int r = e >> 8;
+                    int dim = e & 255;
+                    float v = 0.f;
+                    if (r < ntok) v = q[((size_t)(q0 + r) * (size_t)tok_stride + (size_t)h * 256) + dim];
+                    Qs[e] = f32_to_f16(v);
+                }
+                __syncthreads();
+                if (warp < 8) {
+                    int row_group = warp >> 2;
+                    int col_group = warp & 3;
+                    float s0, s1, s2, s3, s4, s5, s6, s7;
+                    WM_Z(s);
+                    for (int kk = 0; kk < 256; kk += 16) {
+                        unsigned a0, a1, a2, a3, a4, a5, a6, a7;
+                        unsigned b0, b1, b2, b3, b4, b5, b6, b7;
+                        WM_LA(a, Qs + row_group * 16 * 256 + kk, 256);
+                        WM_LB(b, Ks + col_group * 16 * 256 + kk, 256);
+                        WM_M(s, a, b);
+                    }
+                    WM_ST(S + row_group * 16 * BC + col_group * 16, BC, s);
+                }
+                __syncthreads();
+                {
+                    int row = tid >> 4;
+                    int sub = tid & 15;
+                    unsigned half = (lane < 16) ? 0x0000ffffu : 0xffff0000u;
+                    int src = lane & 16;
+                    float mloc = -1e30f;
+                    for (int c = sub; c < BC; c += 16) {
+                        float sv = S[row * BC + c];
+                        int pos = kv + c;
+                        int npos = pos0 + q0 + row + 1;
+                        if (row >= ntok || c >= nvalid || pos >= npos) sv = -1e30f;
+                        else sv *= scale;
+                        S[row * BC + c] = sv;
+                        mloc = fmaxf(mloc, sv);
+                    }
+                    float m_tile = half_max(mloc, half);
+                    size_t mi = wmma_mi(part, q_tiles, q_tile, n_heads, h, BQ, row);
+                    float m_old = -1e30f;
+                    float l_old = 0.f;
+                    if (sub == 0 && row < ntok) {
+                        m_old = partial_m[mi];
+                        l_old = partial_l[mi];
+                    }
+                    m_old = __shfl_sync(half, m_old, src);
+                    l_old = __shfl_sync(half, l_old, src);
+                    int live = m_tile >= -1e20f;
+                    float m_new = m_tile;
+                    float alpha_v = 1.f;
+                    if (live) {
+                        m_new = fmaxf(m_old, m_tile);
+                        alpha_v = expf(m_old - m_new);
+                    }
+                    unsigned short* Ph = Ps + qi * BQ * BC;
+                    float ploc = 0.f;
+                    for (int c = sub; c < BC; c += 16) {
+                        float sv = S[row * BC + c];
+                        float p = 0.f;
+                        if (live && sv >= -1e20f) {
+                            p = expf(sv - m_new);
+                            ploc += p;
+                        }
+                        Ph[row * BC + c] = f32_to_f16(p);
+                    }
+                    ploc = half_sum(ploc, half);
+                    if (sub == 0 && row < ntok && live) {
+                        partial_m[mi] = m_new;
+                        partial_l[mi] = l_old * alpha_v + ploc;
+                    }
+                    if (sub == 0) alpha[qi * BQ + row] = alpha_v;
+                }
+                __syncthreads();
+            }
+            unsigned short* gp = p_store + (block_base + (size_t)ql) * tile_stride;
+            float* ga = alpha_store + (block_base + (size_t)ql) * (size_t)kv_mul * (size_t)BQ;
+            int ncopy = kv_mul * BQ * BC;
+            for (int e = tid; e < ncopy; e += (int)blockDim.x) gp[e] = Ps[e];
+            int nalpha = kv_mul * BQ;
+            for (int e = tid; e < nalpha; e += (int)blockDim.x) ga[e] = alpha[e];
+            __syncthreads();
+        }
+        dequant_v256(Ks, vc, v_pos_bytes, kvh, nb, BC, kv, nvalid, tid, (int)blockDim.x);
+        __syncthreads();
+        for (int ql = 0; ql < n_local; ++ql) {
+            int q_tile = q_begin + ql;
+            int q0 = q_tile * BQ;
+            int ntok = BQ;
+            if (q0 + ntok > T) ntok = T - q0;
+            if (ntok < 0) ntok = 0;
+            unsigned short* gp = p_store + (block_base + (size_t)ql) * tile_stride;
+            float* ga = alpha_store + (block_base + (size_t)ql) * (size_t)kv_mul * (size_t)BQ;
+            int ncopy = kv_mul * BQ * BC;
+            for (int e = tid; e < ncopy; e += (int)blockDim.x) Ps[e] = gp[e];
+            int nalpha = kv_mul * BQ;
+            for (int e = tid; e < nalpha; e += (int)blockDim.x) alpha[e] = ga[e];
+            __syncthreads();
+            for (int qi = 0; qi < kv_mul; ++qi) {
+                int h = kvh * kv_mul + qi;
+                unsigned short* Ph = Ps + qi * BQ * BC;
+                for (int rg = 0; rg < 2; ++rg) {
+                    float c0, c1, c2, c3, c4, c5, c6, c7;
+                    WM_Z(c);
+                    for (int kk = 0; kk < BC; kk += 16) {
+                        unsigned a0, a1, a2, a3, a4, a5, a6, a7;
+                        unsigned b0, b1, b2, b3, b4, b5, b6, b7;
+                        WM_LA(a, Ph + rg * 16 * BC + kk, BC);
+                        WM_LBR(b, Ks + kk * 256 + warp * 16, 256);
+                        WM_MR(c, a, b);
+                    }
+                    WM_ST(scratch + warp * 256, 16, c);
+                    __syncthreads();
+                    for (int e = lane; e < 256; e += 32) {
+                        int r = e >> 4;
+                        int col = e & 15;
+                        int qr = rg * 16 + r;
+                        if (qr < ntok) {
+                            size_t mi = wmma_mi(part, q_tiles, q_tile, n_heads, h, BQ, qr);
+                            float* o = partial_o + mi * 256 + warp * 16 + col;
+                            *o = *o * alpha[qi * BQ + qr] + scratch[warp * 256 + e];
+                        }
+                    }
+                    __syncthreads();
+                }
+            }
+            __syncthreads();
+        }
+        __syncthreads();
+    }
+}
+
 extern "C" __global__ void attention_q8v_wmma_reduce(float* xb3, const float* partial_o, const float* partial_m,
                                                      const float* partial_l, int n_heads, int q_tiles, int nparts,
                                                      int pos0, int T, int tok_stride) {

@@ -53,6 +53,7 @@ you isolate per-stage GPU time. Never enable in production.
 | `ODINFER_CUDA_GEMV_Q5` | `w` | `w` is aligned `gemv2_q5w`. `k` is the 4-row kernel. `w2` is two rows sharing x. The V100 retest did not move decode tok/s. |
 | `ODINFER_CUDA_WGEMM_BK` | `64` | `=32` is the shorter prefill tile. Launch smem is 65536 (the epilogue). Default BK=64 is the #24 kernel. |
 | `ODINFER_CUDA_ATTN_PARTS` | off | `=4` or `=8` forces that many WMMA KV parts. Unset keeps the 80-block target and splits a part longer than 2048 KV tokens, capped at 8. A 512-token chunk at pos0=0 stays at 2 parts. |
+| `ODINFER_CUDA_ATTN_QTILE` | `4` | Query tiles per KV dequant. `=1` is the one-tile kernel. A one-tile chunk stays on that kernel either way. |
 | `ODINFER_CUDA_GEMV_SPLIT` | on | Q4_K / Q6_K decode with `rows≤8192` splits K and `atomicAdd`s the partials. `=0` is one K range. |
 | `ODINFER_CUDA_GEMV_SPLITS` | auto | Unset uses 2-way on short-row matrices whose K still has 12 superblocks per half, and 4-way otherwise. 27B w2 is staged plus that 2-way (bench `q6s2`). 9B w2 is direct 2-way (bench `s2`). `r4` is not the decode launch. `=4` is the flat split. |
 | `ODINFER_CUDA_GEMV_FUSE` | auto | Q4 gate+up with K≥5120 is one kernel (`gemv2_q4p`). 9B (K=4096) stays two launches. `=1` forces the pair. `=0` is two GEMVs. `--bench-gemv` prints `pair` versus `two r4` on the w1 shapes. |

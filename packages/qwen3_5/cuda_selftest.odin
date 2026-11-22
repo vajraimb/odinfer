@@ -2404,7 +2404,7 @@ run_attn_wmma :: proc() -> bool {
 		return false
 	}
 	ok := true
-	wide := [?][2]int{{128, 16}, {128, 7}, {128, 64}, {300, 16}, {1800, 16}, {8192, 16}, {32768, 16}}
+	wide := [?][2]int{{128, 16}, {128, 7}, {128, 64}, {300, 16}, {1800, 16}, {4096, 160}, {8192, 16}, {32768, 16}}
 	short := [?][2]int{{128, 16}, {1800, 16}}
 	if !run_attn_wmma_shape(4, wide[:]) {
 		ok = false
@@ -2481,6 +2481,14 @@ run_attn_wmma_shape :: proc(kv_mul: int, cases: [][2]int) -> bool {
 	dpo, _ := cu.alloc(nslot * hd * 4)
 	dpm, _ := cu.alloc(nslot * 4)
 	dpl, _ := cu.alloc(nslot * 4)
+	qt_cap := (t_max + ATTN_WMMA_BQ - 1) / ATTN_WMMA_BQ
+	if qt_cap < 1 {
+		qt_cap = 1
+	}
+	qr_groups := (qt_cap + 3) / 4
+	qr_slots := qr_groups * 4 * n_kv * ATTN_WMMA_PARTS
+	dps, _ := cu.alloc(qr_slots * kv_mul * ATTN_WMMA_BQ * ATTN_WMMA_BC * 2)
+	das, _ := cu.alloc(qr_slots * kv_mul * ATTN_WMMA_BQ * 4)
 	defer cu.free(dq)
 	defer cu.free(dkc)
 	defer cu.free(dvc)
@@ -2490,7 +2498,9 @@ run_attn_wmma_shape :: proc(kv_mul: int, cases: [][2]int) -> bool {
 	defer cu.free(dpo)
 	defer cu.free(dpm)
 	defer cu.free(dpl)
-	if dq == 0 || dkc == 0 || dvc == 0 || dxb == 0 || dref == 0 || dsc == 0 || dpo == 0 || dpm == 0 || dpl == 0 {
+	defer cu.free(dps)
+	defer cu.free(das)
+	if dq == 0 || dkc == 0 || dvc == 0 || dxb == 0 || dref == 0 || dsc == 0 || dpo == 0 || dpm == 0 || dpl == 0 || dps == 0 || das == 0 {
 		fmt.eprintln("cuda_selftest: attn wmma alloc failed")
 		return false
 	}
@@ -2511,9 +2521,11 @@ run_attn_wmma_shape :: proc(kv_mul: int, cases: [][2]int) -> bool {
 	}
 	got_old := make([]f32, t_max * n_heads * hd)
 	got_new := make([]f32, t_max * n_heads * hd)
+	got_qr := make([]f32, t_max * n_heads * hd)
 	one := make([]f32, n_heads * hd)
 	defer delete(got_old)
 	defer delete(got_new)
+	defer delete(got_qr)
 	defer delete(one)
 	ok := true
 	for cs in cases {
@@ -2577,6 +2589,40 @@ run_attn_wmma_shape :: proc(kv_mul: int, cases: [][2]int) -> bool {
 		}
 		if !s_report(fmt.tprintf("attn_wmma kv_mul={} npos={} T={}", kv_mul, npos, T), st, 1e-1, 5e-2) {
 			ok = false
+		}
+		if T >= 128 {
+			qr := s_fn("attention_q8v_wmma_qr")
+			if qr == nil {
+				fmt.eprintln("cuda_selftest: attention_q8v_wmma_qr missing")
+				return false
+			}
+			if cu.func_set_max_dynamic_shared(qr, ATTN_WMMA_SMEM) != cu.OK {
+				fmt.eprintln("cuda_selftest: attn wmma qr could not raise dynamic smem")
+				return false
+			}
+			q_per := 4
+			groups := (plan.q_tiles + q_per - 1) / q_per
+			qp := i32(q_per)
+			pps, aas := dps, das
+			qargs := [?]rawptr{&qa, &kca, &vca, &po, &pm, &pl, &pps, &aas, &ihd, &ikb, &ivb, &mul, &nh, &ps, &nt, &stride, &qt, &plen, &qp}
+			if cu.launch(qr, u32(groups), u32(n_kv), u32(plan.nparts), 512, 1, 1, u32(ATTN_WMMA_SMEM), qargs[:]) != cu.OK || cu.sync() != cu.OK {
+				fmt.eprintfln("cuda_selftest: attention_q8v_wmma_qr launch failed at npos {} T {}", npos, T)
+				return false
+			}
+			if cu.launch(red_fn, u32(n_heads), u32(plan.q_tiles), 1, 128, 1, 1, 0, rargs[:]) != cu.OK || cu.sync() != cu.OK {
+				fmt.eprintfln("cuda_selftest: attention_q8v_wmma_reduce launch failed after qr at npos {} T {}", npos, T)
+				return false
+			}
+			if cu.download(raw_data(got_qr), dxb, nfloat * 4) != cu.OK {
+				return false
+			}
+			stq: Case_Err
+			for i in 0 ..< nfloat {
+				s_note(&stq, fmt.tprintf("wqr[%d] npos %d T %d", i, npos, T), got_qr[i], got_new[i], 0, 0)
+			}
+			if !s_report(fmt.tprintf("attn_wqr matches attn_wmma kv_mul={} npos={} T={}", kv_mul, npos, T), stq, 0, 0) {
+				ok = false
+			}
 		}
 	}
 	return ok

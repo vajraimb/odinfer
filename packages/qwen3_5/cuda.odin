@@ -118,7 +118,7 @@ d_logits, d_scores, d_partial, d_moe_logits, d_moe_wt, d_moe_sel: cu.Device_Ptr
 @(private)
 d_part_m, d_part_l, d_part_o: cu.Device_Ptr
 @(private)
-d_wmma_o, d_wmma_m, d_wmma_l: cu.Device_Ptr
+d_wmma_o, d_wmma_m, d_wmma_l, d_attn_p, d_attn_a: cu.Device_Ptr
 @(private)
 d_kc, d_vc, d_conv, d_rec: cu.Device_Ptr
 
@@ -230,6 +230,7 @@ g_gemv_mmvq: bool // one warp per row for Q4/Q5/Q6. ODINFER_CUDA_GEMV_MMVQ=0 res
 g_gemv_q5: int // 0 gemv2_q5w, 1 gemv2_q5_k, 2 gemv2_q5w2. ODINFER_CUDA_GEMV_Q5
 g_wgemm_bk32: bool // ODINFER_CUDA_WGEMM_BK=32
 g_attn_parts: int // ODINFER_CUDA_ATTN_PARTS. 0 keeps the 80-block planner
+g_attn_qtile: int // ODINFER_CUDA_ATTN_QTILE. 4 shares one KV dequant across that many query tiles. 1 is the one-tile kernel
 @(private)
 g_launches: int
 @(private)
@@ -295,7 +296,7 @@ k_gemv2r1_q4, k_gemv2r1_q6: cu.Function
 @(private)
 k_rmsnorm, k_qnorm, k_qnorm_rope, k_knorm_rope, k_rope, k_gate, k_gate_q, k_swiglu, k_swiglu_q, k_residual, k_axpy: cu.Function
 @(private)
-k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v, k_attn_part, k_attn_red, k_attn_long4, k_attn_long6, k_attn_flash, k_attn_wmma, k_attn_wred: cu.Function
+k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v, k_attn_part, k_attn_red, k_attn_long4, k_attn_long6, k_attn_flash, k_attn_wmma, k_attn_wmma_qr, k_attn_wred: cu.Function
 @(private)
 k_conv, k_conv_chunk, k_l2, k_l2_chunk, k_delta, k_delta_chunk, k_delta_sm, k_delta_wmma, k_rmsgate, k_rmsgate_q, k_moe_topk: cu.Function
 @(private)
@@ -1730,9 +1731,28 @@ attn_wmma_launch :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos0, T: int) -> bool {
 	ps, nt := i32(pos0), i32(T)
 	stride := i32(g_heads * g_head)
 	qt, plen := i32(plan.q_tiles), i32(plan.part_len)
-	args := [?]rawptr{&a, &b, &c, &po, &pm, &pl, &hd, &kb, &vb, &mul, &nh, &ps, &nt, &stride, &qt, &plen}
-	if !klaunch(k_attn_wmma, u32(plan.q_tiles), u32(g_kv_heads), u32(plan.nparts), 512, 1, 1, args[:], "attn_wmma", u32(ATTN_WMMA_SMEM)) {
-		return false
+	q_per := g_attn_qtile
+	if q_per != 2 && q_per != 4 {
+		q_per = 1
+	}
+	groups := plan.q_tiles
+	if q_per > 1 && plan.q_tiles > 1 && k_attn_wmma_qr != nil && d_attn_p != 0 && d_attn_a != 0 {
+		groups = (plan.q_tiles + q_per - 1) / q_per
+	} else {
+		q_per = 1
+	}
+	if q_per == 1 {
+		args := [?]rawptr{&a, &b, &c, &po, &pm, &pl, &hd, &kb, &vb, &mul, &nh, &ps, &nt, &stride, &qt, &plen}
+		if !klaunch(k_attn_wmma, u32(plan.q_tiles), u32(g_kv_heads), u32(plan.nparts), 512, 1, 1, args[:], "attn_wmma", u32(ATTN_WMMA_SMEM)) {
+			return false
+		}
+	} else {
+		pp, aa := d_attn_p, d_attn_a
+		qp := i32(q_per)
+		args := [?]rawptr{&a, &b, &c, &po, &pm, &pl, &pp, &aa, &hd, &kb, &vb, &mul, &nh, &ps, &nt, &stride, &qt, &plen, &qp}
+		if !klaunch(k_attn_wmma_qr, u32(groups), u32(g_kv_heads), u32(plan.nparts), 512, 1, 1, args[:], "attn_wqr", u32(ATTN_WMMA_SMEM)) {
+			return false
+		}
 	}
 	out := xb3
 	np := i32(plan.nparts)
@@ -2010,6 +2030,7 @@ bind_kernels :: proc() -> bool {
 	k_attn_long6 = get_fn("attention_q8v_long6")
 	k_attn_flash = get_fn("attention_q8v_flash")
 	k_attn_wmma = get_fn("attention_q8v_wmma")
+	k_attn_wmma_qr = get_fn("attention_q8v_wmma_qr")
 	k_attn_wred = get_fn("attention_q8v_wmma_reduce")
 	k_conv = get_fn("conv1d_step")
 	k_conv_chunk = get_fn("conv1d_chunk")
@@ -2076,7 +2097,7 @@ bind_kernels :: proc() -> bool {
 	k_gemv2r1_q6 = get_fn("gemv2r1_q6_k")
 	handles := [?]cu.Function{
 		k_rmsnorm, k_qnorm, k_qnorm_rope, k_knorm_rope, k_rope, k_gate, k_swiglu, k_residual, k_axpy,
-		k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v, k_attn_part, k_attn_red, k_attn_long4, k_attn_long6, k_attn_flash, k_attn_wmma, k_attn_wred,
+		k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v, k_attn_part, k_attn_red, k_attn_long4, k_attn_long6, k_attn_flash, k_attn_wmma, k_attn_wmma_qr, k_attn_wred,
 		k_conv, k_conv_chunk, k_l2, k_l2_chunk, k_delta, k_delta_chunk, k_delta_sm, k_delta_wmma, k_rmsgate, k_rmsgate_q, k_moe_topk,
 		k_gate_q, k_swiglu_q,
 		k_tc2_q4, k_tc2_q6, k_tc2s_q4, k_tc2s_q6, k_tc2m_q4, k_tc2m_q6, k_tc2r_q4, k_tc2r_q6,
@@ -2095,6 +2116,10 @@ bind_kernels :: proc() -> bool {
 		fmt.eprintln("cuda: delta state stays in global memory (cuFuncSetAttribute failed)")
 	}
 	g_wmma_smem = cu.func_set_max_dynamic_shared(k_attn_wmma, ATTN_WMMA_SMEM) == cu.OK
+	if cu.func_set_max_dynamic_shared(k_attn_wmma_qr, ATTN_WMMA_SMEM) != cu.OK {
+		g_attn_qtile = 1
+		fmt.eprintln("cuda: attn query-tile reuse stays off (cuFuncSetAttribute failed)")
+	}
 	g_wgemm_smem = cu.func_set_max_dynamic_shared(k_wgemm_q4, int(WG_SMEM)) == cu.OK && cu.func_set_max_dynamic_shared(k_wgemm_q6, int(WG_SMEM)) == cu.OK && cu.func_set_max_dynamic_shared(k_wgemm_q5, int(WG_SMEM)) == cu.OK && cu.func_set_max_dynamic_shared(k_wgemm_q4x, int(WG_SMEM)) == cu.OK && cu.func_set_max_dynamic_shared(k_wgemm_q6x, int(WG_SMEM)) == cu.OK && cu.func_set_max_dynamic_shared(k_wgemm_q5x, int(WG_SMEM)) == cu.OK
 	if !g_wgemm_smem {
 		fmt.eprintln("cuda: wgemm stays off (cuFuncSetAttribute failed); Q4_K/Q6_K prefill uses mmqk")
@@ -2237,6 +2262,7 @@ alloc_acts :: proc(t: ^Transformer, T: int) -> bool {
 	}
 	d_part_m, d_part_l, d_part_o = 0, 0, 0
 	d_wmma_o, d_wmma_m, d_wmma_l = 0, 0, 0
+	d_attn_p, d_attn_a = 0, 0
 	if g_prefill_mode == 2 && p.head_dim == 256 && p.n_heads > 0 && T > 0 {
 		max_tiles := (T + ATTN_WMMA_BQ - 1) / ATTN_WMMA_BQ
 		if max_tiles < 1 {
@@ -2251,6 +2277,19 @@ alloc_acts :: proc(t: ^Transformer, T: int) -> bool {
 			g_prefill_mode = 0
 		} else {
 			d_wmma_o, d_wmma_m, d_wmma_l = wo, wm, wl
+			// One fp16 P tile and one fp32 scale row per (part, kv head, query tile).
+			// 27B, chunk 512, 8 parts: 16*24*8*32*64*2 ≈ 12.6 MB, plus 0.4 MB of scales.
+			ph := max_tiles * p.n_heads * ATTN_WMMA_PARTS * ATTN_WMMA_BQ * ATTN_WMMA_BC
+			ah := max_tiles * p.n_heads * ATTN_WMMA_PARTS * ATTN_WMMA_BQ
+			wp, okp := alloc_bytes(ph * 2)
+			wa, oka := alloc_bytes(ah * 4)
+			if okp && oka {
+				d_attn_p, d_attn_a = wp, wa
+			} else {
+				d_attn_p, d_attn_a = 0, 0
+				g_attn_qtile = 1
+				fmt.eprintln("cuda: attn query-tile reuse stays off (P buffer did not fit)")
+			}
 		}
 	}
 	if g_attn_split && p.n_heads > 0 && p.head_dim >= 32 && p.head_dim <= 256 && p.head_dim % 32 == 0 && p.seq_len > 0 {
@@ -2480,6 +2519,13 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	g_wgemm_bk32 = os.get_env("ODINFER_CUDA_WGEMM_BK", context.temp_allocator) == "32"
 	if v, ok := strconv.parse_int(os.get_env("ODINFER_CUDA_ATTN_PARTS", context.temp_allocator)); ok && v > 0 {
 		g_attn_parts = v
+	}
+	// 4 query tiles share one KV dequant. =1 is the one-tile kernel from #25.
+	g_attn_qtile = 4
+	if s := os.get_env("ODINFER_CUDA_ATTN_QTILE", context.temp_allocator); s != "" {
+		if v, ok := strconv.parse_int(s); ok && (v == 1 || v == 2 || v == 4) {
+			g_attn_qtile = int(v)
+		}
 	}
 	g_gemv_rows = 0
 	if s := os.get_env("ODINFER_CUDA_GEMV_ROWS", context.temp_allocator); s != "" {
@@ -2838,6 +2884,9 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 			fmt.eprintfln("cuda: attn wmma KV parts forced to {} (ODINFER_CUDA_ATTN_PARTS)", g_attn_parts)
 		} else {
 			fmt.eprintln("cuda: attn wmma keeps the 80-block target and splits a KV part that would pass 2048 tokens, capped at 8")
+		}
+		if g_attn_qtile > 1 && d_attn_p != 0 {
+			fmt.eprintfln("cuda: attn wmma reuses one KV dequant across {} query tiles (ODINFER_CUDA_ATTN_QTILE=1 is the one-tile kernel)", g_attn_qtile)
 		}
 		if g_wgemm_x16 && d_x16 != 0 {
 			fmt.eprintln("cuda: wgemm X is packed to fp16 once per activation. ODINFER_CUDA_WGEMM_X=0 keeps the fp32 load")
