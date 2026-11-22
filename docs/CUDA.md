@@ -208,13 +208,15 @@ accumulate.
 | `ODINFER_CUDA_GEMV` | auto | `old` or `0`: scalar GEMV. `new`: bandwidth kernel even for small Q5_0 / Q8_0. Unset: bandwidth, except Q5_0 / Q8_0 under 16 MiB |
 | `ODINFER_CUDA_GEMV_ROWS` | `4` | Rows per warp for Q4_K and Q6_K. Unset is four. `1` selects the slower one-row kernel |
 | `ODINFER_CUDA_GEMV_WARPS` | `8` | Warps per bandwidth-GEMV block (1..16) |
-| `ODINFER_CUDA_GEMV_SPLIT` | on | Q4_K / Q6_K with `rows≤8192` split K four ways. `=0` is one K range |
+| `ODINFER_CUDA_GEMV_SPLIT` | on | Q4_K / Q6_K with `rows≤8192` split K. `=0` is one K range. The unsplit bench on a V100 was 27B wq 48% of peak, wo 35% (398 GB/s), w2 30% (345 GB/s). wq is 12288 rows and does not split |
+| `ODINFER_CUDA_GEMV_SPLITS` | auto | Unset: 4-way, except 2-way when halving still leaves 12 superblocks and the matrix is under 32 warps per SM (27B wo is 24 superblocks, 27B w2 is 68). `=4` is the previous flat 4-way. `=1` is one K range |
 | `ODINFER_CUDA_TC2` | on | Q4_K / Q6_K prefill. `T<=64` uses the 32-token fp16 tile. `T>64` uses the scalar-dequant tile. `=0` is the scalar tile at every T |
 | `ODINFER_CUDA_TC2_WIDE` | off | `=1` uses the 128-token tile for `T>64`. It was slower than the scalar tile at 581 and 2000 tokens |
 | `ODINFER_CUDA_TC2_BLOCK` | off | `=1` uses `tc2m`. Slower on the V100S (about −26% at 581 and 2000 tokens) and it changed a sampled token. Leave off |
 | `ODINFER_CUDA_TC2_REUSE` | off | `=1` uses `tc2r` for `T>64`: one scalar weight tile covers 128 tokens. Not timed. `T<=64` stays the 32-token tile. Wins over `TC2_BLOCK` and `TC2_WIDE` if several are set |
 | `ODINFER_CUDA_PREFILL_GEMM` | on | Q4_K / Q6_K prefill (`T>1`, K multiple of 256). Default is `wgemm` (fp16 WMMA, 128×128). `ODINFER_CUDA_PREFILL_LINEAR=mmqk` keeps the 32-row dp4a tile. On a V100 that tile, chunk 512, was 9B at 905/1805/8000/16000 371.70/376.91/337.20/290.49 tok/s and 27B at 905/8000/16000 124.00/112.97/97.43. `=0` keeps `tc2` / scalar `tc` and skips both. `wgemm` versus the fp32 CPU GEMV allows `5e-2 + 5e-2*|ref|`. `mmqk` versus `gemv2` allows `2e-3 + 2e-3*|ref|` |
-| `ODINFER_CUDA_PREFILL_LINEAR` | `wgemm` | `=mmqk` selects the q8 dp4a tile. Anything else, including unset, is `wgemm` when `ODINFER_CUDA_PREFILL_GEMM` is on. `wgemm` has not been timed |
+| `ODINFER_CUDA_PREFILL_LINEAR` | `wgemm` | `=mmqk` selects the q8 dp4a tile. Anything else, including unset, is `wgemm` when `ODINFER_CUDA_PREFILL_GEMM` is on and `T` is at least `ODINFER_CUDA_WGEMM_MIN` |
+| `ODINFER_CUDA_WGEMM_MIN` | `128` | Q4_K / Q6_K prefill with `T` below this uses `mmqk`. A 24-token prefill on the 128-wide tile was 1661/824 ms against 896/452 for `mmqk`. A partial tile skips 16-wide MMA fragments that start past `T`. `=0` launches `wgemm` for every `T>1`. A 256-token double buffer does not fit in 96 KB |
 | `ODINFER_CUDA_PREFILL_FUSE` | off | `=1` makes gate+up and K+V share one q8 stage. On the 64-row build it was neutral (9B at 8000 tokens, 332 with it off vs 333 on) and the linear bucket was slower, so it stays off |
 | `ODINFER_CUDA_MMQK_ROWS` | `4` | Default Q4 tile is 32 rows per block. `=8` selects 64 rows, which was slower on a V100. Q6 stays at 32 either way |
 | `ODINFER_CUDA_ATTN_LONG` | on | Mixed-V decode with `npos>=2048`, head_dim 256, and 4 or 6 query heads per KV head. 128 positions per block, K dequantized once per group, V once per position, then the same reduce as the 32-wide split. `=0` keeps 32-token parts at every length. Not bit-exact: same `2e-2 + 1e-3*|ref|` allowance |

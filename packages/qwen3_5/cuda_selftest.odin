@@ -2741,6 +2741,44 @@ gemv_bench_one :: proc(sh: Gemv_Shape, peak: f64) {
 	bytes, new_gbs := gemv_gbs(sh.kind, sh.rows, sh.cols, new_ms)
 	fmt.eprintfln("  %s %s  %dx%d  %.1f MiB", sh.name, tag, sh.rows, sh.cols, bytes / (1024.0 * 1024.0))
 	fmt.eprintfln("    r4   %.3f ms  %.1f GB/s  %.1f%% of peak", new_ms, new_gbs, new_gbs / peak * 100)
+	// gy=1 is the line above. Rows <= 8192 are the shapes whose production
+	// launch splits K. s2/s4 zero the output and atomicAdd, which is what
+	// decode runs. 27B wo was 35% and 27B w2 30% on the unsplit line.
+	if (sh.kind == .Q4_K || sh.kind == .Q6_K) && sh.rows <= 8192 {
+		splits := [?]u32{2, 4}
+		for sp in splits {
+			ms: f64
+			if sh.kind == .Q4_K {
+				args := [?]rawptr{&wb, &qs, &sc, &sm, &yy, &nn, &dd, &acc}
+				ms = gemv_time_split(nw, args[:], gx, sp, bx, dy, sh.rows * 4, warm, iters)
+			} else {
+				args := [?]rawptr{&wb, &qs, &sc, &yy, &nn, &dd, &acc}
+				ms = gemv_time_split(nw, args[:], gx, sp, bx, dy, sh.rows * 4, warm, iters)
+			}
+			if ms > 0 {
+				_, gbs := gemv_gbs(sh.kind, sh.rows, sh.cols, ms)
+				fmt.eprintfln("    s{}   %.3f ms  %.1f GB/s  %.1f%% of peak", sp, ms, gbs, gbs / peak * 100)
+			}
+		}
+	}
+	if sh.kind == .Q6_K {
+		sfn := s_fn("gemv2_q6s_k")
+		if sfn != nil {
+			args := [?]rawptr{&wb, &qs, &sc, &yy, &nn, &dd, &acc}
+			st_ms := gemv_time(sfn, args[:], gx, 1, bx, warm, iters)
+			if st_ms > 0 {
+				_, st_gbs := gemv_gbs(sh.kind, sh.rows, sh.cols, st_ms)
+				fmt.eprintfln("    q6s  %.3f ms  %.1f GB/s  %.1f%% of peak", st_ms, st_gbs, st_gbs / peak * 100)
+			}
+			if sh.rows <= 8192 {
+				st2 := gemv_time_split(sfn, args[:], gx, 2, bx, dy, sh.rows * 4, warm, iters)
+				if st2 > 0 {
+					_, st2_gbs := gemv_gbs(sh.kind, sh.rows, sh.cols, st2)
+					fmt.eprintfln("    q6s2 %.3f ms  %.1f GB/s  %.1f%% of peak", st2, st2_gbs, st2_gbs / peak * 100)
+				}
+			}
+		}
+	}
 	if sh.kind == .Q4_K {
 		nfn := s_fn("gemv2_q4nc_k")
 		xfn := s_fn("gemv2_q4x_k")
@@ -2777,6 +2815,28 @@ gemv_time :: proc(fn: cu.Function, args: []rawptr, gx, gy, bx: u32, warm, iters:
 	cu.sync()
 	t0 := time.now()
 	for _ in 0 ..< iters {
+		if cu.launch(fn, gx, gy, 1, bx, 1, 1, 0, args) != cu.OK {
+			return -1
+		}
+		cu.sync()
+	}
+	return f64(time.duration_milliseconds(time.since(t0))) / f64(iters)
+}
+
+// Split-K atomicAdds into y, so each sample starts from zero. The memset is
+// inside the timed region because decode pays it too.
+@(private)
+gemv_time_split :: proc(fn: cu.Function, args: []rawptr, gx, gy, bx: u32, y: cu.Device_Ptr, bytes, warm, iters: int) -> f64 {
+	for _ in 0 ..< warm {
+		cu.memset(y, 0, bytes)
+		cu.launch(fn, gx, gy, 1, bx, 1, 1, 0, args)
+	}
+	cu.sync()
+	t0 := time.now()
+	for _ in 0 ..< iters {
+		if cu.memset(y, 0, bytes) != cu.OK {
+			return -1
+		}
 		if cu.launch(fn, gx, gy, 1, bx, 1, 1, 0, args) != cu.OK {
 			return -1
 		}

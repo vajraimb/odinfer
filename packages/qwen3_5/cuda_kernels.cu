@@ -3985,28 +3985,65 @@ __device__ void wgemm_run(const unsigned char* wb, const float* x, float* out, i
         unsigned short* cur = (unsigned short*)(wgemm_sm + phase * 40960);
         unsigned short* Xs = cur;
         unsigned short* Ws = cur + 128 * 80;
+        /* A partial token tile still dequants the weight rows once. Skip the
+           16-wide MMA fragments that start past T, so a 15-token tail does
+           not run the other 112 columns. Full tiles take the first branch
+           and the inner loop stays free of that test. Syncs stay outside. */
+        int ntok = T - t0;
+        if (ntok > 128) ntok = 128;
+        int alive0 = (tw * 32) < ntok;
+        int alive1 = (tw * 32 + 16) < ntok;
+        if (alive0 && alive1) {
 #pragma unroll
-        for (int kk = 0; kk < 64; kk += 16) {
-            unsigned a00, a01, a02, a03, a04, a05, a06, a07;
-            unsigned a10, a11, a12, a13, a14, a15, a16, a17;
-            unsigned b00, b01, b02, b03, b04, b05, b06, b07;
-            unsigned b10, b11, b12, b13, b14, b15, b16, b17;
-            unsigned b20, b21, b22, b23, b24, b25, b26, b27;
-            unsigned b30, b31, b32, b33, b34, b35, b36, b37;
-            wmma_load_a(a00, a01, a02, a03, a04, a05, a06, a07, Xs + (tw * 32) * 80 + kk, 80);
-            wmma_load_a(a10, a11, a12, a13, a14, a15, a16, a17, Xs + (tw * 32 + 16) * 80 + kk, 80);
-            wmma_load_b(b00, b01, b02, b03, b04, b05, b06, b07, Ws + (rw * 64) * 80 + kk, 80);
-            wmma_load_b(b10, b11, b12, b13, b14, b15, b16, b17, Ws + (rw * 64 + 16) * 80 + kk, 80);
-            wmma_load_b(b20, b21, b22, b23, b24, b25, b26, b27, Ws + (rw * 64 + 32) * 80 + kk, 80);
-            wmma_load_b(b30, b31, b32, b33, b34, b35, b36, b37, Ws + (rw * 64 + 48) * 80 + kk, 80);
-            wmma_mma(acc[0][0], acc[0][1], acc[0][2], acc[0][3], acc[0][4], acc[0][5], acc[0][6], acc[0][7], a00, a01, a02, a03, a04, a05, a06, a07, b00, b01, b02, b03, b04, b05, b06, b07);
-            wmma_mma(acc[1][0], acc[1][1], acc[1][2], acc[1][3], acc[1][4], acc[1][5], acc[1][6], acc[1][7], a10, a11, a12, a13, a14, a15, a16, a17, b00, b01, b02, b03, b04, b05, b06, b07);
-            wmma_mma(acc[2][0], acc[2][1], acc[2][2], acc[2][3], acc[2][4], acc[2][5], acc[2][6], acc[2][7], a00, a01, a02, a03, a04, a05, a06, a07, b10, b11, b12, b13, b14, b15, b16, b17);
-            wmma_mma(acc[3][0], acc[3][1], acc[3][2], acc[3][3], acc[3][4], acc[3][5], acc[3][6], acc[3][7], a10, a11, a12, a13, a14, a15, a16, a17, b10, b11, b12, b13, b14, b15, b16, b17);
-            wmma_mma(acc[4][0], acc[4][1], acc[4][2], acc[4][3], acc[4][4], acc[4][5], acc[4][6], acc[4][7], a00, a01, a02, a03, a04, a05, a06, a07, b20, b21, b22, b23, b24, b25, b26, b27);
-            wmma_mma(acc[5][0], acc[5][1], acc[5][2], acc[5][3], acc[5][4], acc[5][5], acc[5][6], acc[5][7], a10, a11, a12, a13, a14, a15, a16, a17, b20, b21, b22, b23, b24, b25, b26, b27);
-            wmma_mma(acc[6][0], acc[6][1], acc[6][2], acc[6][3], acc[6][4], acc[6][5], acc[6][6], acc[6][7], a00, a01, a02, a03, a04, a05, a06, a07, b30, b31, b32, b33, b34, b35, b36, b37);
-            wmma_mma(acc[7][0], acc[7][1], acc[7][2], acc[7][3], acc[7][4], acc[7][5], acc[7][6], acc[7][7], a10, a11, a12, a13, a14, a15, a16, a17, b30, b31, b32, b33, b34, b35, b36, b37);
+            for (int kk = 0; kk < 64; kk += 16) {
+                unsigned a00, a01, a02, a03, a04, a05, a06, a07;
+                unsigned a10, a11, a12, a13, a14, a15, a16, a17;
+                unsigned b00, b01, b02, b03, b04, b05, b06, b07;
+                unsigned b10, b11, b12, b13, b14, b15, b16, b17;
+                unsigned b20, b21, b22, b23, b24, b25, b26, b27;
+                unsigned b30, b31, b32, b33, b34, b35, b36, b37;
+                wmma_load_a(a00, a01, a02, a03, a04, a05, a06, a07, Xs + (tw * 32) * 80 + kk, 80);
+                wmma_load_a(a10, a11, a12, a13, a14, a15, a16, a17, Xs + (tw * 32 + 16) * 80 + kk, 80);
+                wmma_load_b(b00, b01, b02, b03, b04, b05, b06, b07, Ws + (rw * 64) * 80 + kk, 80);
+                wmma_load_b(b10, b11, b12, b13, b14, b15, b16, b17, Ws + (rw * 64 + 16) * 80 + kk, 80);
+                wmma_load_b(b20, b21, b22, b23, b24, b25, b26, b27, Ws + (rw * 64 + 32) * 80 + kk, 80);
+                wmma_load_b(b30, b31, b32, b33, b34, b35, b36, b37, Ws + (rw * 64 + 48) * 80 + kk, 80);
+                wmma_mma(acc[0][0], acc[0][1], acc[0][2], acc[0][3], acc[0][4], acc[0][5], acc[0][6], acc[0][7], a00, a01, a02, a03, a04, a05, a06, a07, b00, b01, b02, b03, b04, b05, b06, b07);
+                wmma_mma(acc[1][0], acc[1][1], acc[1][2], acc[1][3], acc[1][4], acc[1][5], acc[1][6], acc[1][7], a10, a11, a12, a13, a14, a15, a16, a17, b00, b01, b02, b03, b04, b05, b06, b07);
+                wmma_mma(acc[2][0], acc[2][1], acc[2][2], acc[2][3], acc[2][4], acc[2][5], acc[2][6], acc[2][7], a00, a01, a02, a03, a04, a05, a06, a07, b10, b11, b12, b13, b14, b15, b16, b17);
+                wmma_mma(acc[3][0], acc[3][1], acc[3][2], acc[3][3], acc[3][4], acc[3][5], acc[3][6], acc[3][7], a10, a11, a12, a13, a14, a15, a16, a17, b10, b11, b12, b13, b14, b15, b16, b17);
+                wmma_mma(acc[4][0], acc[4][1], acc[4][2], acc[4][3], acc[4][4], acc[4][5], acc[4][6], acc[4][7], a00, a01, a02, a03, a04, a05, a06, a07, b20, b21, b22, b23, b24, b25, b26, b27);
+                wmma_mma(acc[5][0], acc[5][1], acc[5][2], acc[5][3], acc[5][4], acc[5][5], acc[5][6], acc[5][7], a10, a11, a12, a13, a14, a15, a16, a17, b20, b21, b22, b23, b24, b25, b26, b27);
+                wmma_mma(acc[6][0], acc[6][1], acc[6][2], acc[6][3], acc[6][4], acc[6][5], acc[6][6], acc[6][7], a00, a01, a02, a03, a04, a05, a06, a07, b30, b31, b32, b33, b34, b35, b36, b37);
+                wmma_mma(acc[7][0], acc[7][1], acc[7][2], acc[7][3], acc[7][4], acc[7][5], acc[7][6], acc[7][7], a10, a11, a12, a13, a14, a15, a16, a17, b30, b31, b32, b33, b34, b35, b36, b37);
+            }
+        } else if (alive0 || alive1) {
+#pragma unroll
+            for (int kk = 0; kk < 64; kk += 16) {
+                unsigned a00, a01, a02, a03, a04, a05, a06, a07;
+                unsigned b00, b01, b02, b03, b04, b05, b06, b07;
+                unsigned b10, b11, b12, b13, b14, b15, b16, b17;
+                unsigned b20, b21, b22, b23, b24, b25, b26, b27;
+                unsigned b30, b31, b32, b33, b34, b35, b36, b37;
+                wmma_load_b(b00, b01, b02, b03, b04, b05, b06, b07, Ws + (rw * 64) * 80 + kk, 80);
+                wmma_load_b(b10, b11, b12, b13, b14, b15, b16, b17, Ws + (rw * 64 + 16) * 80 + kk, 80);
+                wmma_load_b(b20, b21, b22, b23, b24, b25, b26, b27, Ws + (rw * 64 + 32) * 80 + kk, 80);
+                wmma_load_b(b30, b31, b32, b33, b34, b35, b36, b37, Ws + (rw * 64 + 48) * 80 + kk, 80);
+                if (alive0) {
+                    wmma_load_a(a00, a01, a02, a03, a04, a05, a06, a07, Xs + (tw * 32) * 80 + kk, 80);
+                    wmma_mma(acc[0][0], acc[0][1], acc[0][2], acc[0][3], acc[0][4], acc[0][5], acc[0][6], acc[0][7], a00, a01, a02, a03, a04, a05, a06, a07, b00, b01, b02, b03, b04, b05, b06, b07);
+                    wmma_mma(acc[2][0], acc[2][1], acc[2][2], acc[2][3], acc[2][4], acc[2][5], acc[2][6], acc[2][7], a00, a01, a02, a03, a04, a05, a06, a07, b10, b11, b12, b13, b14, b15, b16, b17);
+                    wmma_mma(acc[4][0], acc[4][1], acc[4][2], acc[4][3], acc[4][4], acc[4][5], acc[4][6], acc[4][7], a00, a01, a02, a03, a04, a05, a06, a07, b20, b21, b22, b23, b24, b25, b26, b27);
+                    wmma_mma(acc[6][0], acc[6][1], acc[6][2], acc[6][3], acc[6][4], acc[6][5], acc[6][6], acc[6][7], a00, a01, a02, a03, a04, a05, a06, a07, b30, b31, b32, b33, b34, b35, b36, b37);
+                }
+                if (alive1) {
+                    wmma_load_a(a00, a01, a02, a03, a04, a05, a06, a07, Xs + (tw * 32 + 16) * 80 + kk, 80);
+                    wmma_mma(acc[1][0], acc[1][1], acc[1][2], acc[1][3], acc[1][4], acc[1][5], acc[1][6], acc[1][7], a00, a01, a02, a03, a04, a05, a06, a07, b00, b01, b02, b03, b04, b05, b06, b07);
+                    wmma_mma(acc[3][0], acc[3][1], acc[3][2], acc[3][3], acc[3][4], acc[3][5], acc[3][6], acc[3][7], a00, a01, a02, a03, a04, a05, a06, a07, b10, b11, b12, b13, b14, b15, b16, b17);
+                    wmma_mma(acc[5][0], acc[5][1], acc[5][2], acc[5][3], acc[5][4], acc[5][5], acc[5][6], acc[5][7], a00, a01, a02, a03, a04, a05, a06, a07, b20, b21, b22, b23, b24, b25, b26, b27);
+                    wmma_mma(acc[7][0], acc[7][1], acc[7][2], acc[7][3], acc[7][4], acc[7][5], acc[7][6], acc[7][7], a00, a01, a02, a03, a04, a05, a06, a07, b30, b31, b32, b33, b34, b35, b36, b37);
+                }
+            }
         }
         if (nxt < n) {
             int np = phase ^ 1;
